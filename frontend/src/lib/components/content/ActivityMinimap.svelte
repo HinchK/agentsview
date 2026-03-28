@@ -84,9 +84,6 @@
     const rect = (
       e.currentTarget as SVGElement
     ).getBoundingClientRect();
-    const parentRect =
-      containerRef?.getBoundingClientRect();
-    if (!parentRect) return;
     const range =
       formatTime(bar.bucket.start_time) +
       "\u2013" +
@@ -94,9 +91,8 @@
     const total =
       bar.bucket.user_count + bar.bucket.assistant_count;
     tooltip = {
-      x:
-        rect.left + rect.width / 2 - parentRect.left,
-      y: rect.top - 4 - parentRect.top,
+      x: rect.left + rect.width / 2,
+      y: rect.top - 4,
       text:
         `${range} \u2014 ${bar.bucket.user_count} user, ` +
         `${bar.bucket.assistant_count} assistant`,
@@ -246,7 +242,6 @@
 
 <style>
   .activity-minimap {
-    position: relative;
     padding: 6px 14px 4px;
     border-bottom: 1px solid var(--border-muted);
   }
@@ -323,7 +318,7 @@
   }
 
   .minimap-tooltip {
-    position: absolute;
+    position: fixed;
     transform: translateX(-50%) translateY(-100%);
     padding: 3px 8px;
     background: var(--text-primary);
