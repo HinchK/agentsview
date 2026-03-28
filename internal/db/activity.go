@@ -90,7 +90,7 @@ func getSessionActivitySQLite(
 
 	// Get min and max timestamps from visible messages with valid timestamps.
 	// Use julianday() for sub-second precision — strftime('%s') truncates.
-	tsFilter := "m.timestamp IS NOT NULL AND m.timestamp != ''"
+	tsFilter := "m.timestamp IS NOT NULL AND m.timestamp != '' AND julianday(m.timestamp) IS NOT NULL"
 	var minEpoch, maxEpoch sql.NullFloat64
 	err = d.getReader().QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT

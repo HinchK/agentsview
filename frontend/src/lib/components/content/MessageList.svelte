@@ -147,6 +147,7 @@
         return;
       }
     }
+    sessionActivity.firstVisibleTimestamp = null;
   }
 
   // Recompute visible timestamp when minimap opens.
