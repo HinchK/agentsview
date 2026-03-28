@@ -56,9 +56,10 @@ func SnapInterval(durationSec int64) int64 {
 	}
 
 	// If the best fixed step would produce too many buckets,
-	// scale up to keep the count bounded.
-	if durationSec/best > maxBuckets {
-		best = (durationSec + maxBuckets - 1) / maxBuckets
+	// scale up to keep the count bounded. Bucket count is
+	// floor(duration/interval) + 1, so divide by maxBuckets-1.
+	if durationSec/best+1 > maxBuckets {
+		best = (durationSec + maxBuckets - 2) / (maxBuckets - 1)
 	}
 	return best
 }

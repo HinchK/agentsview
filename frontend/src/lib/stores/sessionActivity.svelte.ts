@@ -90,8 +90,10 @@ class SessionActivityStore {
     return this.load(sessionId);
   }
 
-  /** Mark cached data as stale so the next load() refetches. */
+  /** Mark cached data as stale so the next load() refetches.
+   *  Also discards any in-flight response. */
   invalidate() {
+    this.loadVersion++;
     this.cachedSessionId = null;
     this.loaded = false;
   }
