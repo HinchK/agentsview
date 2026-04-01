@@ -772,6 +772,67 @@ func TestSessionFilterExcludeAutomated(t *testing.T) {
 	}
 }
 
+func TestExcludeOneShotWithIncludeAutomated(t *testing.T) {
+	d := testDB(t)
+
+	// Normal multi-turn session.
+	insertSession(t, d, "multi", "proj", func(s *Session) {
+		s.MessageCount = 10
+		s.UserMessageCount = 5
+	})
+	// Normal single-turn session.
+	insertSession(t, d, "oneshot", "proj", func(s *Session) {
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+	})
+	// Automated single-turn session.
+	insertSession(t, d, "review", "proj", func(s *Session) {
+		fm := "You are a code reviewer. Review the code."
+		s.FirstMessage = &fm
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+	})
+
+	tests := []struct {
+		name             string
+		excludeOneShot   bool
+		excludeAutomated bool
+		want             []string
+	}{
+		{
+			"BothOff",
+			false, false,
+			[]string{"multi", "oneshot", "review"},
+		},
+		{
+			"ExcludeOneShotOnly",
+			true, false,
+			// Automated sessions survive one-shot exclusion.
+			[]string{"multi", "review"},
+		},
+		{
+			"ExcludeBoth",
+			true, true,
+			[]string{"multi"},
+		},
+		{
+			"ExcludeAutomatedOnly",
+			false, true,
+			[]string{"multi", "oneshot"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := SessionFilter{
+				ExcludeOneShot:   tt.excludeOneShot,
+				ExcludeAutomated: tt.excludeAutomated,
+			}
+			requireSessions(t, d, f, tt.want)
+		})
+	}
+}
+
 func TestIsAutomatedSetOnUpsert(t *testing.T) {
 	d := testDB(t)
 

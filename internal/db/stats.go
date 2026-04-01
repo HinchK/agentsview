@@ -49,7 +49,11 @@ func (db *DB) GetStats(
 ) (Stats, error) {
 	filter := rootSessionFilter
 	if excludeOneShot {
-		filter += " AND user_message_count > 1"
+		if !excludeAutomated {
+			filter += " AND (user_message_count > 1 OR is_automated = 1)"
+		} else {
+			filter += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		filter += " AND is_automated = 0"

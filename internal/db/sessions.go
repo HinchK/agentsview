@@ -319,13 +319,20 @@ func buildSessionFilter(f SessionFilter) (string, []any) {
 	// are almost always one-shot by nature and must not be
 	// excluded. The one-shot filter applies only to root
 	// sessions that match the filter directly.
+	// When ExcludeOneShot is true but automated sessions are
+	// included, exempt them from the one-shot filter — automated
+	// sessions are single-turn by definition, so a strict
+	// user_message_count > 1 predicate would always hide them.
 	oneShotPred := ""
 	if f.ExcludeOneShot {
+		pred := "user_message_count > 1"
+		if !f.ExcludeAutomated {
+			pred = "(user_message_count > 1 OR is_automated = 1)"
+		}
 		if f.IncludeChildren {
-			oneShotPred = "user_message_count > 1"
+			oneShotPred = pred
 		} else {
-			filterPreds = append(filterPreds,
-				"user_message_count > 1")
+			filterPreds = append(filterPreds, pred)
 		}
 	}
 
@@ -930,7 +937,11 @@ func (db *DB) GetProjects(
 		  AND relationship_type NOT IN ('subagent', 'fork')
 		  AND deleted_at IS NULL`
 	if excludeOneShot {
-		q += " AND user_message_count > 1"
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = 1)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		q += " AND is_automated = 0"
@@ -970,7 +981,11 @@ func (db *DB) GetAgents(
 		  AND deleted_at IS NULL
 		  AND relationship_type NOT IN ('subagent', 'fork')`
 	if excludeOneShot {
-		q += " AND user_message_count > 1"
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = 1)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		q += " AND is_automated = 0"
@@ -1006,7 +1021,11 @@ func (db *DB) GetMachines(
 ) ([]string, error) {
 	q := "SELECT DISTINCT machine FROM sessions WHERE deleted_at IS NULL"
 	if excludeOneShot {
-		q += " AND user_message_count > 1"
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = 1)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		q += " AND is_automated = 0"

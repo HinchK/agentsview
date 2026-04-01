@@ -144,7 +144,12 @@ func (f AnalyticsFilter) buildWhere(
 		args = append(args, f.MinUserMessages)
 	}
 	if f.ExcludeOneShot {
-		preds = append(preds, "user_message_count > 1")
+		if !f.ExcludeAutomated {
+			preds = append(preds,
+				"(user_message_count > 1 OR is_automated = 1)")
+		} else {
+			preds = append(preds, "user_message_count > 1")
+		}
 	}
 	if f.ExcludeAutomated {
 		preds = append(preds, "is_automated = 0")

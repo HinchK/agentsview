@@ -205,11 +205,14 @@ func buildPGSessionFilter(
 
 	oneShotPred := ""
 	if f.ExcludeOneShot {
+		pred := "user_message_count > 1"
+		if !f.ExcludeAutomated {
+			pred = "(user_message_count > 1 OR is_automated = TRUE)"
+		}
 		if f.IncludeChildren {
-			oneShotPred = "user_message_count > 1"
+			oneShotPred = pred
 		} else {
-			filterPreds = append(filterPreds,
-				"user_message_count > 1")
+			filterPreds = append(filterPreds, pred)
 		}
 	}
 
@@ -504,7 +507,11 @@ func (s *Store) GetStats(
 ) (db.Stats, error) {
 	filter := pgRootSessionFilter
 	if excludeOneShot {
-		filter += " AND user_message_count > 1"
+		if !excludeAutomated {
+			filter += " AND (user_message_count > 1 OR is_automated = TRUE)"
+		} else {
+			filter += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		filter += " AND is_automated = FALSE"
@@ -555,7 +562,11 @@ func (s *Store) GetProjects(
 		  AND relationship_type NOT IN ('subagent', 'fork')
 		  AND deleted_at IS NULL`
 	if excludeOneShot {
-		q += " AND user_message_count > 1"
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = TRUE)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		q += " AND is_automated = FALSE"
@@ -595,7 +606,11 @@ func (s *Store) GetAgents(
 		  AND deleted_at IS NULL
 		  AND relationship_type NOT IN ('subagent', 'fork')`
 	if excludeOneShot {
-		q += " AND user_message_count > 1"
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = TRUE)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		q += " AND is_automated = FALSE"
@@ -632,7 +647,11 @@ func (s *Store) GetMachines(
 	q := `SELECT DISTINCT machine FROM sessions
 		WHERE deleted_at IS NULL`
 	if excludeOneShot {
-		q += " AND user_message_count > 1"
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = TRUE)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
 	}
 	if excludeAutomated {
 		q += " AND is_automated = FALSE"
