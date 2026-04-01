@@ -32,6 +32,7 @@ const pgSessionCols = `id, project, machine, agent,
 	parent_session_id, relationship_type,
 	total_output_tokens, peak_context_tokens,
 	has_total_output_tokens, has_peak_context_tokens,
+	is_automated,
 	deleted_at`
 
 // paramBuilder generates numbered PostgreSQL placeholders.
@@ -62,6 +63,7 @@ func scanPGSession(
 		&s.ParentSessionID, &s.RelationshipType,
 		&s.TotalOutputTokens, &s.PeakContextTokens,
 		&s.HasTotalOutputTokens, &s.HasPeakContextTokens,
+		&s.IsAutomated,
 		&deletedAt,
 	)
 	if err != nil {
@@ -209,6 +211,11 @@ func buildPGSessionFilter(
 			filterPreds = append(filterPreds,
 				"user_message_count > 1")
 		}
+	}
+
+	if f.ExcludeAutomated {
+		filterPreds = append(filterPreds,
+			"is_automated = FALSE")
 	}
 
 	hasFilters := len(filterPreds) > 0 || oneShotPred != ""
@@ -492,11 +499,15 @@ func (s *Store) GetChildSessions(
 // GetStats returns database statistics, counting only root
 // sessions with messages.
 func (s *Store) GetStats(
-	ctx context.Context, excludeOneShot bool,
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
 ) (db.Stats, error) {
 	filter := pgRootSessionFilter
 	if excludeOneShot {
 		filter += " AND user_message_count > 1"
+	}
+	if excludeAutomated {
+		filter += " AND is_automated = FALSE"
 	}
 	query := fmt.Sprintf(`
 		SELECT
@@ -535,7 +546,8 @@ func (s *Store) GetStats(
 
 // GetProjects returns project names with session counts.
 func (s *Store) GetProjects(
-	ctx context.Context, excludeOneShot bool,
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
 ) ([]db.ProjectInfo, error) {
 	q := `SELECT project, COUNT(*) as session_count
 		FROM sessions
@@ -544,6 +556,9 @@ func (s *Store) GetProjects(
 		  AND deleted_at IS NULL`
 	if excludeOneShot {
 		q += " AND user_message_count > 1"
+	}
+	if excludeAutomated {
+		q += " AND is_automated = FALSE"
 	}
 	q += " GROUP BY project ORDER BY project"
 	rows, err := s.pg.QueryContext(ctx, q)
@@ -571,7 +586,8 @@ func (s *Store) GetProjects(
 
 // GetAgents returns distinct agent names with session counts.
 func (s *Store) GetAgents(
-	ctx context.Context, excludeOneShot bool,
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
 ) ([]db.AgentInfo, error) {
 	q := `SELECT agent, COUNT(*) as session_count
 		FROM sessions
@@ -580,6 +596,9 @@ func (s *Store) GetAgents(
 		  AND relationship_type NOT IN ('subagent', 'fork')`
 	if excludeOneShot {
 		q += " AND user_message_count > 1"
+	}
+	if excludeAutomated {
+		q += " AND is_automated = FALSE"
 	}
 	q += " GROUP BY agent ORDER BY agent"
 	rows, err := s.pg.QueryContext(ctx, q)
@@ -607,12 +626,16 @@ func (s *Store) GetAgents(
 
 // GetMachines returns distinct machine names.
 func (s *Store) GetMachines(
-	ctx context.Context, excludeOneShot bool,
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
 ) ([]string, error) {
 	q := `SELECT DISTINCT machine FROM sessions
 		WHERE deleted_at IS NULL`
 	if excludeOneShot {
 		q += " AND user_message_count > 1"
+	}
+	if excludeAutomated {
+		q += " AND is_automated = FALSE"
 	}
 	q += " ORDER BY machine"
 	rows, err := s.pg.QueryContext(ctx, q)

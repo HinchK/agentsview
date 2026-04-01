@@ -658,13 +658,13 @@ func TestGetMachinesExcludeOneShot(t *testing.T) {
 		s.UserMessageCount = 5
 	})
 
-	all, err := d.GetMachines(context.Background(), false)
+	all, err := d.GetMachines(context.Background(), false, false)
 	requireNoError(t, err, "GetMachines includeAll")
 	if len(all) != 2 {
 		t.Fatalf("includeAll: got %d machines, want 2", len(all))
 	}
 
-	filtered, err := d.GetMachines(context.Background(), true)
+	filtered, err := d.GetMachines(context.Background(), true, false)
 	requireNoError(t, err, "GetMachines excludeOneShot")
 	if len(filtered) != 1 {
 		t.Fatalf("excludeOneShot: got %d machines, want 1",
@@ -689,7 +689,7 @@ func TestGetStatsExcludeOneShot(t *testing.T) {
 	})
 
 	// Include all.
-	stats, err := d.GetStats(context.Background(), false)
+	stats, err := d.GetStats(context.Background(), false, false)
 	requireNoError(t, err, "GetStats includeAll")
 	if stats.SessionCount != 2 {
 		t.Errorf("includeAll: session_count = %d, want 2",
@@ -705,7 +705,7 @@ func TestGetStatsExcludeOneShot(t *testing.T) {
 	}
 
 	// Exclude one-shot.
-	stats, err = d.GetStats(context.Background(), true)
+	stats, err = d.GetStats(context.Background(), true, false)
 	requireNoError(t, err, "GetStats excludeOneShot")
 	if stats.SessionCount != 1 {
 		t.Errorf("excludeOneShot: session_count = %d, want 1",
@@ -718,5 +718,87 @@ func TestGetStatsExcludeOneShot(t *testing.T) {
 	if stats.ProjectCount != 1 {
 		t.Errorf("excludeOneShot: project_count = %d, want 1",
 			stats.ProjectCount)
+	}
+}
+
+func TestSessionFilterExcludeAutomated(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "normal", "proj", func(s *Session) {
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+	})
+	insertSession(t, d, "review", "proj", func(s *Session) {
+		fm := "You are a code reviewer. Review the code changes shown below.\n\n## Changes"
+		s.FirstMessage = &fm
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+	})
+	insertSession(t, d, "fix", "proj", func(s *Session) {
+		fm := "# Fix Request\nAn analysis was performed"
+		s.FirstMessage = &fm
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+	})
+	insertSession(t, d, "multi", "proj", func(s *Session) {
+		s.MessageCount = 10
+		s.UserMessageCount = 5
+	})
+
+	tests := []struct {
+		name             string
+		excludeAutomated bool
+		want             []string
+	}{
+		{
+			"IncludeAll",
+			false,
+			[]string{"normal", "review", "fix", "multi"},
+		},
+		{
+			"ExcludeAutomated",
+			true,
+			[]string{"normal", "multi"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := SessionFilter{
+				ExcludeAutomated: tt.excludeAutomated,
+			}
+			requireSessions(t, d, f, tt.want)
+		})
+	}
+}
+
+func TestIsAutomatedSetOnUpsert(t *testing.T) {
+	d := testDB(t)
+
+	// Normal session.
+	insertSession(t, d, "normal", "proj", func(s *Session) {
+		fm := "fix the login bug"
+		s.FirstMessage = &fm
+		s.MessageCount = 3
+	})
+
+	// Automated review session.
+	insertSession(t, d, "review", "proj", func(s *Session) {
+		fm := "You are a code reviewer. Review the code changes shown below."
+		s.FirstMessage = &fm
+		s.MessageCount = 3
+	})
+
+	ctx := context.Background()
+	normal, err := d.GetSession(ctx, "normal")
+	requireNoError(t, err, "get normal")
+	if normal.IsAutomated {
+		t.Error("normal session should not be automated")
+	}
+
+	review, err := d.GetSession(ctx, "review")
+	requireNoError(t, err, "get review")
+	if !review.IsAutomated {
+		t.Error("review session should be automated")
 	}
 }

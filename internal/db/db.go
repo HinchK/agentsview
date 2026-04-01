@@ -327,6 +327,10 @@ func (db *DB) migrateColumns() error {
 			"sessions", "local_modified_at",
 			"ALTER TABLE sessions ADD COLUMN local_modified_at TEXT",
 		},
+		{
+			"sessions", "is_automated",
+			"ALTER TABLE sessions ADD COLUMN is_automated INTEGER NOT NULL DEFAULT 0",
+		},
 	}
 
 	for _, m := range migrations {
@@ -355,6 +359,10 @@ func (db *DB) migrateColumns() error {
 			)
 		}
 	}
+	if err := db.backfillIsAutomatedLocked(w); err != nil {
+		return err
+	}
+
 	runRepair, err := db.shouldRunTokenCoverageRepairLocked(w)
 	if err != nil {
 		return err
@@ -368,6 +376,43 @@ func (db *DB) migrateColumns() error {
 	if err := db.markTokenCoverageRepairDoneLocked(w); err != nil {
 		return err
 	}
+	return nil
+}
+
+// backfillIsAutomatedLocked sets is_automated = 1 for sessions
+// whose first_message matches known automated prompt patterns.
+// Uses SQL LIKE to avoid scanning every row in Go.
+func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
+	var count int
+	if err := w.QueryRow(
+		`SELECT count(*) FROM sessions
+		 WHERE is_automated = 0
+		   AND first_message IS NOT NULL
+		   AND (first_message LIKE 'You are a code reviewer. Review the code changes shown below.%'
+		     OR first_message LIKE '# Fix Request%')`,
+	).Scan(&count); err != nil {
+		return fmt.Errorf(
+			"probing automated backfill: %w", err,
+		)
+	}
+	if count == 0 {
+		return nil
+	}
+	_, err := w.Exec(
+		`UPDATE sessions SET is_automated = 1
+		 WHERE first_message IS NOT NULL
+		   AND (first_message LIKE 'You are a code reviewer. Review the code changes shown below.%'
+		     OR first_message LIKE '# Fix Request%')`,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"backfilling is_automated: %w", err,
+		)
+	}
+	log.Printf(
+		"migration: backfilled is_automated for %d sessions",
+		count,
+	)
 	return nil
 }
 

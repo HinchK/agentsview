@@ -50,9 +50,10 @@ type AnalyticsFilter struct {
 	Timezone        string // IANA timezone for day bucketing
 	DayOfWeek       *int   // nil = all, 0=Mon, 6=Sun (ISO)
 	Hour            *int   // nil = all, 0-23
-	MinUserMessages int    // user_message_count >= N
-	ExcludeOneShot  bool   // exclude sessions with user_message_count <= 1
-	ActiveSince     string // ISO timestamp cutoff
+	MinUserMessages  int    // user_message_count >= N
+	ExcludeOneShot   bool   // exclude sessions with user_message_count <= 1
+	ExcludeAutomated bool   // exclude automated (roborev) sessions
+	ActiveSince      string // ISO timestamp cutoff
 }
 
 // location loads the timezone or returns UTC on error.
@@ -144,6 +145,9 @@ func (f AnalyticsFilter) buildWhere(
 	}
 	if f.ExcludeOneShot {
 		preds = append(preds, "user_message_count > 1")
+	}
+	if f.ExcludeAutomated {
+		preds = append(preds, "is_automated = 0")
 	}
 
 	if f.ActiveSince != "" {

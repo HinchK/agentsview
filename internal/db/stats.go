@@ -44,11 +44,15 @@ func (db *DB) FileBackedSessionCount(
 // GetStats returns database statistics, counting only root
 // sessions with messages (matching the session list filter).
 func (db *DB) GetStats(
-	ctx context.Context, excludeOneShot bool,
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
 ) (Stats, error) {
 	filter := rootSessionFilter
 	if excludeOneShot {
 		filter += " AND user_message_count > 1"
+	}
+	if excludeAutomated {
+		filter += " AND is_automated = 0"
 	}
 	query := fmt.Sprintf(`
 		SELECT

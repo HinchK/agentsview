@@ -109,6 +109,9 @@ func buildAnalyticsWhere(
 	if f.ExcludeOneShot {
 		preds = append(preds, "user_message_count > 1")
 	}
+	if f.ExcludeAutomated {
+		preds = append(preds, "is_automated = FALSE")
+	}
 	if f.ActiveSince != "" {
 		preds = append(preds,
 			"COALESCE(ended_at, started_at, created_at)"+

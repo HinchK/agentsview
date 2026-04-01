@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     peak_context_tokens INT NOT NULL DEFAULT 0,
     has_total_output_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     has_peak_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
+    is_automated       BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -234,6 +235,13 @@ func EnsureSchema(
 			 ADD COLUMN IF NOT EXISTS call_index
 			 INT NOT NULL DEFAULT 0`,
 			"adding tool_calls.call_index",
+		},
+		{
+			"sessions", "is_automated",
+			`ALTER TABLE sessions
+			 ADD COLUMN IF NOT EXISTS is_automated
+			 BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.is_automated",
 		},
 	}
 	tokenCoverageColumnsAdded := false
