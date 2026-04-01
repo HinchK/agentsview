@@ -148,7 +148,7 @@ interface Match {
   segment: ContentSegment;
 }
 
-const toolOnlyCache = new LRUCache<number, boolean>(500);
+const toolOnlyCache = new LRUCache<string, boolean>(500);
 const segmentCache = new LRUCache<string, ContentSegment[]>(500);
 
 /** Clear both content-parser caches. Call on session switch
@@ -160,12 +160,13 @@ export function clearContentCaches(): void {
 
 /** Returns true if the message contains only tool calls (no text) */
 export function isToolOnly(msg: Message): boolean {
-  const cached = toolOnlyCache.get(msg.id);
+  const key = `${msg.id}:${msg.content_length}`;
+  const cached = toolOnlyCache.get(key);
   if (cached !== undefined) return cached;
 
   if (msg.role !== "assistant") return false;
   if (!msg.has_tool_use) {
-    toolOnlyCache.set(msg.id, false);
+    toolOnlyCache.set(key, false);
     return false;
   }
   const stripped = msg.content
@@ -174,7 +175,7 @@ export function isToolOnly(msg: Message): boolean {
     .replace(TOOL_RE, "")
     .trim();
   const result = stripped.length === 0;
-  toolOnlyCache.set(msg.id, result);
+  toolOnlyCache.set(key, result);
   return result;
 }
 
@@ -353,19 +354,21 @@ function mergeThinking(
 }
 
 /** Parse message content into typed segments.
- *  Pass messageId to enable LRU caching keyed by ID
- *  instead of by full text (avoids storing huge strings
- *  as Map keys). */
+ *  Pass messageId and contentLength to enable LRU caching
+ *  keyed by ID instead of by full text (avoids storing huge
+ *  strings as Map keys). contentLength ensures the cache
+ *  invalidates when message content grows during streaming. */
 export function parseContent(
   text: string,
   hasToolUse = true,
   messageId?: number,
+  contentLength?: number,
 ): ContentSegment[] {
   if (!text) return [];
 
   const cacheKey =
     messageId !== undefined
-      ? `${hasToolUse ? "t" : "n"}:${messageId}`
+      ? `${hasToolUse ? "t" : "n"}:${messageId}:${contentLength ?? text.length}`
       : undefined;
 
   if (cacheKey) {
@@ -504,7 +507,12 @@ export function hasVisibleSegments(
   const role: "user" | "assistant" =
     msg.role === "user" ? "user" : "assistant";
   const segs = enrichSegments(
-    parseContent(msg.content, msg.has_tool_use, msg.id),
+    parseContent(
+      msg.content,
+      msg.has_tool_use,
+      msg.id,
+      msg.content_length,
+    ),
     msg.tool_calls,
   );
   // Empty messages (e.g. initial assistant streaming state) should
