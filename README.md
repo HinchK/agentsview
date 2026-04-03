@@ -289,10 +289,20 @@ make install-hooks  # install pre-commit hooks via prek
 ```
 
 Pre-commit hooks are managed with [prek](https://github.com/j178/prek) and
-require [uv](https://docs.astral.sh/uv/) for the Markdown formatting hook. Run
-`brew install prek uv && make install-hooks` after cloning. The hooks run
-`make lint` and `mdformat` on every commit, auto-fixing formatting issues. If a
-hook rewrites files, re-stage and re-commit.
+require [uv](https://docs.astral.sh/uv/) for the Markdown formatting hook.
+Install both, then run `make install-hooks` after cloning:
+
+```bash
+# macOS
+brew install prek uv
+
+# Linux (or any platform)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+go install github.com/j178/prek/cmd/prek@latest
+```
+
+The hooks run `make lint` and `mdformat` on every commit, auto-fixing formatting
+issues. If a hook rewrites files, re-stage and re-commit.
 
 ## Desktop Development
 
