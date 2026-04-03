@@ -222,7 +222,6 @@
           <option value="codex">Codex</option>
           <option value="copilot">Copilot</option>
           <option value="gemini">Gemini</option>
-          <option value="kiro">Kiro</option>
         </select>
       </div>
 

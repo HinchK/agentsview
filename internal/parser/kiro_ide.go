@@ -307,6 +307,18 @@ func parseKiroIDENewFormat(
 			if resolved == "" {
 				resolved = content
 			}
+			// Fall back to concatenated prompt log completions
+			// when execution logs are missing.
+			if resolved == "" {
+				var parts []string
+				for _, pl := range h.PromptLogs {
+					t := strings.TrimSpace(pl.Completion)
+					if t != "" {
+						parts = append(parts, t)
+					}
+				}
+				resolved = strings.Join(parts, "\n\n")
+			}
 			hasToolUse := len(toolCalls) > 0
 			if resolved == "" && !hasToolUse {
 				continue
