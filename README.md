@@ -60,17 +60,19 @@ behavior, and track usage patterns over time.
 
 ## Privacy and Telemetry
 
-agentsview has **no telemetry, no analytics, and no network calls home**. It is
-fully local software:
+agentsview has **no telemetry and no analytics**. No usage data, crash reports,
+or diagnostics are collected or sent anywhere.
 
 - All session data stays on your machine in a local SQLite database
 - The server binds to `127.0.0.1` by default and is not network-accessible
-- No accounts, no sign-ups, no external services contacted
-- No usage data, crash reports, or diagnostics are collected or sent anywhere
+- No accounts, no sign-ups, no tracking
 - The optional PostgreSQL sync is explicit and user-initiated (`pg push`),
   connecting only to a server you configure
 
-There is nothing to disable because there is nothing to opt out of.
+The desktop app checks GitHub for new releases on startup. This contacts
+`github.com` but sends no analytics or session data. To disable the update
+check, set `AGENTSVIEW_DESKTOP_AUTOUPDATE=0` in your environment. The CLI binary
+makes no network requests at all.
 
 ## Usage
 
