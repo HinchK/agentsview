@@ -908,12 +908,6 @@ func (c *Config) ResolvePG() (PGConfig, error) {
 		}
 		pg.MachineName = h
 	}
-	if len(pg.Projects) > 0 && len(pg.ExcludeProjects) > 0 {
-		return pg, fmt.Errorf(
-			"pg.projects and pg.exclude_projects are " +
-				"mutually exclusive",
-		)
-	}
 	return pg, nil
 }
 

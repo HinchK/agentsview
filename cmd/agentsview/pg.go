@@ -86,6 +86,11 @@ func runPGPush(args []string) {
 		projects = nil
 	}
 
+	if len(projects) > 0 && len(excludeProjects) > 0 {
+		fatal("pg push: projects and exclude_projects " +
+			"are mutually exclusive")
+	}
+
 	database, err := db.Open(appCfg.DBPath)
 	if err != nil {
 		fatal("opening database: %v", err)

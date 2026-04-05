@@ -979,9 +979,11 @@ func TestResolvePG_ErrorsOnMissingBareEnvVar(t *testing.T) {
 	}
 }
 
-func TestResolvePG_RejectsMutuallyExclusiveFilters(
-	t *testing.T,
-) {
+// ResolvePG must not reject configs with both filter lists —
+// that's a push-specific concern validated in runPGPush after
+// CLI flags are merged. status and serve use ResolvePG too and
+// shouldn't fail on push-only filter conflicts.
+func TestResolvePG_AllowsBothFilterLists(t *testing.T) {
 	cfg := Config{
 		PG: PGConfig{
 			URL:             "postgres://localhost/test",
@@ -990,10 +992,10 @@ func TestResolvePG_RejectsMutuallyExclusiveFilters(
 		},
 	}
 	_, err := cfg.ResolvePG()
-	if err == nil {
-		t.Fatal("expected error for mutually exclusive filters")
-	}
-	if !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Errorf("error = %v, want mutually exclusive", err)
+	if err != nil {
+		t.Fatalf(
+			"ResolvePG should not reject filter conflicts: %v",
+			err,
+		)
 	}
 }
