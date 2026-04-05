@@ -1445,3 +1445,63 @@ func TestPushExcludeProject(t *testing.T) {
 		t.Errorf("project = %q, want alpha", pgProject)
 	}
 }
+
+func TestPushFilteredFullIsIncremental(t *testing.T) {
+	pgURL := testPGURL(t)
+	cleanPGSchema(t, pgURL)
+	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
+
+	local := testDB(t)
+
+	if err := local.UpsertSession(db.Session{
+		ID: "s1", Project: "alpha",
+		Machine: "local", Agent: "claude",
+		MessageCount: 1,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := local.InsertMessages([]db.Message{
+		{
+			SessionID: "s1", Ordinal: 0,
+			Role: "user", Content: "hello",
+		},
+	}); err != nil {
+		t.Fatalf("insert msg: %v", err)
+	}
+
+	ctx := context.Background()
+	ps, err := New(
+		pgURL, "agentsview", local,
+		"test-machine", true,
+		SyncOptions{Projects: []string{"alpha"}},
+	)
+	if err != nil {
+		t.Fatalf("creating sync: %v", err)
+	}
+	defer ps.Close()
+
+	if err := ps.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+
+	// First push with --full.
+	r1, err := ps.Push(ctx, true)
+	if err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if r1.SessionsPushed != 1 {
+		t.Fatalf("first push: sessions = %d, want 1",
+			r1.SessionsPushed)
+	}
+
+	// Second push (not --full) should be a no-op because
+	// fingerprints were persisted after the filtered --full.
+	r2, err := ps.Push(ctx, false)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if r2.SessionsPushed != 0 {
+		t.Errorf("second push: sessions = %d, want 0",
+			r2.SessionsPushed)
+	}
+}
