@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,8 +43,16 @@ func runPGPush(args []string) {
 	fs := flag.NewFlagSet("pg push", flag.ExitOnError)
 	full := fs.Bool("full", false,
 		"Force full local resync and PG push")
+	projectsFlag := fs.String("projects", "",
+		"Comma-separated list of projects to push (inclusive)")
+	excludeProjectsFlag := fs.String("exclude-projects", "",
+		"Comma-separated list of projects to exclude from push")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parsing flags: %v", err)
+	}
+
+	if *projectsFlag != "" && *excludeProjectsFlag != "" {
+		fatal("pg push: --projects and --exclude-projects are mutually exclusive")
 	}
 
 	appCfg, err := config.LoadMinimal()
@@ -61,6 +70,25 @@ func runPGPush(args []string) {
 	}
 	if pgCfg.URL == "" {
 		fatal("pg push: url not configured")
+	}
+
+	// CLI flags override config values entirely. When either
+	// flag is set, clear both config-derived lists so a CLI
+	// include can override a config exclude (and vice versa).
+	projects := pgCfg.Projects
+	excludeProjects := pgCfg.ExcludeProjects
+	if *projectsFlag != "" {
+		projects = splitProjectList(*projectsFlag)
+		excludeProjects = nil
+	}
+	if *excludeProjectsFlag != "" {
+		excludeProjects = splitProjectList(*excludeProjectsFlag)
+		projects = nil
+	}
+
+	// Validate mutual exclusivity (config values may conflict too).
+	if len(projects) > 0 && len(excludeProjects) > 0 {
+		fatal("pg push: projects and exclude_projects are mutually exclusive")
 	}
 
 	database, err := db.Open(appCfg.DBPath)
@@ -89,6 +117,7 @@ func runPGPush(args []string) {
 	ps, err := postgres.New(
 		pgCfg.URL, pgCfg.Schema, database,
 		pgCfg.MachineName, pgCfg.AllowInsecure,
+		projects, excludeProjects,
 	)
 	if err != nil {
 		fatal("pg push: %v", err)
@@ -151,6 +180,7 @@ func runPGStatus(args []string) {
 	ps, err := postgres.New(
 		pgCfg.URL, pgCfg.Schema, database,
 		pgCfg.MachineName, pgCfg.AllowInsecure,
+		nil, nil,
 	)
 	if err != nil {
 		fatal("pg status: %v", err)
@@ -314,4 +344,18 @@ func runPGServe(args []string) {
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("pg serve: %v", err)
 	}
+}
+
+// splitProjectList splits a comma-separated string into trimmed,
+// non-empty project names.
+func splitProjectList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

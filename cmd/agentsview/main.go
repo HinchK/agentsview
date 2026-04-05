@@ -57,6 +57,9 @@ func main() {
 		case "import":
 			runImport(os.Args[2:])
 			return
+		case "projects":
+			runProjects(os.Args[2:])
+			return
 		case "version", "--version", "-v":
 			fmt.Printf("agentsview %s (commit %s, built %s)\n",
 				version, commit, buildDate)
@@ -88,6 +91,7 @@ Usage:
   agentsview prune [flags]    Delete sessions matching filters
   agentsview import --type <type> <path>
                           Import conversations (claude-ai, chatgpt)
+  agentsview projects [flags] List projects with session counts
   agentsview update [flags]   Check for and install updates
   agentsview version          Show version information
   agentsview help             Show this help
@@ -111,6 +115,8 @@ Sync flags:
 
 PG push flags:
   -full              Bypass per-message skip heuristic
+  -projects string   Comma-separated projects to push (inclusive)
+  -exclude-projects string  Comma-separated projects to exclude from push
 
 PG serve flags:
   -host string       Host to bind to (default "127.0.0.1")
@@ -123,6 +129,9 @@ Prune flags:
   -first-message str  Sessions whose first message starts with this text
   -dry-run            Show what would be pruned without deleting
   -yes                Skip confirmation prompt
+
+Projects flags:
+  -json              Output as JSON array
 
 Update flags:
   -check              Check for updates without installing

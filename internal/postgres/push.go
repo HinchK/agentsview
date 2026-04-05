@@ -77,6 +77,27 @@ func (s *Sync) Push(
 		); err != nil {
 			return result, err
 		}
+		// When a filtered full push runs, clear persisted
+		// watermark and boundary state so the next
+		// unfiltered push also starts from scratch.
+		if s.isFiltered() {
+			if err := s.local.SetSyncState(
+				lastPushBoundaryStateKey, "",
+			); err != nil {
+				return result, fmt.Errorf(
+					"clearing boundary state: %w",
+					err,
+				)
+			}
+			if err := s.local.SetSyncState(
+				"last_push_at", "",
+			); err != nil {
+				return result, fmt.Errorf(
+					"clearing last_push_at: %w",
+					err,
+				)
+			}
+		}
 	}
 
 	// Coherence check: if the local watermark says we've
@@ -106,13 +127,38 @@ func (s *Sync) Push(
 			); err != nil {
 				return result, err
 			}
+			// When running a filtered push against a
+			// reset PG, clear both the watermark and
+			// boundary state so the next unfiltered push
+			// also triggers a full sync for the remaining
+			// projects. Both must be cleared together to
+			// avoid stale fingerprints surviving a partial
+			// recovery.
+			if s.isFiltered() {
+				if err := s.local.SetSyncState(
+					lastPushBoundaryStateKey, "",
+				); err != nil {
+					return result, fmt.Errorf(
+						"clearing boundary state: %w",
+						err,
+					)
+				}
+				if err := s.local.SetSyncState(
+					"last_push_at", "",
+				); err != nil {
+					return result, fmt.Errorf(
+						"clearing last_push_at: %w",
+						err,
+					)
+				}
+			}
 		}
 	}
 
 	cutoff := time.Now().UTC().Format(LocalSyncTimestampLayout)
 
 	allSessions, err := s.local.ListSessionsModifiedBetween(
-		ctx, lastPush, cutoff,
+		ctx, lastPush, cutoff, s.projects, s.excludeProjects,
 	)
 	if err != nil {
 		return result, fmt.Errorf(
@@ -152,7 +198,7 @@ func (s *Sync) Push(
 			)
 		}
 		boundarySessions, err := s.local.ListSessionsModifiedBetween(
-			ctx, windowStart, lastPush,
+			ctx, windowStart, lastPush, s.projects, s.excludeProjects,
 		)
 		if err != nil {
 			return result, fmt.Errorf(
@@ -196,10 +242,22 @@ func (s *Sync) Push(
 	})
 
 	if len(sessions) == 0 {
-		if err := finalizePushState(
-			s.local, cutoff, sessions, nil,
-		); err != nil {
-			return result, err
+		// Filtered pushes must not advance the global
+		// watermark but should still update fingerprints
+		// so repeated filtered runs stay incremental.
+		// Skip when lastPush is empty (--full/PG reset).
+		if s.isFiltered() && lastPush != "" {
+			if err := writePushBoundaryState(
+				s.local, lastPush, sessions, priorFingerprints,
+			); err != nil {
+				return result, err
+			}
+		} else if !s.isFiltered() {
+			if err := finalizePushState(
+				s.local, cutoff, sessions, nil,
+			); err != nil {
+				return result, err
+			}
 		}
 		result.Duration = time.Since(start)
 		return result, nil
@@ -241,22 +299,43 @@ func (s *Sync) Push(
 		}
 	}
 
-	// When all sessions succeeded, advance the watermark to
-	// cutoff. When some failed, keep the watermark at lastPush
-	// so the failed sessions (plus any already-pushed ones) are
-	// re-evaluated next time. Already-pushed sessions are
-	// fingerprint-matched and skipped cheaply.
-	finalizeCutoff := cutoff
-	var mergedFingerprints map[string]string
-	if result.Errors > 0 {
-		finalizeCutoff = lastPush
-		mergedFingerprints = priorFingerprints
-	}
-	if err := finalizePushState(
-		s.local, finalizeCutoff, pushed,
-		mergedFingerprints,
-	); err != nil {
-		return result, err
+	if s.isFiltered() {
+		// Filtered pushes update fingerprints for pushed
+		// sessions so subsequent filtered runs stay
+		// incremental, but do not advance the global
+		// watermark past sessions from other projects.
+		// Only write fingerprints when a watermark exists;
+		// an empty watermark means --full or PG reset
+		// cleared the state, and writing fingerprints
+		// would create stale entries that survive a
+		// subsequent PG reset undetected.
+		if lastPush != "" {
+			if err := writePushBoundaryState(
+				s.local, lastPush, pushed,
+				priorFingerprints,
+			); err != nil {
+				return result, err
+			}
+		}
+	} else {
+		// When all sessions succeeded, advance the watermark
+		// to cutoff. When some failed, keep the watermark at
+		// lastPush so the failed sessions (plus any
+		// already-pushed ones) are re-evaluated next time.
+		// Already-pushed sessions are fingerprint-matched and
+		// skipped cheaply.
+		finalizeCutoff := cutoff
+		var mergedFingerprints map[string]string
+		if result.Errors > 0 {
+			finalizeCutoff = lastPush
+			mergedFingerprints = priorFingerprints
+		}
+		if err := finalizePushState(
+			s.local, finalizeCutoff, pushed,
+			mergedFingerprints,
+		); err != nil {
+			return result, err
+		}
 	}
 
 	result.Duration = time.Since(start)
