@@ -81,21 +81,8 @@ func (s *Sync) Push(
 		// watermark and boundary state so the next
 		// unfiltered push also starts from scratch.
 		if s.isFiltered() {
-			if err := s.local.SetSyncState(
-				lastPushBoundaryStateKey, "",
-			); err != nil {
-				return result, fmt.Errorf(
-					"clearing boundary state: %w",
-					err,
-				)
-			}
-			if err := s.local.SetSyncState(
-				"last_push_at", "",
-			); err != nil {
-				return result, fmt.Errorf(
-					"clearing last_push_at: %w",
-					err,
-				)
+			if err := clearPushState(s.local); err != nil {
+				return result, err
 			}
 		}
 	}
@@ -127,29 +114,12 @@ func (s *Sync) Push(
 			); err != nil {
 				return result, err
 			}
-			// When running a filtered push against a
-			// reset PG, clear both the watermark and
-			// boundary state so the next unfiltered push
-			// also triggers a full sync for the remaining
-			// projects. Both must be cleared together to
-			// avoid stale fingerprints surviving a partial
-			// recovery.
+			// Filtered push against a reset PG: clear
+			// watermark and boundary state so the next
+			// unfiltered push also starts from scratch.
 			if s.isFiltered() {
-				if err := s.local.SetSyncState(
-					lastPushBoundaryStateKey, "",
-				); err != nil {
-					return result, fmt.Errorf(
-						"clearing boundary state: %w",
-						err,
-					)
-				}
-				if err := s.local.SetSyncState(
-					"last_push_at", "",
-				); err != nil {
-					return result, fmt.Errorf(
-						"clearing last_push_at: %w",
-						err,
-					)
+				if err := clearPushState(s.local); err != nil {
+					return result, err
 				}
 			}
 		}
@@ -465,6 +435,29 @@ func finalizePushState(
 	return writePushBoundaryState(
 		local, cutoff, sessions, priorFingerprints,
 	)
+}
+
+// clearPushState resets the watermark and boundary state so that
+// the next push starts from scratch. Used when a filtered push
+// runs --full or detects a PG reset, to avoid leaving stale
+// state that would cause the next unfiltered push to skip
+// sessions.
+func clearPushState(local syncStateStore) error {
+	if err := local.SetSyncState(
+		lastPushBoundaryStateKey, "",
+	); err != nil {
+		return fmt.Errorf(
+			"clearing boundary state: %w", err,
+		)
+	}
+	if err := local.SetSyncState(
+		"last_push_at", "",
+	); err != nil {
+		return fmt.Errorf(
+			"clearing last_push_at: %w", err,
+		)
+	}
+	return nil
 }
 
 func readBoundaryAndFingerprints(
