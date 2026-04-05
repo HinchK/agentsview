@@ -1246,3 +1246,202 @@ func TestPushSimplePK(t *testing.T) {
 		)
 	}
 }
+
+func TestPushFilteredByProject(t *testing.T) {
+	pgURL := testPGURL(t)
+	cleanPGSchema(t, pgURL)
+	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
+
+	local := testDB(t)
+
+	// Seed three sessions across three projects.
+	for _, s := range []db.Session{
+		{
+			ID: "s-alpha", Project: "alpha",
+			Machine: "local", Agent: "claude",
+			MessageCount: 1,
+		},
+		{
+			ID: "s-beta", Project: "beta",
+			Machine: "local", Agent: "claude",
+			MessageCount: 1,
+		},
+		{
+			ID: "s-gamma", Project: "gamma",
+			Machine: "local", Agent: "claude",
+			MessageCount: 1,
+		},
+	} {
+		if err := local.UpsertSession(s); err != nil {
+			t.Fatalf("upsert %s: %v", s.ID, err)
+		}
+		if err := local.InsertMessages([]db.Message{
+			{
+				SessionID: s.ID, Ordinal: 0,
+				Role: "user", Content: "msg " + s.ID,
+			},
+		}); err != nil {
+			t.Fatalf("insert msg %s: %v", s.ID, err)
+		}
+	}
+
+	ctx := context.Background()
+
+	// Step 1: push with project filter = ["alpha"].
+	filtered, err := New(
+		pgURL, "agentsview", local,
+		"test-machine", true,
+		SyncOptions{Projects: []string{"alpha"}},
+	)
+	if err != nil {
+		t.Fatalf("creating filtered sync: %v", err)
+	}
+	defer filtered.Close()
+
+	if err := filtered.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	r1, err := filtered.Push(ctx, false)
+	if err != nil {
+		t.Fatalf("filtered push: %v", err)
+	}
+	if r1.SessionsPushed != 1 {
+		t.Fatalf(
+			"filtered push: sessions = %d, want 1",
+			r1.SessionsPushed,
+		)
+	}
+
+	// Verify only alpha is in PG.
+	pgSessionCount := func(project string) int {
+		t.Helper()
+		var n int
+		err := filtered.pg.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM sessions "+
+				"WHERE project = $1",
+			project,
+		).Scan(&n)
+		if err != nil {
+			t.Fatalf("count %s: %v", project, err)
+		}
+		return n
+	}
+	if n := pgSessionCount("alpha"); n != 1 {
+		t.Errorf("alpha count = %d, want 1", n)
+	}
+	if n := pgSessionCount("beta"); n != 0 {
+		t.Errorf("beta count = %d, want 0", n)
+	}
+	if n := pgSessionCount("gamma"); n != 0 {
+		t.Errorf("gamma count = %d, want 0", n)
+	}
+
+	// Step 2: push unfiltered — beta and gamma should arrive.
+	unfiltered, err := New(
+		pgURL, "agentsview", local,
+		"test-machine", true,
+		SyncOptions{},
+	)
+	if err != nil {
+		t.Fatalf("creating unfiltered sync: %v", err)
+	}
+	defer unfiltered.Close()
+
+	r2, err := unfiltered.Push(ctx, false)
+	if err != nil {
+		t.Fatalf("unfiltered push: %v", err)
+	}
+	if r2.SessionsPushed < 2 {
+		t.Fatalf(
+			"unfiltered push: sessions = %d, want >= 2",
+			r2.SessionsPushed,
+		)
+	}
+
+	// Verify all three projects are in PG.
+	for _, p := range []string{"alpha", "beta", "gamma"} {
+		if n := pgSessionCount(p); n != 1 {
+			t.Errorf("%s count = %d, want 1", p, n)
+		}
+	}
+
+	// Step 3: second filtered push is a no-op (fingerprints
+	// match).
+	r3, err := filtered.Push(ctx, false)
+	if err != nil {
+		t.Fatalf("second filtered push: %v", err)
+	}
+	if r3.SessionsPushed != 0 {
+		t.Errorf(
+			"second filtered push: sessions = %d, want 0",
+			r3.SessionsPushed,
+		)
+	}
+}
+
+func TestPushExcludeProject(t *testing.T) {
+	pgURL := testPGURL(t)
+	cleanPGSchema(t, pgURL)
+	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
+
+	local := testDB(t)
+
+	for _, s := range []db.Session{
+		{
+			ID: "s-a", Project: "alpha",
+			Machine: "local", Agent: "claude",
+			MessageCount: 1,
+		},
+		{
+			ID: "s-b", Project: "beta",
+			Machine: "local", Agent: "claude",
+			MessageCount: 1,
+		},
+	} {
+		if err := local.UpsertSession(s); err != nil {
+			t.Fatalf("upsert %s: %v", s.ID, err)
+		}
+		if err := local.InsertMessages([]db.Message{
+			{
+				SessionID: s.ID, Ordinal: 0,
+				Role: "user", Content: "msg",
+			},
+		}); err != nil {
+			t.Fatalf("insert msg %s: %v", s.ID, err)
+		}
+	}
+
+	ctx := context.Background()
+
+	ps, err := New(
+		pgURL, "agentsview", local,
+		"test-machine", true,
+		SyncOptions{ExcludeProjects: []string{"beta"}},
+	)
+	if err != nil {
+		t.Fatalf("creating sync: %v", err)
+	}
+	defer ps.Close()
+
+	if err := ps.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	r, err := ps.Push(ctx, false)
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if r.SessionsPushed != 1 {
+		t.Fatalf("sessions = %d, want 1", r.SessionsPushed)
+	}
+
+	var pgProject string
+	err = ps.pg.QueryRowContext(ctx,
+		"SELECT project FROM sessions LIMIT 1",
+	).Scan(&pgProject)
+	if err != nil {
+		t.Fatalf("query pg: %v", err)
+	}
+	if pgProject != "alpha" {
+		t.Errorf("project = %q, want alpha", pgProject)
+	}
+}
