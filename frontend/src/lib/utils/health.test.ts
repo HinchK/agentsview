@@ -167,4 +167,19 @@ describe("setupVisibilityHealthCheck", () => {
     expect(init.headers).toBeUndefined();
     cleanup();
   });
+
+  it("skips health check in desktop mode", async () => {
+    // Simulate desktop mode by setting ?desktop in URL
+    Object.defineProperty(window, "location", {
+      value: { reload: reloadSpy, search: "?desktop=1" },
+      writable: true,
+    });
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("net"));
+    const cleanup = setupVisibilityHealthCheck(() => "/api/v1");
+    fireVisible();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(reloadSpy).not.toHaveBeenCalled();
+    cleanup();
+  });
 });

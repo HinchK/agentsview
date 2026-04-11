@@ -11,6 +11,11 @@ const TIMEOUT_MS = 3_000;
  * 4xx responses (401/403) are treated as proof the backend is alive
  * and do not trigger a reload — auth recovery is handled elsewhere.
  *
+ * In desktop mode (?desktop param present), this handler is a no-op
+ * because Tauri's on_window_event focus handler owns recovery and
+ * navigates to the correct absolute URL (which may differ from the
+ * current origin if the sidecar restarted on a new port).
+ *
  * The base URL is resolved lazily on each check so it stays current
  * if the connection target changes at runtime.
  *
@@ -19,6 +24,13 @@ const TIMEOUT_MS = 3_000;
 export function setupVisibilityHealthCheck(
   getBaseUrl: () => string,
 ): () => void {
+  // In desktop mode, Tauri owns recovery via on_window_event focus.
+  // Skip the frontend handler to avoid racing with Rust's navigate.
+  const isDesktop = new URLSearchParams(window.location.search).has(
+    "desktop",
+  );
+  if (isDesktop) return () => {};
+
   let lastCheck = 0;
 
   function onVisibilityChange() {
