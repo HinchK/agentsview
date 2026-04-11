@@ -91,6 +91,23 @@ fn launch_backend(app: &mut App) -> Result<(), DynError> {
     let (rx, child) = spawn_sidecar(app)?;
 
     save_sidecar(app, child)?;
+
+    let focus_window = window.clone();
+    let focus_handle = app.handle().clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Focused(true) = event {
+            let port = focus_handle
+                .state::<SidecarState>()
+                .backend_port
+                .lock()
+                .ok()
+                .and_then(|g| *g);
+            if let Some(port) = port {
+                recover_webview(&focus_window, port);
+            }
+        }
+    });
+
     forward_sidecar_logs(rx, window);
 
     Ok(())
@@ -528,6 +545,34 @@ fn main_window(app: &App) -> Result<WebviewWindow, DynError> {
 
 fn desktop_redirect_url(port: u16) -> String {
     format!("http://{HOST}:{port}?desktop=1")
+}
+
+/// Recover a dead or stale WebView on window focus.
+///
+/// Layer 1: try eval — if WKWebView content process was killed by
+/// macOS (sleep/wake, memory pressure), eval returns Err and we
+/// navigate to the backend URL which spawns a fresh content process.
+///
+/// Layer 2: if eval succeeds (content process alive), the injected
+/// JS pings the backend and reloads on failure — covers
+/// alive-but-disconnected WebViews.
+fn recover_webview(window: &WebviewWindow, port: u16) {
+    let health_js = "fetch('/api/v1/version',\
+        {signal:AbortSignal.timeout(3000)})\
+        .then(function(r){if(!r.ok)throw r})\
+        .catch(function(){location.reload()})";
+    match window.eval(health_js) {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!(
+                "[agentsview] WebView eval failed, recovering: {err}"
+            );
+            let url = desktop_redirect_url(port);
+            if let Ok(parsed) = Url::parse(url.as_str()) {
+                let _ = window.navigate(parsed);
+            }
+        }
+    }
 }
 
 fn redirect_when_ready(window: WebviewWindow, port: u16) {
