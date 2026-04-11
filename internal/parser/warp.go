@@ -212,11 +212,11 @@ func loadOneWarpConversation(
 
 // warpExchangeRow is a row from ai_queries.
 type warpExchangeRow struct {
-	exchangeID  string
-	startTS     string
-	input       string
-	modelID     string
-	workingDir  string
+	exchangeID   string
+	startTS      string
+	input        string
+	modelID      string
+	workingDir   string
 	outputStatus string
 }
 
@@ -269,15 +269,15 @@ func buildWarpSession(
 	}
 
 	var (
-		parsed       []ParsedMessage
-		firstMsg     string
-		startedAt    time.Time
-		endedAt      time.Time
-		project      string
-		cwd          string
-		ordinal      int
-		userCount    int
-		lastModel    string
+		parsed    []ParsedMessage
+		firstMsg  string
+		startedAt time.Time
+		endedAt   time.Time
+		project   string
+		cwd       string
+		ordinal   int
+		userCount int
+		lastModel string
 	)
 
 	for _, e := range exchanges {
@@ -376,19 +376,19 @@ type warpConversationMeta struct {
 }
 
 type warpToolStats struct {
-	RunCommand           int
-	ReadFiles            int
-	SearchCodebase       int
-	Grep                 int
-	FileGlob             int
-	ApplyFileDiff        int
-	WriteLongRunning     int
-	ReadMCPResource      int
-	CallMCPTool          int
-	SuggestPlan          int
-	SuggestCreatePlan    int
-	ReadShellCmdOutput   int
-	UseComputer          int
+	RunCommand         int
+	ReadFiles          int
+	SearchCodebase     int
+	Grep               int
+	FileGlob           int
+	ApplyFileDiff      int
+	WriteLongRunning   int
+	ReadMCPResource    int
+	CallMCPTool        int
+	SuggestPlan        int
+	SuggestCreatePlan  int
+	ReadShellCmdOutput int
+	UseComputer        int
 }
 
 func parseWarpConversationMeta(data string) warpConversationMeta {
@@ -404,21 +404,21 @@ func parseWarpConversationMeta(data string) warpConversationMeta {
 				BYOKTokens int `json:"byok_tokens"`
 			} `json:"token_usage"`
 			ToolUsage struct {
-				RunCommand       struct{ Count int } `json:"run_command_stats"`
-				ReadFiles        struct{ Count int } `json:"read_files_stats"`
-				SearchCodebase   struct{ Count int } `json:"search_codebase_stats"`
-				Grep             struct{ Count int } `json:"grep_stats"`
-				FileGlob         struct{ Count int } `json:"file_glob_stats"`
-				ApplyFileDiff    struct {
+				RunCommand     struct{ Count int } `json:"run_command_stats"`
+				ReadFiles      struct{ Count int } `json:"read_files_stats"`
+				SearchCodebase struct{ Count int } `json:"search_codebase_stats"`
+				Grep           struct{ Count int } `json:"grep_stats"`
+				FileGlob       struct{ Count int } `json:"file_glob_stats"`
+				ApplyFileDiff  struct {
 					Count int `json:"count"`
 				} `json:"apply_file_diff_stats"`
-				WriteLongRunning struct{ Count int } `json:"write_to_long_running_shell_command_stats"`
-				ReadMCPResource  struct{ Count int } `json:"read_mcp_resource_stats"`
-				CallMCPTool      struct{ Count int } `json:"call_mcp_tool_stats"`
-				SuggestPlan      struct{ Count int } `json:"suggest_plan_stats"`
+				WriteLongRunning  struct{ Count int } `json:"write_to_long_running_shell_command_stats"`
+				ReadMCPResource   struct{ Count int } `json:"read_mcp_resource_stats"`
+				CallMCPTool       struct{ Count int } `json:"call_mcp_tool_stats"`
+				SuggestPlan       struct{ Count int } `json:"suggest_plan_stats"`
 				SuggestCreatePlan struct{ Count int } `json:"suggest_create_plan_stats"`
-				ReadShellOutput  struct{ Count int } `json:"read_shell_command_output_stats"`
-				UseComputer      struct{ Count int } `json:"use_computer_stats"`
+				ReadShellOutput   struct{ Count int } `json:"read_shell_command_output_stats"`
+				UseComputer       struct{ Count int } `json:"use_computer_stats"`
 			} `json:"tool_usage_metadata"`
 		} `json:"conversation_usage_metadata"`
 	}

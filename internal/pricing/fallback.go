@@ -2,10 +2,41 @@ package pricing
 
 // FallbackPricing returns hardcoded pricing for key Claude
 // models. Used when the LiteLLM fetch fails.
+// Prices in USD per million tokens, current as of 2025-05.
 func FallbackPricing() []ModelPricing {
 	return []ModelPricing{
+		// Current model names (used by Claude Code / Codex)
+		{
+			ModelPattern:         "claude-sonnet-4-6",
+			InputPerMTok:         3.0,
+			OutputPerMTok:        15.0,
+			CacheCreationPerMTok: 3.75,
+			CacheReadPerMTok:     0.30,
+		},
+		{
+			ModelPattern:         "claude-opus-4-6",
+			InputPerMTok:         5.0,
+			OutputPerMTok:        25.0,
+			CacheCreationPerMTok: 6.25,
+			CacheReadPerMTok:     0.50,
+		},
+		{
+			ModelPattern:         "claude-haiku-4-5-20251001",
+			InputPerMTok:         1.0,
+			OutputPerMTok:        5.0,
+			CacheCreationPerMTok: 1.25,
+			CacheReadPerMTok:     0.10,
+		},
+		// Older model names (still in some session logs)
 		{
 			ModelPattern:         "claude-sonnet-4-20250514",
+			InputPerMTok:         3.0,
+			OutputPerMTok:        15.0,
+			CacheCreationPerMTok: 3.75,
+			CacheReadPerMTok:     0.30,
+		},
+		{
+			ModelPattern:         "claude-sonnet-4-5-20250514",
 			InputPerMTok:         3.0,
 			OutputPerMTok:        15.0,
 			CacheCreationPerMTok: 3.75,
@@ -24,13 +55,6 @@ func FallbackPricing() []ModelPricing {
 			OutputPerMTok:        4.0,
 			CacheCreationPerMTok: 1.0,
 			CacheReadPerMTok:     0.08,
-		},
-		{
-			ModelPattern:         "claude-sonnet-4-5-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
 		},
 	}
 }

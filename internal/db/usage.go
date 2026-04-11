@@ -88,7 +88,10 @@ SELECT
 FROM messages m
 JOIN sessions s ON m.session_id = s.id
 LEFT JOIN model_pricing p ON m.model = p.model_pattern
-WHERE m.token_usage != '' AND s.deleted_at IS NULL`
+WHERE m.token_usage != ''
+	AND m.model != ''
+	AND m.model != '<synthetic>'
+	AND s.deleted_at IS NULL`
 
 	var args []any
 

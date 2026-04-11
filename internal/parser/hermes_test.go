@@ -593,7 +593,7 @@ func TestDiscoverHermesSessions(t *testing.T) {
 		{
 			name: "JSONL takes priority over JSON",
 			files: map[string]string{
-				"20260403_153620_aaa.jsonl":  "{}",
+				"20260403_153620_aaa.jsonl":        "{}",
 				"session_20260403_153620_aaa.json": "{}",
 			},
 			wantFiles: []string{
@@ -615,8 +615,8 @@ func TestDiscoverHermesSessions(t *testing.T) {
 		{
 			name: "directories ignored",
 			files: map[string]string{
-				"20260403_aaa.jsonl":      "{}",
-				"subdir/nested.jsonl":     "{}",
+				"20260403_aaa.jsonl":  "{}",
+				"subdir/nested.jsonl": "{}",
 			},
 			wantFiles: []string{
 				"20260403_aaa.jsonl",
@@ -677,7 +677,7 @@ func TestFindHermesSourceFile(t *testing.T) {
 		{
 			name: "prefers JSONL over JSON",
 			files: map[string]string{
-				"20260403_aaa.jsonl":      "{}",
+				"20260403_aaa.jsonl":        "{}",
 				"session_20260403_aaa.json": "{}",
 			},
 			sessionID: "20260403_aaa",
