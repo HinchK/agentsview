@@ -308,6 +308,14 @@ func (db *DB) migrateColumns() error {
 			"ALTER TABLE messages ADD COLUMN has_output_tokens INTEGER NOT NULL DEFAULT 0",
 		},
 		{
+			"messages", "claude_message_id",
+			"ALTER TABLE messages ADD COLUMN claude_message_id TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "claude_request_id",
+			"ALTER TABLE messages ADD COLUMN claude_request_id TEXT NOT NULL DEFAULT ''",
+		},
+		{
 			"sessions", "total_output_tokens",
 			"ALTER TABLE sessions ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0",
 		},

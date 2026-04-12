@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS messages (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     has_context_tokens INTEGER NOT NULL DEFAULT 0,
     has_output_tokens INTEGER NOT NULL DEFAULT 0,
+    claude_message_id TEXT NOT NULL DEFAULT '',
+    claude_request_id TEXT NOT NULL DEFAULT '',
     UNIQUE(session_id, ordinal)
 );
 
