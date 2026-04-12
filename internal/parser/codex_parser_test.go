@@ -850,6 +850,96 @@ func TestParseCodexSession_TurnContextModel(t *testing.T) {
 	})
 }
 
+func TestParseCodexSession_TokenUsage(t *testing.T) {
+	t.Run("token_count attached to assistant message", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi there", tsEarlyS5),
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10000, 500, 6000),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 2)
+
+		// User message has no usage.
+		assert.Empty(t, msgs[0].TokenUsage)
+
+		// Assistant message has normalized usage.
+		assert.NotEmpty(t, msgs[1].TokenUsage)
+		assert.Contains(t, string(msgs[1].TokenUsage), `"input_tokens":10000`)
+		assert.Contains(t, string(msgs[1].TokenUsage), `"output_tokens":500`)
+		assert.Contains(t, string(msgs[1].TokenUsage), `"cache_read_input_tokens":6000`)
+		assert.Equal(t, 500, msgs[1].OutputTokens)
+		assert.Equal(t, 16000, msgs[1].ContextTokens) // 10000+6000
+		assert.True(t, msgs[1].HasOutputTokens)
+		assert.True(t, msgs[1].HasContextTokens)
+
+		// Session-level accumulation.
+		assert.True(t, sess.HasTotalOutputTokens)
+		assert.Equal(t, 500, sess.TotalOutputTokens)
+		assert.True(t, sess.HasPeakContextTokens)
+		assert.Equal(t, 16000, sess.PeakContextTokens)
+	})
+
+	t.Run("duplicate token_count events deduplicated", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-2", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi", tsEarlyS5),
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10000, 500, 6000),
+			// Streaming duplicates.
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10000, 500, 6000),
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10000, 500, 6000),
+		)
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.Len(t, msgs, 2)
+		assert.NotEmpty(t, msgs[1].TokenUsage)
+		assert.Equal(t, 500, msgs[1].OutputTokens)
+	})
+
+	t.Run("multiple turns get separate usage", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-3", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi", tsEarlyS5),
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10000, 500, 6000),
+			testjsonl.CodexMsgJSON("user", "think more", tsLate),
+			testjsonl.CodexMsgJSON("assistant", "deep thought", tsLateS5),
+			testjsonl.CodexTokenCountJSON(tsLateS5, 20000, 800, 12000),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.Len(t, msgs, 4)
+
+		// First assistant msg.
+		assert.Equal(t, 500, msgs[1].OutputTokens)
+		assert.Equal(t, 16000, msgs[1].ContextTokens)
+
+		// Second assistant msg.
+		assert.Equal(t, 800, msgs[3].OutputTokens)
+		assert.Equal(t, 32000, msgs[3].ContextTokens)
+
+		// Session totals.
+		assert.Equal(t, 1300, sess.TotalOutputTokens)
+		assert.Equal(t, 32000, sess.PeakContextTokens)
+	})
+
+	t.Run("no token_count leaves usage empty", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-4", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi", tsEarlyS5),
+		)
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.Len(t, msgs, 2)
+		assert.Empty(t, msgs[1].TokenUsage)
+		assert.Equal(t, 0, msgs[1].OutputTokens)
+	})
+}
+
 func TestParseCodexSession_EdgeCases(t *testing.T) {
 	t.Run("skips system messages", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(

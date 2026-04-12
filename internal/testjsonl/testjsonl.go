@@ -269,6 +269,30 @@ func CodexTurnContextJSON(model, timestamp string) string {
 	return mustMarshal(m)
 }
 
+// CodexTokenCountJSON returns a Codex event_msg with
+// payload.type=token_count and last_token_usage fields.
+func CodexTokenCountJSON(
+	timestamp string,
+	inputTokens, outputTokens, cachedInputTokens int,
+) string {
+	m := map[string]any{
+		"type":      "event_msg",
+		"timestamp": timestamp,
+		"payload": map[string]any{
+			"type": "token_count",
+			"info": map[string]any{
+				"last_token_usage": map[string]any{
+					"input_tokens":        inputTokens,
+					"output_tokens":       outputTokens,
+					"cached_input_tokens": cachedInputTokens,
+					"total_tokens":        inputTokens + outputTokens,
+				},
+			},
+		},
+	}
+	return mustMarshal(m)
+}
+
 // ClaudeEntryJSON returns a Claude JSONL entry with uuid and
 // parentUuid fields.
 func ClaudeEntryJSON(

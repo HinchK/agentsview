@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,7 @@ const (
 	codexTypeSessionMeta  = "session_meta"
 	codexTypeResponseItem = "response_item"
 	codexTypeTurnContext  = "turn_context"
+	codexTypeEventMsg     = "event_msg"
 	codexOriginatorExec   = "codex_exec"
 )
 
@@ -43,6 +45,7 @@ type codexSessionBuilder struct {
 	agentWaitCalls       map[string]string
 	pendingAgentEvents   map[string][]codexPendingEvent
 	orphanNotificationIx map[string]int
+	lastTokenUsageRaw    string // dedup streaming duplicates
 }
 
 type codexToolCallRef struct {
@@ -102,6 +105,8 @@ func (b *codexSessionBuilder) processLine(
 		b.currentModel = payload.Get("model").Str
 	case codexTypeResponseItem:
 		b.handleResponseItem(payload, ts)
+	case codexTypeEventMsg:
+		b.handleEventMsg(payload)
 	}
 	return false
 }
@@ -172,6 +177,60 @@ func (b *codexSessionBuilder) handleResponseItem(
 		Model:         b.currentModel,
 	})
 	b.ordinal++
+}
+
+func (b *codexSessionBuilder) handleEventMsg(
+	payload gjson.Result,
+) {
+	if payload.Get("type").Str != "token_count" {
+		return
+	}
+	raw := payload.Get("info.last_token_usage").Raw
+	if raw == "" || raw == b.lastTokenUsageRaw {
+		return
+	}
+	b.lastTokenUsageRaw = raw
+
+	// Find last message to attach usage to.
+	for i := len(b.messages) - 1; i >= 0; i-- {
+		if b.messages[i].TokenUsage != nil {
+			break
+		}
+		if b.messages[i].Role == RoleAssistant {
+			b.applyCodexTokenUsage(&b.messages[i], raw)
+			return
+		}
+	}
+}
+
+// applyCodexTokenUsage normalizes Codex token usage fields
+// into the format expected by the usage query:
+//
+//	input_tokens        → input_tokens
+//	output_tokens       → output_tokens
+//	cached_input_tokens → cache_read_input_tokens
+func (b *codexSessionBuilder) applyCodexTokenUsage(
+	msg *ParsedMessage, raw string,
+) {
+	usage := gjson.Parse(raw)
+	input := int(usage.Get("input_tokens").Int())
+	cached := int(usage.Get("cached_input_tokens").Int())
+	output := int(usage.Get("output_tokens").Int())
+
+	normalized := map[string]int{
+		"input_tokens":            input,
+		"output_tokens":           output,
+		"cache_read_input_tokens": cached,
+	}
+	j, err := json.Marshal(normalized)
+	if err != nil {
+		return
+	}
+	msg.TokenUsage = j
+	msg.OutputTokens = output
+	msg.HasOutputTokens = output > 0
+	msg.ContextTokens = input + cached
+	msg.HasContextTokens = input > 0 || cached > 0
 }
 
 func (b *codexSessionBuilder) handleFunctionCall(
@@ -1034,6 +1093,8 @@ func ParseCodexSession(
 			Mtime: info.ModTime().UnixNano(),
 		},
 	}
+
+	accumulateMessageTokenUsage(sess, b.messages)
 
 	return sess, b.messages, nil
 }
