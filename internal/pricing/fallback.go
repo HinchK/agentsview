@@ -2,7 +2,7 @@ package pricing
 
 // FallbackPricing returns hardcoded pricing for key Claude
 // models. Used when the LiteLLM fetch fails.
-// Prices in USD per million tokens, current as of 2025-05.
+// Prices in USD per million tokens, current as of 2026-04.
 func FallbackPricing() []ModelPricing {
 	return []ModelPricing{
 		// Current model names (used by Claude Code / Codex)
@@ -47,6 +47,11 @@ func FallbackPricing() []ModelPricing {
 			ModelPattern:  "gpt-5.4-mini",
 			InputPerMTok:  0.75,
 			OutputPerMTok: 4.50,
+		},
+		{
+			ModelPattern:  "gpt-5.4-nano",
+			InputPerMTok:  0.20,
+			OutputPerMTok: 1.25,
 		},
 		{
 			ModelPattern:  "gpt-5.1-codex-max",
