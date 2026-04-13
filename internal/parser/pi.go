@@ -85,6 +85,7 @@ func ParsePiSession(
 		firstMessage string
 		ordinal      int
 		userCount    int
+		currentModel string
 	)
 
 	for {
@@ -127,9 +128,12 @@ func ParsePiSession(
 				userCount++
 
 			case "assistant":
-				msg := parsePiAssistantMessage(line, ordinal)
+				msg := parsePiAssistantMessage(line, ordinal, currentModel)
 				if msg == nil {
 					continue
+				}
+				if msg.Model != "" {
+					currentModel = msg.Model
 				}
 				messages = append(messages, *msg)
 				ordinal++
@@ -146,7 +150,12 @@ func ParsePiSession(
 				// skip silently
 			}
 
-		case "model_change", "compaction":
+		case "model_change":
+			if id := gjson.Get(line, "modelId").Str; id != "" {
+				currentModel = id
+			}
+
+		case "compaction":
 			continue
 
 		default:
@@ -196,6 +205,8 @@ func ParsePiSession(
 		},
 	}
 
+	accumulateMessageTokenUsage(sess, messages)
+
 	return sess, messages, nil
 }
 
@@ -232,8 +243,12 @@ func parsePiUserMessage(line string, ordinal int) *ParsedMessage {
 }
 
 // parsePiAssistantMessage parses a message entry with role="assistant".
-// Returns nil if the entry is malformed.
-func parsePiAssistantMessage(line string, ordinal int) *ParsedMessage {
+// Returns nil if the entry is malformed. fallbackModel is the most
+// recent model id seen (from a prior assistant message or
+// model_change entry), used when this message has no inline model.
+func parsePiAssistantMessage(
+	line string, ordinal int, fallbackModel string,
+) *ParsedMessage {
 	var (
 		parts       []string
 		toolCalls   []ParsedToolCall
@@ -288,7 +303,7 @@ func parsePiAssistantMessage(line string, ordinal int) *ParsedMessage {
 	content := strings.Join(parts, "\n")
 	ts := piTimestamp(line)
 
-	return &ParsedMessage{
+	pm := &ParsedMessage{
 		Ordinal:       ordinal,
 		Role:          RoleAssistant,
 		Content:       content,
@@ -298,6 +313,61 @@ func parsePiAssistantMessage(line string, ordinal int) *ParsedMessage {
 		ContentLength: len(content),
 		ToolCalls:     toolCalls,
 	}
+	applyPiTokenUsage(pm, line, fallbackModel)
+	return pm
+}
+
+// applyPiTokenUsage extracts the assistant message's model and
+// per-message token counts from a Pi JSONL line. Pi records
+// usage as a flat object under message.usage with provider-
+// agnostic input/output keys plus optional cache breakdowns.
+// Cache fields are read from both the nested cache.{read,write}
+// shape (OpenCode-style) and the flat cacheRead/cacheCreation
+// shape (Anthropic-style) so both transports work.
+func applyPiTokenUsage(
+	pm *ParsedMessage, line, fallbackModel string,
+) {
+	if model := gjson.Get(line, "message.model").Str; model != "" {
+		pm.Model = model
+	} else if fallbackModel != "" {
+		pm.Model = fallbackModel
+	}
+
+	usage := gjson.Get(line, "message.usage")
+	if !usage.Exists() {
+		return
+	}
+
+	input := int(usage.Get("input").Int())
+	output := int(usage.Get("output").Int())
+	cacheRead := int(usage.Get("cache.read").Int())
+	if cacheRead == 0 {
+		cacheRead = int(usage.Get("cacheRead").Int())
+	}
+	cacheCreate := int(usage.Get("cache.write").Int())
+	if cacheCreate == 0 {
+		cacheCreate = int(usage.Get("cacheCreation").Int())
+	}
+
+	if input == 0 && output == 0 && cacheRead == 0 && cacheCreate == 0 {
+		return
+	}
+
+	normalized := map[string]int{
+		"input_tokens":                input,
+		"output_tokens":               output,
+		"cache_read_input_tokens":     cacheRead,
+		"cache_creation_input_tokens": cacheCreate,
+	}
+	j, err := json.Marshal(normalized)
+	if err != nil {
+		return
+	}
+	pm.TokenUsage = j
+	pm.OutputTokens = output
+	pm.HasOutputTokens = output > 0
+	pm.ContextTokens = input + cacheRead + cacheCreate
+	pm.HasContextTokens = pm.ContextTokens > 0
 }
 
 // parsePiToolResultMessage parses a message entry with role="toolResult".

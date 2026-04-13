@@ -261,6 +261,25 @@ func ensureFreshData(
 	engine.SyncAllSince(ctx, since, func(sync.Progress) {})
 }
 
+// seedPricingIfEmpty populates the model_pricing table on first
+// run when the server starts. Without this, a fresh install that
+// only ever opens the web dashboard sees $0 across the board
+// because no CLI command has fetched LiteLLM rates yet. It is
+// safe to call repeatedly: it only fetches when the table is
+// empty so curated rates from a prior `agentsview usage` run
+// are never overwritten.
+func seedPricingIfEmpty(database *db.DB) {
+	n, err := database.CountModelPricing()
+	if err != nil {
+		log.Printf("pricing seed: %v", err)
+		return
+	}
+	if n > 0 {
+		return
+	}
+	ensurePricing(database, false)
+}
+
 func ensurePricing(database *db.DB, offline bool) {
 	var prices []pricing.ModelPricing
 

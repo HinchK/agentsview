@@ -271,9 +271,29 @@ type openCodeMessageRow struct {
 }
 
 // openCodeMessageData holds the fields we extract from the
-// message data JSON blob.
+// message data JSON blob. Assistant rows additionally carry the
+// model id and per-message token counts that drive cost
+// calculation in the usage dashboard.
 type openCodeMessageData struct {
-	Role string `json:"role"`
+	Role    string                 `json:"role"`
+	ModelID string                 `json:"modelID"`
+	Tokens  *openCodeMessageTokens `json:"tokens,omitempty"`
+}
+
+// openCodeMessageTokens mirrors the OpenCode `tokens` object.
+// Reasoning tokens are recorded by OpenCode but are already
+// counted inside `output` for billing purposes, so they are
+// kept only as metadata and not added to output_tokens.
+type openCodeMessageTokens struct {
+	Input     int                  `json:"input"`
+	Output    int                  `json:"output"`
+	Reasoning int                  `json:"reasoning"`
+	Cache     openCodeMessageCache `json:"cache"`
+}
+
+type openCodeMessageCache struct {
+	Read  int `json:"read"`
+	Write int `json:"write"`
 }
 
 // openCodePartRow is a row from the opencode part table.
@@ -398,6 +418,7 @@ func buildOpenCodeSession(
 		pm := buildOpenCodeMessage(
 			ordinal, role, m.timeCreated, msgParts,
 		)
+		applyOpenCodeTokenUsage(&pm, md)
 		if strings.TrimSpace(pm.Content) == "" &&
 			!pm.HasToolUse {
 			continue
@@ -455,7 +476,47 @@ func buildOpenCodeSession(
 		},
 	}
 
+	accumulateMessageTokenUsage(sess, parsed)
+
 	return sess, parsed, nil
+}
+
+// applyOpenCodeTokenUsage copies the assistant message's model
+// id and per-message token counts into pm so the usage dashboard
+// can attribute cost. OpenCode's token field names use a nested
+// `cache.{read,write}` shape; this maps them onto the
+// agentsview-native `cache_{read,creation}_input_tokens` keys
+// that internal/db/usage.go expects.
+func applyOpenCodeTokenUsage(
+	pm *ParsedMessage, md openCodeMessageData,
+) {
+	if md.ModelID != "" {
+		pm.Model = md.ModelID
+	}
+	if md.Tokens == nil {
+		return
+	}
+	t := md.Tokens
+	if t.Input == 0 && t.Output == 0 &&
+		t.Cache.Read == 0 && t.Cache.Write == 0 {
+		return
+	}
+
+	normalized := map[string]int{
+		"input_tokens":                t.Input,
+		"output_tokens":               t.Output,
+		"cache_read_input_tokens":     t.Cache.Read,
+		"cache_creation_input_tokens": t.Cache.Write,
+	}
+	j, err := json.Marshal(normalized)
+	if err != nil {
+		return
+	}
+	pm.TokenUsage = j
+	pm.OutputTokens = t.Output
+	pm.HasOutputTokens = t.Output > 0
+	pm.ContextTokens = t.Input + t.Cache.Read + t.Cache.Write
+	pm.HasContextTokens = pm.ContextTokens > 0
 }
 
 // openCodeDefaultTitleRe matches the exact placeholder format

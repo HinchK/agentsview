@@ -63,6 +63,20 @@ func (db *DB) UpsertModelPricing(
 	return tx.Commit()
 }
 
+// CountModelPricing returns the number of rows in model_pricing.
+// Used by the server to decide whether to seed pricing on
+// startup so a fresh install does not silently report $0 cost.
+func (db *DB) CountModelPricing() (int, error) {
+	var n int
+	err := db.getReader().QueryRow(
+		`SELECT count(*) FROM model_pricing`,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("counting model_pricing: %w", err)
+	}
+	return n, nil
+}
+
 // GetModelPricing returns pricing for an exact model match.
 // Returns nil, nil if not found.
 func (db *DB) GetModelPricing(

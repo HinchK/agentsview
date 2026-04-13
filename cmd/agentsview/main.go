@@ -260,6 +260,11 @@ func runServe(args []string) {
 		}
 	}
 
+	// Seed model_pricing after any resync swap so the new DB
+	// file (which doesn't carry pricing across the swap) gets
+	// populated before the dashboard starts answering requests.
+	go seedPricingIfEmpty(database)
+
 	// Auto-bind to 0.0.0.0 when remote access is enabled so the
 	// server is reachable from the network. Only override if the
 	// user hasn't explicitly set --host via the CLI flag.

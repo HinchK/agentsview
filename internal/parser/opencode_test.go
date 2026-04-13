@@ -2,6 +2,7 @@ package parser
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -423,4 +424,173 @@ func TestListOpenCodeSessionMeta_NonexistentDB(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertEq(t, "metas len", len(metas), 0)
+}
+
+// TestParseOpenCodeDB_TokenUsage verifies that an assistant
+// message with modelID and tokens populates ParsedMessage.Model
+// and TokenUsage in the agentsview-native key shape, and that
+// session totals roll up. Without this fix the usage dashboard
+// reports $0 for every OpenCode session.
+func TestParseOpenCodeDB_TokenUsage(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/home/user/code/myapp")
+	seeder.AddSession("ses_usage", "prj_1", "", "Usage Test",
+		1700000000000, 1700000060000)
+
+	seeder.AddMessage("msg_user", "ses_usage",
+		1700000000000, 1700000000000,
+		`{"role":"user"}`)
+	seeder.AddPart("prt_user", "msg_user", "ses_usage",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hi"}`)
+
+	// Assistant message with full token blob: input, output,
+	// cache.read, cache.write. Mirrors the real OpenCode shape
+	// for OpenAI and Anthropic providers.
+	assistantData := `{"role":"assistant","modelID":"gpt-5.2-codex",` +
+		`"providerID":"openai","cost":0.0186375,` +
+		`"tokens":{"input":10370,"output":35,"reasoning":0,` +
+		`"cache":{"read":0,"write":0}}}`
+	seeder.AddMessage("msg_asst", "ses_usage",
+		1700000010000, 1700000010000, assistantData)
+	seeder.AddPart("prt_asst", "msg_asst", "ses_usage",
+		1700000010000, 1700000010000,
+		`{"type":"text","text":"answer"}`)
+
+	// Second assistant with cache read+write to verify the
+	// nested cache.{read,write} fields map onto the
+	// cache_{read,creation}_input_tokens keys.
+	cacheData := `{"role":"assistant","modelID":"claude-sonnet-4-20250514",` +
+		`"providerID":"anthropic","cost":0.04641675,` +
+		`"tokens":{"input":1,"output":102,"reasoning":0,` +
+		`"cache":{"read":500,"write":11969}}}`
+	seeder.AddMessage("msg_asst2", "ses_usage",
+		1700000020000, 1700000020000, cacheData)
+	seeder.AddPart("prt_asst2", "msg_asst2", "ses_usage",
+		1700000020000, 1700000020000,
+		`{"type":"text","text":"answer2"}`)
+
+	sessions, err := ParseOpenCodeDB(dbPath, "testmachine")
+	if err != nil {
+		t.Fatalf("ParseOpenCodeDB: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions len = %d, want 1", len(sessions))
+	}
+	s := sessions[0]
+
+	var asst1, asst2 *ParsedMessage
+	for i := range s.Messages {
+		m := &s.Messages[i]
+		if m.Role != RoleAssistant {
+			continue
+		}
+		switch m.Model {
+		case "gpt-5.2-codex":
+			asst1 = m
+		case "claude-sonnet-4-20250514":
+			asst2 = m
+		}
+	}
+	if asst1 == nil {
+		t.Fatal("missing gpt-5.2-codex assistant message")
+	}
+	if asst2 == nil {
+		t.Fatal("missing claude-sonnet assistant message")
+	}
+
+	checkUsage := func(name string, m *ParsedMessage,
+		wantIn, wantOut, wantCacheRead, wantCacheCreate int) {
+		t.Helper()
+		if len(m.TokenUsage) == 0 {
+			t.Fatalf("%s: TokenUsage empty", name)
+		}
+		var got map[string]int
+		if err := json.Unmarshal(m.TokenUsage, &got); err != nil {
+			t.Fatalf("%s: unmarshal TokenUsage: %v", name, err)
+		}
+		assertEq(t, name+" input_tokens",
+			got["input_tokens"], wantIn)
+		assertEq(t, name+" output_tokens",
+			got["output_tokens"], wantOut)
+		assertEq(t, name+" cache_read_input_tokens",
+			got["cache_read_input_tokens"], wantCacheRead)
+		assertEq(t, name+" cache_creation_input_tokens",
+			got["cache_creation_input_tokens"], wantCacheCreate)
+		assertEq(t, name+" OutputTokens",
+			m.OutputTokens, wantOut)
+		assertEq(t, name+" HasOutputTokens",
+			m.HasOutputTokens, wantOut > 0)
+		wantCtx := wantIn + wantCacheRead + wantCacheCreate
+		assertEq(t, name+" ContextTokens",
+			m.ContextTokens, wantCtx)
+		assertEq(t, name+" HasContextTokens",
+			m.HasContextTokens, wantCtx > 0)
+	}
+
+	checkUsage("gpt", asst1, 10370, 35, 0, 0)
+	checkUsage("claude", asst2, 1, 102, 500, 11969)
+
+	// Session-level rollups via accumulateMessageTokenUsage.
+	if !s.Session.HasTotalOutputTokens {
+		t.Fatal("session HasTotalOutputTokens=false, want true")
+	}
+	assertEq(t, "TotalOutputTokens",
+		s.Session.TotalOutputTokens, 137) // 35 + 102
+	if !s.Session.HasPeakContextTokens {
+		t.Fatal("session HasPeakContextTokens=false, want true")
+	}
+	assertEq(t, "PeakContextTokens",
+		s.Session.PeakContextTokens, 12470) // 1 + 500 + 11969
+}
+
+// TestParseOpenCodeDB_NoTokenUsage verifies that assistant
+// messages with no tokens block (e.g. errored requests) leave
+// TokenUsage empty so they are filtered out by the usage query.
+func TestParseOpenCodeDB_NoTokenUsage(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/tmp/proj")
+	seeder.AddSession("ses_err", "prj_1", "", "Errored",
+		1700000000000, 1700000010000)
+
+	seeder.AddMessage("msg_u", "ses_err",
+		1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_err",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hi"}`)
+
+	// No tokens block at all (errored request).
+	seeder.AddMessage("msg_a", "ses_err",
+		1700000005000, 1700000005000,
+		`{"role":"assistant","modelID":"gpt-5.4","providerID":"openai"}`)
+	seeder.AddPart("prt_a", "msg_a", "ses_err",
+		1700000005000, 1700000005000,
+		`{"type":"text","text":"oops"}`)
+
+	sessions, err := ParseOpenCodeDB(dbPath, "m")
+	if err != nil {
+		t.Fatalf("ParseOpenCodeDB: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions len = %d, want 1", len(sessions))
+	}
+
+	var asst *ParsedMessage
+	for i := range sessions[0].Messages {
+		if sessions[0].Messages[i].Role == RoleAssistant {
+			asst = &sessions[0].Messages[i]
+			break
+		}
+	}
+	if asst == nil {
+		t.Fatal("missing assistant message")
+	}
+	assertEq(t, "Model", asst.Model, "gpt-5.4")
+	if len(asst.TokenUsage) != 0 {
+		t.Fatalf("TokenUsage = %q, want empty", string(asst.TokenUsage))
+	}
 }

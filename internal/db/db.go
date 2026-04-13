@@ -25,7 +25,12 @@ import (
 // formatting changes). Old databases with a lower user_version
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
-const dataVersion = 9
+//
+// Bumped to 10: opencode and pi parsers now extract per-message
+// model id and token usage so the cost dashboard attributes
+// non-Claude/Codex sessions correctly. Existing rows have empty
+// model and token_usage and need a reparse to backfill.
+const dataVersion = 10
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
