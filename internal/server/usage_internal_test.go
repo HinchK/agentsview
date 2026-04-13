@@ -84,18 +84,29 @@ func TestComputeCacheStats_HitRate(t *testing.T) {
 	}
 }
 
-func TestComputeCacheStats_UncachedInputNonNegative(t *testing.T) {
-	// Pathological case where cache tokens exceed total
-	// input (can happen because the tallies come from
-	// different JSON fields). UncachedInputTokens must clamp
-	// to 0, not go negative.
+func TestComputeCacheStats_UncachedPassesInputThrough(t *testing.T) {
+	// Anthropic's input_tokens field is the NON-cached portion
+	// of the input; cache_read and cache_creation are tracked
+	// separately. UncachedInputTokens must therefore equal
+	// InputTokens directly — not input minus the cache buckets,
+	// which would double-subtract and wrongly drive the value
+	// toward zero for any cached workload.
 	cs := computeCacheStats(db.UsageTotals{
 		InputTokens:         100,
 		CacheReadTokens:     200,
 		CacheCreationTokens: 50,
 	})
-	if cs.UncachedInputTokens != 0 {
-		t.Errorf("UncachedInputTokens = %d, want 0",
+	if cs.UncachedInputTokens != 100 {
+		t.Errorf("UncachedInputTokens = %d, want 100",
 			cs.UncachedInputTokens)
+	}
+	// And the cache buckets are reported verbatim alongside it.
+	if cs.CacheReadTokens != 200 {
+		t.Errorf("CacheReadTokens = %d, want 200",
+			cs.CacheReadTokens)
+	}
+	if cs.CacheCreationTokens != 50 {
+		t.Errorf("CacheCreationTokens = %d, want 50",
+			cs.CacheCreationTokens)
 	}
 }

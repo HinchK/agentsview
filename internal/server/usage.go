@@ -223,12 +223,14 @@ func foldAgentTotals(
 // v1 ballpark; a future iteration can compute weighted rates
 // from per-model breakdowns.
 func computeCacheStats(t db.UsageTotals) CacheStats {
-	uncached := max(t.InputTokens-t.CacheReadTokens-
-		t.CacheCreationTokens, 0)
+	// Anthropic reports input_tokens as the NON-cached portion
+	// of the input (cache_read and cache_creation are separate
+	// fields), so UncachedInputTokens is just t.InputTokens
+	// directly — no subtraction.
 	cs := CacheStats{
 		CacheReadTokens:     t.CacheReadTokens,
 		CacheCreationTokens: t.CacheCreationTokens,
-		UncachedInputTokens: uncached,
+		UncachedInputTokens: t.InputTokens,
 		OutputTokens:        t.OutputTokens,
 	}
 	denominator := t.CacheReadTokens + t.InputTokens
@@ -322,6 +324,9 @@ func (s *Server) handleUsageSummary(
 		if handleContextError(w, err) {
 			return
 		}
+		if handleReadOnly(w, err) {
+			return
+		}
 		log.Printf("usage summary error: %v", err)
 		writeError(w, http.StatusInternalServerError,
 			"internal server error")
@@ -336,6 +341,9 @@ func (s *Server) handleUsageSummary(
 	)
 	if err != nil {
 		if handleContextError(w, err) {
+			return
+		}
+		if handleReadOnly(w, err) {
 			return
 		}
 		log.Printf("usage session counts error: %v", err)
@@ -397,6 +405,9 @@ func (s *Server) handleUsageTopSessions(
 	)
 	if err != nil {
 		if handleContextError(w, err) {
+			return
+		}
+		if handleReadOnly(w, err) {
 			return
 		}
 		log.Printf("usage top sessions error: %v", err)

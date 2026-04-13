@@ -69,32 +69,32 @@ func (s *Store) GetSessionVersion(
 
 // ------------------------------------------------------------
 // Usage stubs (not yet implemented for PG)
+//
+// These return db.ErrReadOnly so the usage HTTP handlers can map
+// them to 501 Not Implemented. Returning empty results silently
+// would look like "no usage data" on a fully populated PG
+// deployment, which is far worse than an explicit error.
 // ------------------------------------------------------------
 
 // GetDailyUsage is not implemented for PG.
 func (s *Store) GetDailyUsage(
 	_ context.Context, _ db.UsageFilter,
 ) (db.DailyUsageResult, error) {
-	return db.DailyUsageResult{
-		Daily: []db.DailyUsageEntry{},
-	}, nil
+	return db.DailyUsageResult{}, db.ErrReadOnly
 }
 
 // GetTopSessionsByCost is not implemented for PG.
 func (s *Store) GetTopSessionsByCost(
 	_ context.Context, _ db.UsageFilter, _ int,
 ) ([]db.TopSessionEntry, error) {
-	return []db.TopSessionEntry{}, nil
+	return nil, db.ErrReadOnly
 }
 
 // GetUsageSessionCounts is not implemented for PG.
 func (s *Store) GetUsageSessionCounts(
 	_ context.Context, _ db.UsageFilter,
 ) (db.UsageSessionCounts, error) {
-	return db.UsageSessionCounts{
-		ByProject: make(map[string]int),
-		ByAgent:   make(map[string]int),
-	}, nil
+	return db.UsageSessionCounts{}, db.ErrReadOnly
 }
 
 // ------------------------------------------------------------
