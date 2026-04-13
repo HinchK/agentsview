@@ -93,6 +93,14 @@ func NewEngine(
 // pass so subsequent process starts do not re-scan files.
 // New skip entries for real parse errors on exec files are
 // untouched here and honored normally on later syncs.
+//
+// The cleanup builds a rebuilt snapshot and writes it through
+// the atomic ReplaceSkippedFiles, then only mutates the
+// in-memory map and records the done flag after the persist
+// succeeds. A partial failure leaves both the DB and the
+// in-memory cache in their prior state so the migration is
+// retried on the next startup rather than being falsely
+// marked complete.
 func migrateLegacyCodexExecSkips(
 	database *db.DB, skipCache map[string]int64,
 ) {
@@ -105,22 +113,34 @@ func migrateLegacyCodexExecSkips(
 		return
 	}
 
-	removed := 0
-	for path := range skipCache {
-		if !strings.HasSuffix(path, ".jsonl") {
+	cleaned := make(map[string]int64, len(skipCache))
+	var legacy []string
+	for path, mtime := range skipCache {
+		if strings.HasSuffix(path, ".jsonl") &&
+			parser.IsCodexExecSessionFile(path) {
+			legacy = append(legacy, path)
 			continue
 		}
-		if !parser.IsCodexExecSessionFile(path) {
-			continue
-		}
-		delete(skipCache, path)
-		if err := database.DeleteSkippedFile(path); err != nil {
+		cleaned[path] = mtime
+	}
+
+	if len(legacy) > 0 {
+		if err := database.ReplaceSkippedFiles(
+			cleaned,
+		); err != nil {
 			log.Printf(
-				"codex exec migration: delete %s: %v",
-				path, err,
+				"codex exec migration: persist cleaned skip cache: %v",
+				err,
 			)
+			return
 		}
-		removed++
+		for _, p := range legacy {
+			delete(skipCache, p)
+		}
+		log.Printf(
+			"codex exec legacy migration: cleared %d skip entries",
+			len(legacy),
+		)
 	}
 
 	if err := database.SetSyncState(
@@ -128,13 +148,6 @@ func migrateLegacyCodexExecSkips(
 	); err != nil {
 		log.Printf(
 			"codex exec migration: set flag: %v", err,
-		)
-		return
-	}
-	if removed > 0 {
-		log.Printf(
-			"codex exec legacy migration: cleared %d skip entries",
-			removed,
 		)
 	}
 }
