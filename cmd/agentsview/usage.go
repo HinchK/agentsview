@@ -276,8 +276,11 @@ func seedPricing(database *db.DB) {
 		log.Printf("pricing seed: %v", err)
 	}
 	if stored != pricing.FallbackVersion {
-		upsertPricing(database, pricing.FallbackPricing())
-		if err := database.SetPricingMeta(
+		if err := upsertPricing(
+			database, pricing.FallbackPricing(),
+		); err != nil {
+			log.Printf("pricing seed: %v", err)
+		} else if err := database.SetPricingMeta(
 			metaKey, pricing.FallbackVersion,
 		); err != nil {
 			log.Printf("pricing seed: %v", err)
@@ -298,7 +301,9 @@ func refreshPricingFromLiteLLM(database *db.DB) {
 		)
 		return
 	}
-	upsertPricing(database, prices)
+	if err := upsertPricing(database, prices); err != nil {
+		log.Printf("pricing refresh: upsert failed: %v", err)
+	}
 }
 
 func ensurePricing(database *db.DB, offline bool) {
@@ -317,7 +322,10 @@ func ensurePricing(database *db.DB, offline bool) {
 		}
 	}
 
-	upsertPricing(database, prices)
+	if err := upsertPricing(database, prices); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"warning: pricing upsert failed: %v\n", err)
+	}
 }
 
 // upsertPricing copies pricing rows into the db.ModelPricing
@@ -326,7 +334,7 @@ func ensurePricing(database *db.DB, offline bool) {
 // refreshPricingFromLiteLLM (async refresh).
 func upsertPricing(
 	database *db.DB, prices []pricing.ModelPricing,
-) {
+) error {
 	dbPrices := make([]db.ModelPricing, len(prices))
 	for i, p := range prices {
 		dbPrices[i] = db.ModelPricing{
@@ -337,9 +345,7 @@ func upsertPricing(
 			CacheReadPerMTok:     p.CacheReadPerMTok,
 		}
 	}
-	if err := database.UpsertModelPricing(dbPrices); err != nil {
-		log.Printf("pricing upsert: %v", err)
-	}
+	return database.UpsertModelPricing(dbPrices)
 }
 
 func printDailyTable(
