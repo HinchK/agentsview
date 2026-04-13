@@ -1137,6 +1137,12 @@ func ParseCodexSession(
 // no turn_context is found before the offset. Used to seed
 // currentModel for incremental parses that resume past turn
 // boundaries.
+// readCodexModelAtOffset scans a Codex JSONL file from the
+// start up to the given byte offset and returns the model
+// from the most recent turn_context entry. Mirrors the full
+// parser: every turn_context unconditionally overwrites the
+// model, including empty strings. Returns "" when no
+// turn_context is found before the offset.
 func readCodexModelAtOffset(
 	path string, offset int64,
 ) string {
@@ -1158,9 +1164,7 @@ func readCodexModelAtOffset(
 		if gjson.Get(line, "type").Str != codexTypeTurnContext {
 			continue
 		}
-		if m := gjson.Get(line, "payload.model").Str; m != "" {
-			model = m
-		}
+		model = gjson.Get(line, "payload.model").Str
 	}
 	return model
 }
@@ -1170,15 +1174,27 @@ func readCodexModelAtOffset(
 // the newly parsed messages (with ordinals starting at
 // startOrdinal) and the latest timestamp seen. Used for
 // incremental re-parsing of large append-only session files.
+//
+// lastModel seeds the builder's currentModel so that messages
+// appearing before the first turn_context in the new chunk
+// inherit the correct model. Callers should pass the value
+// from IncrementalInfo.LastModel (fast DB lookup). When
+// lastModel is empty, the function falls back to a file
+// pre-scan via readCodexModelAtOffset.
 func ParseCodexSessionFrom(
 	path string,
 	offset int64,
 	startOrdinal int,
 	includeExec bool,
+	lastModel string,
 ) ([]ParsedMessage, time.Time, int64, error) {
 	b := newCodexSessionBuilder(includeExec)
 	b.ordinal = startOrdinal
-	b.currentModel = readCodexModelAtOffset(path, offset)
+	if lastModel != "" {
+		b.currentModel = lastModel
+	} else {
+		b.currentModel = readCodexModelAtOffset(path, offset)
+	}
 	var fallbackErr error
 
 	consumed, err := readJSONLFrom(

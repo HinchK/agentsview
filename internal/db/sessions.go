@@ -721,6 +721,7 @@ type IncrementalInfo struct {
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
 	HasPeakContextTokens bool
+	LastModel            string
 }
 
 // GetSessionForIncremental returns session state needed for
@@ -744,23 +745,33 @@ func (db *DB) GetSessionForIncremental(
 
 	var info IncrementalInfo
 	var fs sql.NullInt64
+	var lastModel sql.NullString
 	err = db.getReader().QueryRow(
-		`SELECT id, file_size, message_count,
-			user_message_count,
-			total_output_tokens, peak_context_tokens,
-			has_total_output_tokens, has_peak_context_tokens
-		 FROM sessions WHERE file_path = ?`,
+		`SELECT s.id, s.file_size, s.message_count,
+			s.user_message_count,
+			s.total_output_tokens, s.peak_context_tokens,
+			s.has_total_output_tokens,
+			s.has_peak_context_tokens,
+			(SELECT m.model FROM messages m
+			 WHERE m.session_id = s.id
+			   AND m.model != ''
+			 ORDER BY m.ordinal DESC LIMIT 1)
+		 FROM sessions s WHERE s.file_path = ?`,
 		path,
 	).Scan(
 		&info.ID, &fs, &info.MsgCount, &info.UserMsgCount,
 		&info.TotalOutputTokens, &info.PeakContextTokens,
 		&info.HasTotalOutputTokens, &info.HasPeakContextTokens,
+		&lastModel,
 	)
 	if err != nil {
 		return nil, false
 	}
 	if fs.Valid {
 		info.FileSize = fs.Int64
+	}
+	if lastModel.Valid {
+		info.LastModel = lastModel.String
 	}
 	info.HasTotalOutputTokens =
 		info.HasTotalOutputTokens || info.TotalOutputTokens != 0

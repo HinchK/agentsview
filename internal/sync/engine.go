@@ -1867,13 +1867,20 @@ func (e *Engine) processCodex(
 		return processResult{skip: true}
 	}
 
-	// Try incremental parse for append-only JSONL files
-	// that have already been synced.
+	// Pre-fetch the last known model so the incremental
+	// closure can seed it without a file re-scan.
+	var lastModel string
+	if inc, ok := e.db.GetSessionForIncremental(
+		file.Path,
+	); ok {
+		lastModel = inc.LastModel
+	}
+
 	codexParseFn := func(
 		path string, offset int64, startOrd int,
 	) ([]parser.ParsedMessage, time.Time, int64, error) {
 		return parser.ParseCodexSessionFrom(
-			path, offset, startOrd, false,
+			path, offset, startOrd, false, lastModel,
 		)
 	}
 	if res, ok := e.tryIncrementalJSONL(

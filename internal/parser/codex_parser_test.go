@@ -1063,7 +1063,7 @@ func TestParseCodexSessionFrom_Incremental(t *testing.T) {
 
 	// Incremental parse from the offset.
 	newMsgs, endedAt, _, err := ParseCodexSessionFrom(
-		path, offset, 1, false,
+		path, offset, 1, false, "",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(newMsgs))
@@ -1112,7 +1112,7 @@ func TestParseCodexSessionFrom_SkipsSessionMeta(t *testing.T) {
 	f.Close()
 
 	newMsgs, _, _, err := ParseCodexSessionFrom(
-		path, offset, 5, false,
+		path, offset, 5, false, "",
 	)
 	require.NoError(t, err)
 	// Only the assistant message, not the session_meta.
@@ -1136,7 +1136,7 @@ func TestParseCodexSessionFrom_NoNewData(t *testing.T) {
 
 	// Parse from end of file — no new data.
 	newMsgs, endedAt, _, err := ParseCodexSessionFrom(
-		path, offset, 10, false,
+		path, offset, 10, false, "",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 0, len(newMsgs))
@@ -1168,7 +1168,7 @@ func TestParseCodexSessionFrom_SubagentOutputRequiresFullParse(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = ParseCodexSessionFrom(path, offset, 2, false)
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 2, false, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "full parse")
 }
@@ -1206,7 +1206,7 @@ func TestParseCodexSessionFrom_WaitCallRequiresFullParse(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = ParseCodexSessionFrom(path, offset, 4, false)
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 4, false, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "full parse")
 }
@@ -1232,7 +1232,7 @@ func TestParseCodexSessionFrom_SystemMessageDoesNotRequireFullParse(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, endedAt, _, err := ParseCodexSessionFrom(path, offset, 1, false)
+	newMsgs, endedAt, _, err := ParseCodexSessionFrom(path, offset, 1, false, "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, len(newMsgs))
 	assert.False(t, endedAt.IsZero())
@@ -1263,7 +1263,7 @@ func TestParseCodexSessionFrom_RunningNotificationRequiresFullParse(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = ParseCodexSessionFrom(path, offset, 1, false)
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 1, false, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "full parse")
 }
@@ -1289,7 +1289,7 @@ func TestParseCodexSessionFrom_NonSubagentFunctionOutputDoesNotRequireFullParse(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, endedAt, _, err := ParseCodexSessionFrom(path, offset, 1, false)
+	newMsgs, endedAt, _, err := ParseCodexSessionFrom(path, offset, 1, false, "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, len(newMsgs))
 	assert.False(t, endedAt.IsZero())
@@ -1331,14 +1331,24 @@ func TestParseCodexSessionFrom_SeedsModelFromTurnContext(
 	require.NoError(t, err)
 	require.NoError(t, f2.Close())
 
+	// File-scan fallback path (lastModel="").
 	newMsgs2, _, _, err := ParseCodexSessionFrom(
-		path, offset, 2, false,
+		path, offset, 2, false, "",
 	)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(newMsgs2))
 	assert.Equal(t, "gpt-5.4", newMsgs2[0].Model,
-		"incremental parse should seed model from "+
+		"file-scan fallback should seed model from "+
 			"prior turn_context")
+
+	// DB-first path (lastModel provided by caller).
+	newMsgs3, _, _, err := ParseCodexSessionFrom(
+		path, offset, 2, false, "gpt-5.4",
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(newMsgs3))
+	assert.Equal(t, "gpt-5.4", newMsgs3[0].Model,
+		"DB-provided lastModel should seed model")
 }
 
 func TestReadCodexModelAtOffset(t *testing.T) {
