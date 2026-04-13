@@ -261,31 +261,13 @@ func ensureFreshData(
 	engine.SyncAllSince(ctx, since, func(sync.Progress) {})
 }
 
-// seedPricingIfEmpty populates the model_pricing table on first
-// run when the server starts. Without this, a fresh install
-// that only ever opens the web dashboard sees $0 across the
-// board because no CLI command has fetched LiteLLM rates yet.
-// It is safe to call repeatedly: it only seeds when the table
-// is empty so curated rates from a prior `agentsview usage`
-// run are never overwritten.
-//
-// The seed runs in two stages:
-//
-//  1. Synchronous upsert of the hardcoded fallback rates so the
-//     dashboard and any startup-waiting CLI probes observe a
-//     populated table as soon as the server accepts requests.
-//  2. Background LiteLLM refresh so the full multi-provider
-//     catalog lands shortly after startup without holding the
-//     listen socket behind a 30-second HTTP timeout.
-func seedPricingIfEmpty(database *db.DB) {
-	n, err := database.CountModelPricing()
-	if err != nil {
-		log.Printf("pricing seed: %v", err)
-		return
-	}
-	if n > 0 {
-		return
-	}
+// seedPricing upserts hardcoded fallback rates into
+// model_pricing on every server start, then kicks off a
+// background LiteLLM refresh that overwrites them with live
+// data. The unconditional upsert ensures corrected fallback
+// rates propagate to existing databases without requiring a
+// schema migration.
+func seedPricing(database *db.DB) {
 	upsertPricing(database, pricing.FallbackPricing())
 	go refreshPricingFromLiteLLM(database)
 }
@@ -326,7 +308,7 @@ func ensurePricing(database *db.DB, offline bool) {
 
 // upsertPricing copies pricing rows into the db.ModelPricing
 // shape and upserts them. Shared by ensurePricing (CLI),
-// seedPricingIfEmpty (sync fallback), and
+// seedPricing (startup fallback), and
 // refreshPricingFromLiteLLM (async refresh).
 func upsertPricing(
 	database *db.DB, prices []pricing.ModelPricing,
