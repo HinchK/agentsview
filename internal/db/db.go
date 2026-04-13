@@ -26,11 +26,12 @@ import (
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
-// Bumped to 10: opencode and pi parsers now extract per-message
-// model id and token usage so the cost dashboard attributes
-// non-Claude/Codex sessions correctly. Existing rows have empty
-// model and token_usage and need a reparse to backfill.
-const dataVersion = 10
+// Bumped to 11: codex incremental parser was not seeding
+// currentModel from prior turn_context lines, causing all
+// incrementally parsed messages to store an empty model
+// string. The usage query filters these out, so codex cost
+// tracking froze after the initial full parse.
+const dataVersion = 11
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

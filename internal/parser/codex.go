@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1130,6 +1131,40 @@ func ParseCodexSession(
 	return sess, b.messages, nil
 }
 
+// readCodexModelAtOffset scans a Codex JSONL file from the
+// start up to the given byte offset and returns the model
+// from the most recent turn_context entry. Returns "" when
+// no turn_context is found before the offset. Used to seed
+// currentModel for incremental parses that resume past turn
+// boundaries.
+func readCodexModelAtOffset(
+	path string, offset int64,
+) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	lr := newLineReader(
+		io.LimitReader(f, offset), maxLineSize,
+	)
+	var model string
+	for {
+		line, ok := lr.next()
+		if !ok {
+			break
+		}
+		if gjson.Get(line, "type").Str != codexTypeTurnContext {
+			continue
+		}
+		if m := gjson.Get(line, "payload.model").Str; m != "" {
+			model = m
+		}
+	}
+	return model
+}
+
 // ParseCodexSessionFrom parses only new lines from a Codex
 // JSONL file starting at the given byte offset. Returns only
 // the newly parsed messages (with ordinals starting at
@@ -1143,6 +1178,7 @@ func ParseCodexSessionFrom(
 ) ([]ParsedMessage, time.Time, int64, error) {
 	b := newCodexSessionBuilder(includeExec)
 	b.ordinal = startOrdinal
+	b.currentModel = readCodexModelAtOffset(path, offset)
 	var fallbackErr error
 
 	consumed, err := readJSONLFrom(
