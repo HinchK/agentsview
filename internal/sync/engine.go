@@ -1699,7 +1699,7 @@ func (e *Engine) shouldSkipFile(
 	sessionID string, info os.FileInfo,
 ) bool {
 	storedSize, storedMtime, ok := e.db.GetSessionFileInfo(
-		sessionID,
+		e.idPrefix + sessionID,
 	)
 	if !ok {
 		return false
@@ -1714,8 +1714,12 @@ func (e *Engine) shouldSkipFile(
 func (e *Engine) shouldSkipByPath(
 	path string, info os.FileInfo,
 ) bool {
+	lookupPath := path
+	if e.pathRewriter != nil {
+		lookupPath = e.pathRewriter(path)
+	}
 	storedSize, storedMtime, ok := e.db.GetFileInfoByPath(
-		path,
+		lookupPath,
 	)
 	if !ok {
 		return false
@@ -1732,7 +1736,7 @@ func (e *Engine) processClaude(
 
 	if e.shouldSkipFile(sessionID, info) {
 		sess, _ := e.db.GetSession(
-			context.Background(), sessionID,
+			context.Background(), e.idPrefix+sessionID,
 		)
 		if sess != nil &&
 			sess.Project != "" &&
@@ -1804,7 +1808,11 @@ func (e *Engine) tryIncrementalJSONL(
 	agent parser.AgentType,
 	parseFn incrementalParseFunc,
 ) (processResult, bool) {
-	inc, ok := e.db.GetSessionForIncremental(file.Path)
+	lookupPath := file.Path
+	if e.pathRewriter != nil {
+		lookupPath = e.pathRewriter(file.Path)
+	}
+	inc, ok := e.db.GetSessionForIncremental(lookupPath)
 	if !ok || inc.FileSize <= 0 {
 		return processResult{}, false
 	}
@@ -2453,7 +2461,7 @@ func (e *Engine) processIflow(
 
 	if e.shouldSkipFile(sessionID, info) {
 		sess, _ := e.db.GetSession(
-			context.Background(), sessionID,
+			context.Background(), e.idPrefix+sessionID,
 		)
 		if sess != nil &&
 			sess.Project != "" &&
