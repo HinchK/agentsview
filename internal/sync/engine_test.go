@@ -636,6 +636,159 @@ func TestPairToolResultEventSummaries(t *testing.T) {
 	}
 }
 
+func TestApplyRemoteRewrites(t *testing.T) {
+	tests := []struct {
+		name         string
+		prefix       string
+		rewriter     func(string) string
+		sess         db.Session
+		msgs         []db.Message
+		wantSessID   string
+		wantParent   *string
+		wantFilePath *string
+		wantMsgSess  string // expected SessionID on messages
+		wantSubs     []string
+		wantEvSubs   []string
+	}{
+		{
+			name:   "no prefix is no-op",
+			prefix: "",
+			sess: db.Session{
+				ID: "abc",
+			},
+			msgs: []db.Message{
+				{SessionID: "abc"},
+			},
+			wantSessID:  "abc",
+			wantMsgSess: "abc",
+		},
+		{
+			name:   "all fields prefixed",
+			prefix: "host~",
+			sess: db.Session{
+				ID:              "abc",
+				ParentSessionID: strPtr("parent-1"),
+				FilePath:        strPtr("/tmp/file"),
+			},
+			msgs: []db.Message{
+				{
+					SessionID: "abc",
+					ToolCalls: []db.ToolCall{
+						{
+							SessionID:         "abc",
+							SubagentSessionID: "sub-1",
+							ResultEvents: []db.ToolResultEvent{
+								{SubagentSessionID: "ev-1"},
+								{SubagentSessionID: ""},
+							},
+						},
+						{SessionID: "abc"},
+					},
+				},
+			},
+			wantSessID:  "host~abc",
+			wantParent:  strPtr("host~parent-1"),
+			wantFilePath: strPtr("/tmp/file"),
+			wantMsgSess: "host~abc",
+			wantSubs:    []string{"host~sub-1", ""},
+			wantEvSubs:  []string{"host~ev-1", ""},
+		},
+		{
+			name:   "path rewriter applied",
+			prefix: "box~",
+			rewriter: func(p string) string {
+				return "box:" + p
+			},
+			sess: db.Session{
+				ID:       "x",
+				FilePath: strPtr("/remote/path"),
+			},
+			msgs:         nil,
+			wantSessID:   "box~x",
+			wantFilePath: strPtr("box:/remote/path"),
+		},
+		{
+			name:   "nil parent stays nil",
+			prefix: "h~",
+			sess: db.Session{
+				ID: "z",
+			},
+			wantSessID: "h~z",
+			wantParent: nil,
+		},
+		{
+			name:   "empty parent stays empty",
+			prefix: "h~",
+			sess: db.Session{
+				ID:              "z",
+				ParentSessionID: strPtr(""),
+			},
+			wantSessID: "h~z",
+			wantParent: strPtr(""),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &Engine{
+				idPrefix:     tt.prefix,
+				pathRewriter: tt.rewriter,
+			}
+			e.applyRemoteRewrites(&tt.sess, tt.msgs)
+
+			if tt.sess.ID != tt.wantSessID {
+				t.Errorf(
+					"ID = %q, want %q",
+					tt.sess.ID, tt.wantSessID,
+				)
+			}
+			if diff := cmp.Diff(
+				tt.wantParent, tt.sess.ParentSessionID,
+			); diff != "" {
+				t.Errorf("ParentSessionID %s", diff)
+			}
+			if tt.wantFilePath != nil {
+				if diff := cmp.Diff(
+					tt.wantFilePath, tt.sess.FilePath,
+				); diff != "" {
+					t.Errorf("FilePath %s", diff)
+				}
+			}
+			for _, m := range tt.msgs {
+				if m.SessionID != tt.wantMsgSess {
+					t.Errorf(
+						"msg SessionID = %q, want %q",
+						m.SessionID, tt.wantMsgSess,
+					)
+				}
+			}
+			var gotSubs, gotEvSubs []string
+			for _, m := range tt.msgs {
+				for _, tc := range m.ToolCalls {
+					gotSubs = append(
+						gotSubs, tc.SubagentSessionID,
+					)
+					for _, ev := range tc.ResultEvents {
+						gotEvSubs = append(
+							gotEvSubs,
+							ev.SubagentSessionID,
+						)
+					}
+				}
+			}
+			if diff := cmp.Diff(
+				tt.wantSubs, gotSubs,
+			); diff != "" {
+				t.Errorf("SubagentSessionIDs %s", diff)
+			}
+			if diff := cmp.Diff(
+				tt.wantEvSubs, gotEvSubs,
+			); diff != "" {
+				t.Errorf("ResultEvent SubagentSessionIDs %s", diff)
+			}
+		})
+	}
+}
+
 func TestBlockedCategorySet(t *testing.T) {
 	tests := []struct {
 		name  string
