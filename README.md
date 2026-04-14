@@ -35,7 +35,9 @@ machine, syncs them into a local SQLite database, and opens a web UI at
 
 `agentsview usage` is a fast, local replacement for ccusage and similar tools.
 It tracks token consumption and compute costs across **all** your coding agents
--- not just Claude Code.
+-- not just Claude Code. Because session data is already indexed in SQLite,
+queries are over 100x faster than tools that re-parse raw session files on every
+run.
 
 ```bash
 # Daily cost summary (default: last 30 days)
