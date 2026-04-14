@@ -286,10 +286,13 @@
     }
   }
 
+  const isLocal = $derived(
+    session?.machine === "local",
+  );
+
   const canResume = $derived(
     session
-      ? supportsResume(session.agent) &&
-          session.machine === "local"
+      ? supportsResume(session.agent) && isLocal
       : false,
   );
 
@@ -313,9 +316,11 @@
 
   const showDropdown = $derived(
     canResume ||
-    editorOpeners.length > 0 ||
-    fileOpeners.length > 0 ||
-    (sessionDir !== null && !!session?.file_path),
+    (isLocal && (
+      editorOpeners.length > 0 ||
+      fileOpeners.length > 0 ||
+      (sessionDir !== null && !!session?.file_path)
+    )),
   );
 
   function handleKeydown(e: KeyboardEvent) {
@@ -330,7 +335,7 @@
       }
       return;
     }
-    if (showOpenMenu) {
+    if (showOpenMenu && isLocal) {
       // Number key shortcuts (1-9) for quick selection.
       const num = parseInt(e.key);
       if (num >= 1 && num <= 9) {
@@ -459,6 +464,7 @@
                   <span class="open-menu-name">Copy command</span>
                 </button>
               {/if}
+              {#if isLocal}
               <button class="open-menu-item" onclick={handleCopyFilePath}>
                 <span class="open-menu-num">
                   <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
@@ -497,6 +503,7 @@
                     <span class="open-menu-name">{opener.name}</span>
                   </button>
                 {/each}
+              {/if}
               {/if}
               {#if canResume && claudeDesktopOpener}
                 <div class="open-menu-divider"></div>
