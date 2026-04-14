@@ -3,11 +3,41 @@
 package sync
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/wesm/agentsview/internal/db"
 )
+
+func openTestDB(t *testing.T) *db.DB {
+	t.Helper()
+	d, err := db.Open(
+		filepath.Join(t.TempDir(), "test.db"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	return d
+}
+
+// fakeFileInfo implements os.FileInfo for test use.
+type fakeFileInfo struct {
+	size  int64
+	mtime int64 // UnixNano
+}
+
+func (f fakeFileInfo) Name() string      { return "test" }
+func (f fakeFileInfo) Size() int64       { return f.size }
+func (f fakeFileInfo) Mode() os.FileMode { return 0 }
+func (f fakeFileInfo) ModTime() time.Time {
+	return time.Unix(0, f.mtime)
+}
+func (f fakeFileInfo) IsDir() bool      { return false }
+func (f fakeFileInfo) Sys() any         { return nil }
 
 func TestFilterEmptyMessages(t *testing.T) {
 	tests := []struct {
@@ -786,6 +816,101 @@ func TestApplyRemoteRewrites(t *testing.T) {
 				t.Errorf("ResultEvent SubagentSessionIDs %s", diff)
 			}
 		})
+	}
+}
+
+func TestShouldSkipFileWithIDPrefix(t *testing.T) {
+	database := openTestDB(t)
+
+	// Store a session with prefixed ID and file metadata.
+	sess := db.Session{
+		ID:       "host~abc-123",
+		Project:  "test",
+		Machine:  "host",
+		Agent:    "claude",
+		FilePath: strPtr("host:/remote/session.jsonl"),
+		FileSize: int64Ptr(1024),
+		FileMtime: int64Ptr(
+			int64(1700000000000000000),
+		),
+	}
+	if err := database.UpsertSession(sess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Engine with IDPrefix should find the session.
+	e := &Engine{
+		db:       database,
+		idPrefix: "host~",
+	}
+	got := e.shouldSkipFile(
+		"abc-123",
+		fakeFileInfo{size: 1024, mtime: 1700000000000000000},
+	)
+	if !got {
+		t.Error("shouldSkipFile should return true")
+	}
+
+	// Engine WITHOUT IDPrefix should NOT find it.
+	e2 := &Engine{db: database}
+	got2 := e2.shouldSkipFile(
+		"abc-123",
+		fakeFileInfo{size: 1024, mtime: 1700000000000000000},
+	)
+	if got2 {
+		t.Error(
+			"shouldSkipFile without prefix should return false",
+		)
+	}
+}
+
+func TestShouldSkipByPathWithRewriter(t *testing.T) {
+	database := openTestDB(t)
+
+	// Store a session with rewritten file path.
+	sess := db.Session{
+		ID:       "host~codex:abc",
+		Project:  "test",
+		Machine:  "host",
+		Agent:    "codex",
+		FilePath: strPtr("host:/remote/codex/abc.jsonl"),
+		FileSize: int64Ptr(2048),
+		FileMtime: int64Ptr(
+			int64(1700000000000000000),
+		),
+	}
+	if err := database.UpsertSession(sess); err != nil {
+		t.Fatal(err)
+	}
+
+	rewriter := func(p string) string {
+		return "host:" + p
+	}
+
+	// Engine with PathRewriter should find the session.
+	e := &Engine{
+		db:           database,
+		pathRewriter: rewriter,
+	}
+	got := e.shouldSkipByPath(
+		"/remote/codex/abc.jsonl",
+		fakeFileInfo{size: 2048, mtime: 1700000000000000000},
+	)
+	if !got {
+		t.Error("shouldSkipByPath should return true")
+	}
+
+	// Without rewriter, lookup misses.
+	e2 := &Engine{db: database}
+	got2 := e2.shouldSkipByPath(
+		"/remote/codex/abc.jsonl",
+		fakeFileInfo{size: 2048, mtime: 1700000000000000000},
+	)
+	if got2 {
+		t.Error(
+			"shouldSkipByPath without rewriter should " +
+				"return false",
+		)
 	}
 }
 

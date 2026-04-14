@@ -2315,8 +2315,12 @@ func (e *Engine) processOpenHands(
 		return processResult{err: err}
 	}
 
+	lookupPath := file.Path
+	if e.pathRewriter != nil {
+		lookupPath = e.pathRewriter(file.Path)
+	}
 	storedSize, storedMtime, ok := e.db.GetFileInfoByPath(
-		file.Path,
+		lookupPath,
 	)
 	if ok &&
 		storedSize == snapshot.Size &&
