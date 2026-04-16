@@ -10,7 +10,7 @@ require (
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/pmezard/go-difflib v1.0.0
-	github.com/spf13/cobra v1.8.1
+	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.18.0
