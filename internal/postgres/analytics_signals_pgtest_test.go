@@ -86,8 +86,18 @@ func TestStoreGetAnalyticsSignals(t *testing.T) {
 	}
 	defer store.Close()
 
+	// The HTTP handler always populates From/To via
+	// defaultDateRange before calling the Store. Mirror that
+	// here -- analyticsUTCRange in the PG path expects
+	// "YYYY-MM-DD" strings and cannot range over an empty
+	// filter.
+	now := time.Now().UTC()
 	resp, err := store.GetAnalyticsSignals(
-		ctx, db.AnalyticsFilter{},
+		ctx,
+		db.AnalyticsFilter{
+			From: now.AddDate(0, 0, -7).Format("2006-01-02"),
+			To:   now.Format("2006-01-02"),
+		},
 	)
 	if err != nil {
 		t.Fatalf("GetAnalyticsSignals: %v", err)
