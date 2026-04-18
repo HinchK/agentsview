@@ -14,6 +14,7 @@ import (
 
 const (
 	selectMessageCols = `id, session_id, ordinal, role, content,
+		thinking_text,
 		timestamp, has_thinking, has_tool_use, content_length,
 		is_system,
 		model, token_usage, context_tokens, output_tokens,
@@ -23,6 +24,7 @@ const (
 		source_parent_uuid, is_sidechain, is_compact_boundary`
 
 	insertMessageCols = `session_id, ordinal, role, content,
+		thinking_text,
 		timestamp, has_thinking, has_tool_use, content_length,
 		is_system,
 		model, token_usage, context_tokens, output_tokens,
@@ -79,11 +81,14 @@ type ToolResultEvent struct {
 
 // Message represents a row in the messages table.
 type Message struct {
-	ID                int64           `json:"id"`
-	SessionID         string          `json:"session_id"`
-	Ordinal           int             `json:"ordinal"`
-	Role              string          `json:"role"`
-	Content           string          `json:"content"`
+	ID        int64  `json:"id"`
+	SessionID string `json:"session_id"`
+	Ordinal   int    `json:"ordinal"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	// ThinkingText holds the concatenated text of all thinking
+	// blocks for this message; "" if none.
+	ThinkingText      string          `json:"thinking_text"`
 	Timestamp         string          `json:"timestamp"`
 	HasThinking       bool            `json:"has_thinking"`
 	HasToolUse        bool            `json:"has_tool_use"`
@@ -192,7 +197,7 @@ func (db *DB) insertMessagesTx(
 ) ([]int64, error) {
 	stmt, err := tx.Prepare(fmt.Sprintf(`
 		INSERT INTO messages (%s)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, insertMessageCols))
 	if err != nil {
 		return nil, fmt.Errorf("preparing insert: %w", err)
 	}
@@ -202,6 +207,7 @@ func (db *DB) insertMessagesTx(
 	for i, m := range msgs {
 		res, err := stmt.Exec(
 			m.SessionID, m.Ordinal, m.Role, m.Content,
+			m.ThinkingText,
 			m.Timestamp, m.HasThinking, m.HasToolUse,
 			m.ContentLength, m.IsSystem,
 			m.Model, string(m.TokenUsage),
@@ -735,7 +741,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 		var tokenUsage string
 		err := rows.Scan(
 			&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
-			&m.Content, &m.Timestamp,
+			&m.Content, &m.ThinkingText, &m.Timestamp,
 			&m.HasThinking, &m.HasToolUse, &m.ContentLength,
 			&m.IsSystem,
 			&m.Model, &tokenUsage,
@@ -893,7 +899,7 @@ func (db *DB) GetMessageByOrdinal(
 	var tokenUsage string
 	err := row.Scan(
 		&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
-		&m.Content, &m.Timestamp,
+		&m.Content, &m.ThinkingText, &m.Timestamp,
 		&m.HasThinking, &m.HasToolUse, &m.ContentLength,
 		&m.IsSystem,
 		&m.Model, &tokenUsage,

@@ -353,7 +353,7 @@ func extractMessagesIflow(entries []dagEntryIflow) (
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, hasThinking, hasToolUse, tcs, trs :=
+		text, _, hasThinking, hasToolUse, tcs, trs :=
 			ExtractTextContent(content)
 
 		// Convert command/skill invocation XML into readable

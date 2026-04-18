@@ -1,10 +1,10 @@
 package server
 
 import (
-	"math"
 	"net/http"
 
 	dbpkg "github.com/wesm/agentsview/internal/db"
+	"github.com/wesm/agentsview/internal/service"
 )
 
 func (s *Server) handleGetMessages(
@@ -18,22 +18,21 @@ func (s *Server) handleGetMessages(
 	}
 	limit = clampLimit(limit, dbpkg.DefaultMessageLimit, dbpkg.MaxMessageLimit)
 
-	asc := r.URL.Query().Get("direction") != "desc"
+	direction := r.URL.Query().Get("direction")
 
-	from := 0
+	filter := service.MessageFilter{
+		Limit:     limit,
+		Direction: direction,
+	}
 	if r.URL.Query().Get("from") != "" {
-		var ok bool
-		from, ok = parseIntParam(w, r, "from")
+		from, ok := parseIntParam(w, r, "from")
 		if !ok {
 			return
 		}
-	} else if !asc {
-		from = math.MaxInt32
+		filter.From = &from
 	}
 
-	msgs, err := s.db.GetMessages(
-		r.Context(), sessionID, from, limit, asc,
-	)
+	list, err := s.sessions.Messages(r.Context(), sessionID, filter)
 	if err != nil {
 		if handleContextError(w, err) {
 			return
@@ -42,8 +41,5 @@ func (s *Server) handleGetMessages(
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"messages": msgs,
-		"count":    len(msgs),
-	})
+	writeJSON(w, http.StatusOK, list)
 }

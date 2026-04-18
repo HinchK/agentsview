@@ -1324,7 +1324,8 @@ func (s *Store) queryAutonomyChunk(
 	pb := &paramBuilder{}
 	ph := pgInPlaceholders(chunk, pb)
 	q := `SELECT session_id,
-		SUM(CASE WHEN role='user' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN role='user' AND is_system=false
+			THEN 1 ELSE 0 END),
 		SUM(CASE WHEN role='assistant'
 			AND has_tool_use=true THEN 1 ELSE 0 END)
 		FROM messages

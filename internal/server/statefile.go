@@ -19,6 +19,7 @@ type StateFile struct {
 	Host      string `json:"host"`
 	Version   string `json:"version"`
 	StartedAt string `json:"started_at"`
+	ReadOnly  bool   `json:"read_only,omitempty"`
 }
 
 // stateFileName returns the filename for a given port.
@@ -30,8 +31,11 @@ func stateFileName(port int) string {
 // running server. Returns the path written. StartedAt is
 // set to the actual process creation time so it passes
 // processStartTime validation even when startup is slow.
+// readOnly indicates whether the server is read-only
+// (e.g. pg serve) versus read/write (local serve).
 func WriteStateFile(
 	dataDir string, host string, port int, version string,
+	readOnly bool,
 ) (string, error) {
 	started := time.Now()
 	if ps, err := processStartTime(os.Getpid()); err == nil {
@@ -43,6 +47,7 @@ func WriteStateFile(
 		Host:      host,
 		Version:   version,
 		StartedAt: started.UTC().Format(time.RFC3339Nano),
+		ReadOnly:  readOnly,
 	}
 	data, err := json.Marshal(sf)
 	if err != nil {
@@ -126,6 +131,11 @@ const stateFileStartTolerance = 120 * time.Second
 // Unlike FindRunningServer, this returns true even during
 // transient TCP probe failures.
 //
+// When requireLocalSync is true, read-only state files (pg serve)
+// are ignored. Callers that gate on-demand local sync need this
+// so a running pg serve daemon — which does not keep the local
+// SQLite DB fresh — doesn't cause them to skip sync.
+//
 // Staleness detection uses two layers:
 //  1. Boot time: state files from before the last reboot are
 //     removed (PID reuse across reboots).
@@ -134,6 +144,14 @@ const stateFileStartTolerance = 120 * time.Second
 //     creation time. A mismatch beyond the tolerance
 //     indicates same-boot PID reuse.
 func hasLiveStateFile(dataDir string) bool {
+	return anyLiveStateFile(dataDir, false)
+}
+
+// anyLiveStateFile is the shared implementation behind
+// hasLiveStateFile and IsLocalServerActive. When
+// requireLocalSync is true, read-only (pg serve) state files are
+// skipped.
+func anyLiveStateFile(dataDir string, requireLocalSync bool) bool {
 	bootTime, _ := systemBootTime()
 
 	entries, err := os.ReadDir(dataDir)
@@ -182,6 +200,9 @@ func hasLiveStateFile(dataDir string) bool {
 			}
 		}
 
+		if requireLocalSync && sf.ReadOnly {
+			continue
+		}
 		return true
 	}
 	return false
@@ -286,10 +307,21 @@ func IsStartupLocked(dataDir string) bool {
 //   - a startup lock with a live PID exists (server is still
 //     syncing / binding its port).
 //
-// This is the check CLI commands should use to decide whether
-// to skip on-demand sync.
+// This check does NOT distinguish a writable local daemon from a
+// read-only pg serve. Callers that rely on a fresh local SQLite
+// archive (e.g. `usage`, `token-use`) should use
+// IsLocalServerActive instead.
 func IsServerActive(dataDir string) bool {
 	return hasLiveStateFile(dataDir) || isServerStarting(dataDir)
+}
+
+// IsLocalServerActive reports whether a writable local daemon is
+// managing the SQLite archive in dataDir. Unlike IsServerActive,
+// it ignores read-only state files (pg serve) so commands that
+// need an up-to-date local DB don't skip on-demand sync when only
+// a pg serve daemon is running.
+func IsLocalServerActive(dataDir string) bool {
+	return anyLiveStateFile(dataDir, true) || isServerStarting(dataDir)
 }
 
 // WaitForStartup polls until the startup lock clears or a

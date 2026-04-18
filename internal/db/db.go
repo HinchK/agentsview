@@ -26,11 +26,11 @@ import (
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
-// Bumped to 13: track mid-task compaction count (boundaries
-// where post-boundary tools repeat pre-boundary work — a
-// context-loss signal that scores heavier than ordinary
-// compactions).
-const dataVersion = 13
+// Bumped to 14: thinking_text column + promoted system
+// subtypes (continuation, resume, interrupted,
+// task_notification, stop_hook) surfaced as first-class
+// system messages instead of being silently skipped.
+const dataVersion = 14
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -459,6 +459,10 @@ func (db *DB) migrateColumns() error {
 		{
 			"sessions", "is_truncated",
 			"ALTER TABLE sessions ADD COLUMN is_truncated INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"messages", "thinking_text",
+			"ALTER TABLE messages ADD COLUMN thinking_text TEXT NOT NULL DEFAULT ''",
 		},
 	}
 

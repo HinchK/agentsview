@@ -1148,7 +1148,7 @@ func bulkInsertMessages(
 
 		var b strings.Builder
 		b.WriteString(`INSERT INTO messages (
-			session_id, ordinal, role, content,
+			session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
 			context_tokens, output_tokens,
@@ -1157,19 +1157,19 @@ func bulkInsertMessages(
 			source_type, source_subtype, source_uuid,
 			source_parent_uuid, is_sidechain,
 			is_compact_boundary) VALUES `)
-		args := make([]any, 0, len(batch)*23)
+		args := make([]any, 0, len(batch)*24)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*23 + 1
+			p := j*24 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-				p, p+1, p+2, p+3,
-				p+4, p+5, p+6, p+7, p+8,
-				p+9, p+10, p+11, p+12, p+13, p+14,
-				p+15, p+16, p+17, p+18, p+19,
-				p+20, p+21, p+22,
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				p, p+1, p+2, p+3, p+4,
+				p+5, p+6, p+7, p+8, p+9,
+				p+10, p+11, p+12, p+13, p+14, p+15,
+				p+16, p+17, p+18, p+19, p+20,
+				p+21, p+22, p+23,
 			)
 			var ts any
 			if m.Timestamp != "" {
@@ -1181,7 +1181,7 @@ func bulkInsertMessages(
 			}
 			args = append(args,
 				sessionID, m.Ordinal, m.Role,
-				sanitizePG(m.Content), ts,
+				sanitizePG(m.Content), m.ThinkingText, ts,
 				m.HasThinking,
 				m.HasToolUse, m.ContentLength, m.IsSystem,
 				m.Model, string(m.TokenUsage),

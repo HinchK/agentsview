@@ -20,6 +20,7 @@ function makeMsg(
     content: "",
     has_tool_use: false,
     has_thinking: false,
+    thinking_text: "",
     content_length: 0,
     model: "",
     token_usage: null,

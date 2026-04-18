@@ -96,6 +96,7 @@ export interface Message {
   content: string;
   timestamp: string;
   has_thinking: boolean;
+  thinking_text: string;
   has_tool_use: boolean;
   content_length: number;
   model: string;

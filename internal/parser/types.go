@@ -467,6 +467,7 @@ type ParsedMessage struct {
 	Ordinal       int
 	Role          RoleType
 	Content       string
+	ThinkingText  string // concatenated text of all thinking blocks; "" if none
 	Timestamp     time.Time
 	HasThinking   bool
 	HasToolUse    bool

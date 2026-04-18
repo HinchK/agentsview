@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/wesm/agentsview/internal/db"
+	"github.com/wesm/agentsview/internal/timeutil"
 )
 
 // ProjectTotal holds range-wide token and cost totals per project.
@@ -92,7 +93,7 @@ func parseUsageFilter(
 
 	from, to := defaultDateRange(q.Get("from"), q.Get("to"))
 
-	if !isValidDate(from) || !isValidDate(to) {
+	if !timeutil.IsValidDate(from) || !timeutil.IsValidDate(to) {
 		writeError(w, http.StatusBadRequest,
 			"invalid date format: use YYYY-MM-DD")
 		return db.UsageFilter{}, false

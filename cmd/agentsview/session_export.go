@@ -1,0 +1,72 @@
+// ABOUTME: `session export <id>` subcommand — streams the raw source
+// ABOUTME: JSONL file for a locally-synced session. Local-only by
+// ABOUTME: design; bypasses the SessionService layer.
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/spf13/cobra"
+	"github.com/wesm/agentsview/internal/config"
+	"github.com/wesm/agentsview/internal/db"
+)
+
+func newSessionExportCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:          "export <id>",
+		Short:        "Stream the raw source JSONL for a session (local only)",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("server") {
+				return fmt.Errorf(
+					"session export: local-only command; --server not supported",
+				)
+			}
+			id := args[0]
+			cfg, err := config.LoadPFlags(cmd.Flags())
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			d, err := db.Open(cfg.DBPath)
+			if err != nil {
+				return fmt.Errorf("open local archive: %w", err)
+			}
+			defer d.Close()
+
+			path := d.GetSessionFilePath(id)
+			if path == "" {
+				// Distinguish "not in archive" from "in archive but
+				// file_path was NULL": check session existence.
+				s, err := d.GetSession(cmd.Context(), id)
+				if err != nil {
+					return fmt.Errorf(
+						"looking up session %s: %w", id, err,
+					)
+				}
+				if s == nil {
+					return fmt.Errorf(
+						"session not in local archive: %s", id,
+					)
+				}
+				return fmt.Errorf(
+					"source file not found for session %s", id,
+				)
+			}
+			f, err := os.Open(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return fmt.Errorf(
+						"source file not found: %s", path,
+					)
+				}
+				return err
+			}
+			defer f.Close()
+			_, err = io.Copy(cmd.OutOrStdout(), f)
+			return err
+		},
+	}
+}

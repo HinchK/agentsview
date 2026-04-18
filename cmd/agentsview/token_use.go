@@ -153,9 +153,9 @@ type tokenUseOutput struct {
 	ServerRunning     bool   `json:"server_running"`
 }
 
-// startupWaitTimeout is how long token-use will wait for a
+// startupWaitTimeout is how long CLI subcommands wait for a
 // starting server to become ready before falling back to
-// on-demand sync.
+// on-demand sync or direct DB access.
 const startupWaitTimeout = 30 * time.Second
 
 func runTokenUse(args []string) {
@@ -184,13 +184,13 @@ func tokenUse(sessionID string) (int, error) {
 			fmt.Errorf("creating data dir: %w", err)
 	}
 
-	serverActive := server.IsServerActive(appCfg.DataDir)
+	serverActive := server.IsLocalServerActive(appCfg.DataDir)
 
 	// If a server is actively starting up (startup lock
 	// present), wait for it to finish so we read fresh data
 	// rather than returning stale results or "not found".
 	// We only wait when the startup lock is the reason
-	// IsServerActive returned true — if a state file has a
+	// IsLocalServerActive returned true — if a state file has a
 	// live PID but the TCP probe is transiently failing,
 	// the server is running and we should just read the DB.
 	if serverActive &&
@@ -216,12 +216,12 @@ func tokenUse(sessionID string) (int, error) {
 					// Lock cleared but no running
 					// server. Re-check in case of
 					// transient TCP failure.
-					serverActive = server.IsServerActive(
+					serverActive = server.IsLocalServerActive(
 						appCfg.DataDir,
 					)
 				}
 			}
-		} else if !server.IsServerActive(appCfg.DataDir) {
+		} else if !server.IsLocalServerActive(appCfg.DataDir) {
 			// The server that was alive at the first check
 			// has since exited. Fall back to on-demand sync.
 			serverActive = false
@@ -259,7 +259,7 @@ func tokenUse(sessionID string) (int, error) {
 	// If the re-check detects a starting server, wait for
 	// it rather than reading potentially stale data.
 	if !serverActive {
-		serverActive = server.IsServerActive(appCfg.DataDir)
+		serverActive = server.IsLocalServerActive(appCfg.DataDir)
 		if serverActive &&
 			server.FindRunningServer(appCfg.DataDir) == nil &&
 			server.IsStartupLocked(appCfg.DataDir) {
@@ -276,7 +276,7 @@ func tokenUse(sessionID string) (int, error) {
 				// via TCP. Re-check: a live state
 				// file (transient probe failure)
 				// still means the server is active.
-				serverActive = server.IsServerActive(
+				serverActive = server.IsLocalServerActive(
 					appCfg.DataDir,
 				)
 			}

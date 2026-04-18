@@ -28,7 +28,7 @@ func (s *Store) GetMessages(
 	}
 
 	query := fmt.Sprintf(`
-		SELECT session_id, ordinal, role, content,
+		SELECT session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
 			context_tokens, output_tokens,
@@ -68,7 +68,7 @@ func (s *Store) GetAllMessages(
 	ctx context.Context, sessionID string,
 ) ([]db.Message, error) {
 	rows, err := s.pg.QueryContext(ctx, `
-		SELECT session_id, ordinal, role, content,
+		SELECT session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, token_usage,
 			context_tokens, output_tokens,
@@ -530,7 +530,7 @@ func scanPGMessages(rows interface {
 		var tokenUsage string
 		if err := rows.Scan(
 			&m.SessionID, &m.Ordinal, &m.Role,
-			&m.Content, &ts, &m.HasThinking,
+			&m.Content, &m.ThinkingText, &ts, &m.HasThinking,
 			&m.HasToolUse, &m.ContentLength, &m.IsSystem,
 			&m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,

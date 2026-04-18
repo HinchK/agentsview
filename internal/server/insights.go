@@ -13,6 +13,7 @@ import (
 
 	"github.com/wesm/agentsview/internal/db"
 	"github.com/wesm/agentsview/internal/insight"
+	"github.com/wesm/agentsview/internal/timeutil"
 )
 
 var validInsightTypes = map[string]bool{
@@ -172,12 +173,12 @@ func (s *Server) handleGenerateInsight(
 			"invalid type: must be daily_activity or agent_analysis")
 		return
 	}
-	if !isValidDate(req.DateFrom) {
+	if !timeutil.IsValidDate(req.DateFrom) {
 		writeError(w, http.StatusBadRequest,
 			"invalid date_from: use YYYY-MM-DD")
 		return
 	}
-	if !isValidDate(req.DateTo) {
+	if !timeutil.IsValidDate(req.DateTo) {
 		writeError(w, http.StatusBadRequest,
 			"invalid date_to: use YYYY-MM-DD")
 		return

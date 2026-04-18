@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"github.com/wesm/agentsview/internal/testjsonl"
 )
 
@@ -157,19 +158,43 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 		assert.Equal(t, RoleUser, msgs[1].Role)
 	})
 
-	t.Run("skips content-heuristic system messages", func(t *testing.T) {
+	t.Run("promotes and skips system-injected patterns", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeUserJSON("This session is being continued from a previous conversation.", tsZero),
 			testjsonl.ClaudeUserJSON("[Request interrupted by user]", tsZeroS1),
-			testjsonl.ClaudeUserJSON("<task-notification>data</task-notification>", tsZeroS2),
+			testjsonl.ClaudeUserJSON("<local-command-caveat>Caveat: resumed</local-command-caveat>", tsZeroS2),
+			testjsonl.ClaudeUserJSON("<task-notification>data</task-notification>", "2024-01-01T00:00:04Z"),
+			// Non-caveat local-command is pure noise and stays skipped.
 			testjsonl.ClaudeUserJSON("<local-command-result>ok</local-command-result>", "2024-01-01T00:00:05Z"),
 			testjsonl.ClaudeUserJSON("Stop hook feedback: rejected", "2024-01-01T00:00:06Z"),
 			testjsonl.ClaudeUserJSON("real user message", "2024-01-01T00:00:07Z"),
 		)
 		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 1, sess.MessageCount)
-		assert.Equal(t, "real user message", msgs[0].Content)
+		// 5 promoted system + 1 real user; <local-command-result>
+		// is still skipped.
+		assert.Equal(t, 6, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
 		assert.Equal(t, "real user message", sess.FirstMessage)
+
+		wantSubtypes := []string{
+			"continuation", "interrupted", "resume",
+			"task_notification", "stop_hook",
+		}
+		require.Len(t, msgs, 6)
+		for i, want := range wantSubtypes {
+			assert.True(t, msgs[i].IsSystem,
+				"msgs[%d] should be system", i)
+			// Promoted system markers keep Role=user so
+			// role-keyed analytics don't count them as
+			// assistant replies.
+			assert.Equal(t, RoleUser, msgs[i].Role)
+			assert.Equal(t, "system", msgs[i].SourceType)
+			assert.Equal(t, want, msgs[i].SourceSubtype)
+		}
+		// Final message is the real user message.
+		assert.False(t, msgs[5].IsSystem)
+		assert.Equal(t, RoleUser, msgs[5].Role)
+		assert.Equal(t, "real user message", msgs[5].Content)
 	})
 
 	t.Run("skill invocation shown as user message", func(t *testing.T) {
@@ -225,7 +250,10 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 			testjsonl.ClaudeUserJSON("Fix the auth bug", tsZeroS2),
 		)
 		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
-		assert.Equal(t, 1, sess.MessageCount)
+		// Meta user is skipped, continuation is promoted to a
+		// system message, real user is kept.
+		assert.Equal(t, 2, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
 		assert.Equal(t, "Fix the auth bug", sess.FirstMessage)
 	})
 }
@@ -912,4 +940,99 @@ func TestParseClaudeSession_CompactBoundary(t *testing.T) {
 		assert.Equal(t, 2, newMsgs[1].Ordinal)
 		assert.Equal(t, RoleUser, newMsgs[1].Role)
 	})
+}
+
+func TestExtractTextContent_ReturnsThinkingText(t *testing.T) {
+	t.Parallel()
+
+	t.Run("joins multiple thinking blocks", func(t *testing.T) {
+		content := gjson.Parse(`[
+			{"type":"thinking","thinking":"first thought"},
+			{"type":"text","text":"reply A"},
+			{"type":"thinking","thinking":"second thought"},
+			{"type":"text","text":"reply B"}
+		]`)
+		text, thinking, hasThinking, _, _, _ := ExtractTextContent(content)
+		assert.True(t, hasThinking)
+		assert.Equal(t, "first thought\n\nsecond thought", thinking)
+		assert.Contains(t, text, "[Thinking]\nfirst thought\n[/Thinking]")
+		assert.Contains(t, text, "reply A")
+	})
+
+	t.Run("skips empty thinking blocks", func(t *testing.T) {
+		content := gjson.Parse(`[
+			{"type":"thinking","thinking":""},
+			{"type":"thinking","thinking":"real thought"}
+		]`)
+		_, thinking, _, _, _, _ := ExtractTextContent(content)
+		assert.Equal(t, "real thought", thinking)
+	})
+}
+
+func TestClassifyClaudeSystemMessage(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		content  string
+		expected string
+	}{
+		{"continuation", "This session is being continued from a previous conversation...", "continuation"},
+		{"resume caveat", "<local-command-caveat>Caveat: ...</local-command-caveat>", "resume"},
+		{"interrupted", "[Request interrupted by user]", "interrupted"},
+		{"task notification", "<task-notification>done</task-notification>", "task_notification"},
+		{"stop hook", "Stop hook feedback: ...", "stop_hook"},
+		{"bom prefix", "\uFEFF  This session is being continued", "continuation"},
+		{"non-caveat local-command", "<local-command-stdout>foo</local-command-stdout>", ""},
+		{"regular text", "what do you think?", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ClassifyClaudeSystemMessage(c.content)
+			assert.Equal(t, c.expected, got)
+		})
+	}
+}
+
+func TestParseClaudeSession_PromotesSystemSubtypes(t *testing.T) {
+	t.Parallel()
+	content := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("what time is it?", tsZero),
+		testjsonl.ClaudeAssistantJSON([]map[string]any{
+			{"type": "text", "text": "it is 3pm"},
+		}, tsZeroS1),
+		// Promoted: continuation marker on resume.
+		testjsonl.ClaudeUserJSON(
+			"This session is being continued from a previous conversation.",
+			tsZeroS2,
+		),
+		testjsonl.ClaudeAssistantJSON([]map[string]any{
+			{"type": "text", "text": "welcome back"},
+		}, "2024-01-01T00:00:03Z"),
+		// Promoted: interrupt marker.
+		testjsonl.ClaudeUserJSON(
+			"[Request interrupted by user]",
+			"2024-01-01T00:00:04Z",
+		),
+	)
+	_, msgs := runClaudeParserTest(t, "test.jsonl", content)
+
+	var systems []ParsedMessage
+	for _, m := range msgs {
+		if m.IsSystem {
+			systems = append(systems, m)
+		}
+	}
+	require.Len(t, systems, 2)
+
+	assert.Equal(t, "continuation", systems[0].SourceSubtype)
+	assert.Equal(t, "system", systems[0].SourceType)
+	// Role stays "user" so analytics that key off role alone
+	// don't count these markers as assistant replies. The UI uses
+	// is_system + source_subtype for routing.
+	assert.Equal(t, RoleUser, systems[0].Role)
+	assert.Contains(t, systems[0].Content, "This session is being continued")
+
+	assert.Equal(t, "interrupted", systems[1].SourceSubtype)
+	assert.Equal(t, "system", systems[1].SourceType)
+	assert.Equal(t, RoleUser, systems[1].Role)
 }

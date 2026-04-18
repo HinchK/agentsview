@@ -65,6 +65,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newHealthCommand())
 	root.AddCommand(newUsageCommand())
 	root.AddCommand(newPGCommand())
+	root.AddCommand(newSessionCommand())
 	root.AddCommand(newVersionCommand())
 
 	defaultHelp := root.HelpFunc()

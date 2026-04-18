@@ -403,7 +403,7 @@ func extractMessagesFrom(
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, hasThinking, hasToolUse, tcs, trs :=
+		text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
 			ExtractTextContent(content)
 
 		// Convert command/skill invocation XML into readable
@@ -422,15 +422,41 @@ func extractMessagesFrom(
 			continue
 		}
 
-		if e.entryType == "user" &&
-			isClaudeSystemMessage(text) {
-			continue
+		if e.entryType == "user" {
+			if subtype := ClassifyClaudeSystemMessage(text); subtype != "" {
+				// Preserve Role=user so analytics that compute
+				// turn-cycle/throughput on role alone (see
+				// internal/db/analytics.go) don't count these as
+				// assistant replies. is_system + source_subtype
+				// let the UI and filters route them correctly.
+				messages = append(messages, ParsedMessage{
+					Ordinal:          ordinal,
+					Role:             RoleUser,
+					Content:          text,
+					Timestamp:        e.timestamp,
+					IsSystem:         true,
+					ContentLength:    len(text),
+					SourceType:       "system",
+					SourceSubtype:    subtype,
+					SourceUUID:       e.uuid,
+					SourceParentUUID: e.parentUuid,
+					IsSidechain:      gjson.Get(e.line, "isSidechain").Bool(),
+				})
+				ordinal++
+				continue
+			}
+			// Skip unclassified noise (e.g. non-caveat
+			// <local-command-*> envelopes).
+			if isClaudeSystemMessage(text) {
+				continue
+			}
 		}
 
 		msg := ParsedMessage{
 			Ordinal:            ordinal,
 			Role:               RoleType(e.entryType),
 			Content:            text,
+			ThinkingText:       thinkingText,
 			Timestamp:          e.timestamp,
 			HasThinking:        hasThinking,
 			HasToolUse:         hasToolUse,
@@ -493,6 +519,14 @@ func parseLinear(
 	userCount := 0
 	firstMsg := ""
 	for _, m := range messages {
+		if m.IsSystem {
+			// Promoted system messages (continuation/resume/
+			// interrupted/task_notification/stop_hook) carry
+			// Role=user so role-keyed analytics ignore them,
+			// but they are not real user turns — skip them
+			// when computing user_message_count / first_message.
+			continue
+		}
 		if m.Role == RoleUser && m.Content != "" {
 			userCount++
 			if firstMsg == "" {
@@ -658,6 +692,9 @@ func parseDAG(
 		userCount := 0
 		firstMsg := ""
 		for _, m := range messages {
+			if m.IsSystem {
+				continue
+			}
 			if m.Role == RoleUser && m.Content != "" {
 				userCount++
 				if firstMsg == "" {
@@ -818,7 +855,7 @@ func extractMessages(entries []dagEntry) (
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, hasThinking, hasToolUse, tcs, trs :=
+		text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
 			ExtractTextContent(content)
 
 		// Convert command/skill invocation XML into readable
@@ -837,15 +874,39 @@ func extractMessages(entries []dagEntry) (
 			continue
 		}
 
-		// Tier 2: skip known system-injected patterns.
-		if e.entryType == "user" && isClaudeSystemMessage(text) {
-			continue
+		// Tier 2: promote classifiable system-injected patterns
+		// to source_subtype messages; skip unclassified noise
+		// (e.g. non-caveat <local-command-*> envelopes). Role
+		// stays "user" so role-keyed analytics continue to treat
+		// these as inputs, not assistant replies.
+		if e.entryType == "user" {
+			if subtype := ClassifyClaudeSystemMessage(text); subtype != "" {
+				messages = append(messages, ParsedMessage{
+					Ordinal:          ordinal,
+					Role:             RoleUser,
+					Content:          text,
+					Timestamp:        e.timestamp,
+					IsSystem:         true,
+					ContentLength:    len(text),
+					SourceType:       "system",
+					SourceSubtype:    subtype,
+					SourceUUID:       e.uuid,
+					SourceParentUUID: e.parentUuid,
+					IsSidechain:      gjson.Get(e.line, "isSidechain").Bool(),
+				})
+				ordinal++
+				continue
+			}
+			if isClaudeSystemMessage(text) {
+				continue
+			}
 		}
 
 		msg := ParsedMessage{
 			Ordinal:            ordinal,
 			Role:               RoleType(e.entryType),
 			Content:            text,
+			ThinkingText:       thinkingText,
 			Timestamp:          e.timestamp,
 			HasThinking:        hasThinking,
 			HasToolUse:         hasToolUse,
@@ -1129,6 +1190,32 @@ func extractCompactSummary(line string) string {
 		return strings.Join(parts, "\n")
 	}
 	return content.Str
+}
+
+// ClassifyClaudeSystemMessage inspects a user-entry content string and
+// returns the matched system subtype (e.g. "continuation", "resume"),
+// or "" if the content is an ordinary user message.
+//
+// Non-caveat <local-command-*> envelopes (stdout/stderr surrounds for
+// local command output) are treated as regular noise and return "";
+// only the caveat variant is a semantic "resume" marker.
+func ClassifyClaudeSystemMessage(content string) string {
+	trimmed := strings.TrimLeftFunc(content, func(r rune) bool {
+		return r == '\uFEFF' || unicode.IsSpace(r)
+	})
+	switch {
+	case strings.HasPrefix(trimmed, "This session is being continued"):
+		return "continuation"
+	case strings.HasPrefix(trimmed, "<local-command-caveat>"):
+		return "resume"
+	case strings.HasPrefix(trimmed, "[Request interrupted"):
+		return "interrupted"
+	case strings.HasPrefix(trimmed, "<task-notification>"):
+		return "task_notification"
+	case strings.HasPrefix(trimmed, "Stop hook feedback:"):
+		return "stop_hook"
+	}
+	return ""
 }
 
 // isClaudeSystemMessage returns true if the content matches

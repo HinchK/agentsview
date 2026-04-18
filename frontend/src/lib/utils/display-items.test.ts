@@ -15,6 +15,7 @@ function msg(
     role: "assistant",
     timestamp: "2025-02-17T21:04:00Z",
     has_thinking: false,
+    thinking_text: "",
     has_tool_use: false,
     content_length: overrides.content.length,
     model: "",

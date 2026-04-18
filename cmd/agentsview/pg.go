@@ -305,6 +305,21 @@ func runPGServe(appCfg config.Config, basePath string) {
 		fatal("pg serve: %v", err)
 	}
 
+	// Write the state file so CLI commands can discover this
+	// daemon. ReadOnly=true marks it as pg serve (read-only)
+	// so clients can select an appropriate transport.
+	if _, sfErr := server.WriteStateFile(
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, true,
+	); sfErr != nil {
+		log.Printf(
+			"warning: could not write state file: %v"+
+				" (pg serve daemon may not be discoverable by CLI)",
+			sfErr,
+		)
+	} else {
+		defer server.RemoveStateFile(rt.Cfg.DataDir, rt.Cfg.Port)
+	}
+
 	if rt.Cfg.RequireAuth && rt.Cfg.AuthToken != "" {
 		fmt.Printf("Auth token: %s\n", rt.Cfg.AuthToken)
 	}

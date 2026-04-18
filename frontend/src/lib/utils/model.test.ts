@@ -11,6 +11,7 @@ function msg(role: string, model: string): Message {
     content: "",
     timestamp: "",
     has_thinking: false,
+    thinking_text: "",
     has_tool_use: false,
     content_length: 0,
     model,

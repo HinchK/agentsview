@@ -129,6 +129,7 @@ func (d *DB) CopyOrphanedDataFrom(
 		"source_type", "source_subtype",
 		"source_uuid", "source_parent_uuid",
 		"is_sidechain", "is_compact_boundary",
+		"thinking_text",
 	} {
 		if oldDBHasColumn(ctx, tx, "messages", c) {
 			msgCols.WriteString(", " + c)

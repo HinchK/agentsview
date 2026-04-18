@@ -17,6 +17,7 @@ import (
 	"github.com/wesm/agentsview/internal/config"
 	"github.com/wesm/agentsview/internal/db"
 	"github.com/wesm/agentsview/internal/insight"
+	"github.com/wesm/agentsview/internal/service"
 	"github.com/wesm/agentsview/internal/sync"
 	"github.com/wesm/agentsview/internal/web"
 )
@@ -35,6 +36,7 @@ type Server struct {
 	cfg         config.Config
 	db          db.Store
 	engine      *sync.Engine
+	sessions    service.SessionService
 	broadcaster *Broadcaster
 	mux         *http.ServeMux
 	httpSrv     *http.Server
@@ -77,10 +79,23 @@ func New(
 		log.Fatalf("embedded frontend not found: %v", err)
 	}
 
+	// Pick the backend that matches the concrete store. A local
+	// *db.DB plus a sync engine yields a full read/write backend;
+	// any other combination (PG reader, or local DB with nil
+	// engine when used by a read-only daemon) yields a read-only
+	// backend whose Sync returns db.ErrReadOnly.
+	var sessions service.SessionService
+	if local, ok := database.(*db.DB); ok && engine != nil {
+		sessions = service.NewDirectBackend(local, engine)
+	} else {
+		sessions = service.NewReadOnlyBackend(database)
+	}
+
 	s := &Server{
 		cfg:                cfg,
 		db:                 database,
 		engine:             engine,
+		sessions:           sessions,
 		mux:                http.NewServeMux(),
 		generateStreamFunc: insight.GenerateStream,
 		spaFS:              dist,
@@ -170,6 +185,9 @@ func (s *Server) routes() {
 		"GET /api/v1/sessions/{id}/messages", s.withTimeout(s.handleGetMessages),
 	)
 	s.mux.Handle(
+		"GET /api/v1/sessions/{id}/tool-calls", s.withTimeout(s.handleToolCalls),
+	)
+	s.mux.Handle(
 		"GET /api/v1/sessions/{id}/children", s.withTimeout(s.handleGetChildSessions),
 	)
 	s.mux.Handle(
@@ -200,6 +218,9 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/sessions/{id}/directory", s.withTimeout(s.handleGetSessionDir))
 	s.mux.Handle("GET /api/v1/sessions/{id}/search", s.withTimeout(s.handleSearchSession))
 	s.mux.Handle("POST /api/v1/sessions/{id}/open", s.withTimeout(s.handleOpenSession))
+	s.mux.Handle(
+		"POST /api/v1/sessions/sync", s.withTimeout(s.handleSyncSession),
+	)
 	s.mux.Handle(
 		"POST /api/v1/sessions/upload", s.withTimeout(s.handleUploadSession),
 	)

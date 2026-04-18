@@ -217,7 +217,7 @@ func runServe(cfg config.Config) {
 	// is active" marker so token-use doesn't start a competing
 	// on-demand sync against our live DB.
 	if _, sfErr := server.WriteStateFile(
-		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version,
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, false,
 	); sfErr != nil {
 		log.Printf(
 			"warning: could not write state file: %v"+

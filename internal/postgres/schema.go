@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS messages (
     ordinal        INT NOT NULL,
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
+    thinking_text  TEXT NOT NULL DEFAULT '',
     timestamp      TIMESTAMPTZ,
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -491,6 +492,13 @@ func EnsureSchema(
 			 ADD COLUMN IF NOT EXISTS is_compact_boundary
 			 BOOLEAN NOT NULL DEFAULT FALSE`,
 			"adding messages.is_compact_boundary",
+		},
+		{
+			"messages", "thinking_text",
+			`ALTER TABLE messages
+			 ADD COLUMN IF NOT EXISTS thinking_text
+			 TEXT NOT NULL DEFAULT ''`,
+			"adding messages.thinking_text",
 		},
 	}
 	tokenCoverageColumnsAdded := false

@@ -13,7 +13,7 @@ import (
 func TestWriteAndRemoveStateFile(t *testing.T) {
 	dir := t.TempDir()
 
-	path, err := WriteStateFile(dir, "127.0.0.1", 8080, "1.0.0")
+	path, err := WriteStateFile(dir, "127.0.0.1", 8080, "1.0.0", false)
 	if err != nil {
 		t.Fatalf("WriteStateFile: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestWriteStateFile_UsesProcessStartTime(t *testing.T) {
 
 	dir := t.TempDir()
 	path, err := WriteStateFile(
-		dir, "127.0.0.1", 7777, "1.0.0",
+		dir, "127.0.0.1", 7777, "1.0.0", false,
 	)
 	if err != nil {
 		t.Fatalf("WriteStateFile: %v", err)
@@ -556,7 +556,7 @@ func TestWaitForStartup_AlreadyRunning(t *testing.T) {
 	defer ln.Close()
 
 	port := ln.Addr().(*net.TCPAddr).Port
-	WriteStateFile(dir, "127.0.0.1", port, "1.0.0")
+	WriteStateFile(dir, "127.0.0.1", port, "1.0.0", false)
 
 	// Should return immediately since server is running.
 	if !WaitForStartup(dir, 100*millisecondsForTest) {
@@ -706,6 +706,70 @@ func TestIsStaleByProcessStart_OwnPID(t *testing.T) {
 	fakeTime := procStart.Add(-1 * time.Hour)
 	if !isStaleByProcessStart(os.Getpid(), fakeTime) {
 		t.Error("expected true for mismatched start time")
+	}
+}
+
+// TestStateFile_ReadOnlyPersisted verifies that
+// WriteStateFile(readOnly=true) persists ReadOnly=true in the
+// JSON payload so CLI consumers can distinguish pg serve
+// (read-only) from local serve (read/write).
+func TestStateFile_ReadOnlyPersisted(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	path, err := WriteStateFile(
+		dir, "127.0.0.1", 9876, "test", true,
+	)
+	if err != nil {
+		t.Fatalf("WriteStateFile: %v", err)
+	}
+	defer RemoveStateFile(dir, 9876)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading state file: %v", err)
+	}
+	var sf StateFile
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !sf.ReadOnly {
+		t.Error("ReadOnly = false, want true")
+	}
+	if sf.Port != 9876 {
+		t.Errorf("port = %d, want 9876", sf.Port)
+	}
+	if sf.Version != "test" {
+		t.Errorf("version = %q, want test", sf.Version)
+	}
+}
+
+// TestStateFile_ReadOnlyDefaultsToFalse verifies that
+// WriteStateFile(readOnly=false) persists ReadOnly=false. The
+// omitempty tag means the "read_only" key is elided from the
+// JSON entirely in this case.
+func TestStateFile_ReadOnlyDefaultsToFalse(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	path, err := WriteStateFile(
+		dir, "127.0.0.1", 9877, "test", false,
+	)
+	if err != nil {
+		t.Fatalf("WriteStateFile: %v", err)
+	}
+	defer RemoveStateFile(dir, 9877)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading state file: %v", err)
+	}
+	var sf StateFile
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if sf.ReadOnly {
+		t.Error("ReadOnly = true, want false")
 	}
 }
 

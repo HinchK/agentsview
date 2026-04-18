@@ -350,7 +350,7 @@ func parseOpenHandsMessageEvent(
 		return ParsedMessage{}, false, ""
 	}
 
-	content, _, _, toolCalls, toolResults :=
+	content, _, _, _, toolCalls, toolResults :=
 		ExtractTextContent(llmMessage.Get("content"))
 	content, hasThinking := openHandsAppendThinking(
 		content, ev,
@@ -506,7 +506,7 @@ func openHandsBaseStateCwd(base gjson.Result) string {
 }
 
 func openHandsText(content gjson.Result) string {
-	text, _, _, _, _ := ExtractTextContent(content)
+	text, _, _, _, _, _ := ExtractTextContent(content)
 	return strings.TrimSpace(text)
 }
 

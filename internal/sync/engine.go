@@ -3009,6 +3009,7 @@ func toDBMessages(pw pendingWrite, blocked map[string]bool) []db.Message {
 			Ordinal:           m.Ordinal,
 			Role:              string(m.Role),
 			Content:           m.Content,
+			ThinkingText:      m.ThinkingText,
 			Timestamp:         timeutil.Format(m.Timestamp),
 			HasThinking:       m.HasThinking,
 			HasToolUse:        m.HasToolUse,

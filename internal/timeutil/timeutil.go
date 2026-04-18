@@ -20,3 +20,19 @@ func Format(t time.Time) string {
 	}
 	return t.UTC().Format(time.RFC3339Nano)
 }
+
+// IsValidDate reports whether s is a well-formed YYYY-MM-DD string.
+func IsValidDate(s string) bool {
+	_, err := time.Parse("2006-01-02", s)
+	return err == nil
+}
+
+// IsValidTimestamp reports whether s is a well-formed RFC3339 or
+// RFC3339Nano timestamp.
+func IsValidTimestamp(s string) bool {
+	if _, err := time.Parse(time.RFC3339, s); err == nil {
+		return true
+	}
+	_, err := time.Parse(time.RFC3339Nano, s)
+	return err == nil
+}

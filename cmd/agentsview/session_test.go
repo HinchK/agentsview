@@ -1,0 +1,599 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/wesm/agentsview/internal/db"
+	"github.com/wesm/agentsview/internal/server"
+)
+
+func TestSessionHelp_ShowsSubcommands(t *testing.T) {
+	t.Parallel()
+	cmd := newRootCommand()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"session", "--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	help := buf.String()
+	for _, name := range []string{
+		"get", "list", "messages", "tool-calls",
+		"export", "sync", "watch",
+	} {
+		assert.Contains(t, help, name,
+			"expected subcommand %q in help", name)
+	}
+	assert.Contains(t, help, "--format",
+		"expected --format persistent flag in help")
+}
+
+// seedSession opens the SQLite DB at dataDir/sessions.db, inserts
+// one session with the given id+project (plus sane defaults), and
+// closes the DB. Each subtest gets its own dataDir so parallel
+// runs don't step on each other.
+func seedSession(t *testing.T, dataDir, id, project string) {
+	t.Helper()
+	seedSessionWithOpts(t, dataDir, id, project, nil)
+}
+
+// seedSessionWithOpts is like seedSession but allows mutation of
+// the db.Session before insert via the optional mut callback.
+// Use this when a test needs to set signal counts or other
+// non-default fields (e.g. ToolFailureSignalCount = 0 to
+// exercise the --min-tool-failures flag's *int handling).
+func seedSessionWithOpts(
+	t *testing.T, dataDir, id, project string,
+	mut func(*db.Session),
+) {
+	t.Helper()
+	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	// UserMessageCount >= 2 so seeded sessions pass the default
+	// ExcludeOneShot filter in `session list` (one-shot means
+	// user_message_count <= 1). See internal/db/analytics.go.
+	s := db.Session{
+		ID:               id,
+		Project:          project,
+		Machine:          "m",
+		Agent:            "claude",
+		MessageCount:     4,
+		UserMessageCount: 2,
+	}
+	if mut != nil {
+		mut(&s)
+	}
+	require.NoError(t, d.UpsertSession(s))
+	require.NoError(t, d.Close())
+}
+
+func TestSessionGet_JSON(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-1", "proj")
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "get", "s-1", "--format", "json")
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	assert.Equal(t, "s-1", got["id"])
+	assert.Equal(t, "proj", got["project"])
+}
+
+func TestSessionGet_NotFound(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+
+	_, err := executeCommand(newRootCommand(),
+		"session", "get", "missing", "--format", "json")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing")
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestSessionGet_Human(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-2", "proj")
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "get", "s-2")
+	require.NoError(t, err)
+	assert.True(t, strings.Contains(out, "s-2"),
+		"human output should contain session id, got: %q", out)
+	assert.True(t, strings.Contains(out, "proj"),
+		"human output should contain project, got: %q", out)
+}
+
+func TestSessionList_JSONShape(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-a", "proj")
+	seedSession(t, dataDir, "s-b", "proj")
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "list", "--format", "json")
+	require.NoError(t, err)
+
+	var got struct {
+		Sessions   []map[string]any `json:"sessions"`
+		NextCursor string           `json:"next_cursor"`
+		Total      int              `json:"total"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	assert.Equal(t, 2, got.Total)
+	assert.Len(t, got.Sessions, 2)
+}
+
+func TestSessionList_FilterByProject(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-a", "p1")
+	seedSession(t, dataDir, "s-b", "p2")
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "list", "--project", "p1", "--format", "json")
+	require.NoError(t, err)
+
+	var got struct {
+		Sessions []map[string]any `json:"sessions"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	require.Len(t, got.Sessions, 1)
+	assert.Equal(t, "s-a", got.Sessions[0]["id"])
+}
+
+// TestSessionList_MinToolFailuresZero verifies that passing
+// --min-tool-failures 0 is treated as an explicit filter value
+// (sessions with >=0 failures) rather than skipped as the int
+// zero value. This exercises the cmd.Flags().Changed() guard
+// that converts the int flag into a *int on ListFilter.
+func TestSessionList_MinToolFailuresZero(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSessionWithOpts(t, dataDir, "s-a", "proj",
+		func(s *db.Session) { s.ToolFailureSignalCount = 0 })
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "list", "--min-tool-failures", "0",
+		"--format", "json")
+	require.NoError(t, err)
+
+	var got struct {
+		Sessions []map[string]any `json:"sessions"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	require.Len(t, got.Sessions, 1)
+	assert.Equal(t, "s-a", got.Sessions[0]["id"])
+}
+
+// seedMessages inserts n message rows for sessionID with alternating
+// user/assistant roles, ordinals starting at 1, and RFC3339
+// timestamps one minute apart starting at 2026-04-01T00:00:00Z.
+func seedMessages(t *testing.T, dataDir, sessionID string, n int) {
+	t.Helper()
+	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+
+	base := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	msgs := make([]db.Message, 0, n)
+	for i := range n {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		content := fmt.Sprintf("msg-%d", i+1)
+		msgs = append(msgs, db.Message{
+			SessionID:     sessionID,
+			Ordinal:       i + 1,
+			Role:          role,
+			Content:       content,
+			ContentLength: len(content),
+			Timestamp:     base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	require.NoError(t, d.InsertMessages(msgs))
+	require.NoError(t, d.Close())
+}
+
+func TestSessionMessages_JSONShape(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-msgs", "proj")
+	seedMessages(t, dataDir, "s-msgs", 3)
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "messages", "s-msgs", "--format", "json")
+	require.NoError(t, err)
+
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+		Count    int              `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	assert.Equal(t, 3, got.Count)
+	require.Len(t, got.Messages, 3)
+	assert.Equal(t, float64(1), got.Messages[0]["ordinal"])
+}
+
+func TestSessionMessages_FromLimit(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-msgs", "proj")
+	seedMessages(t, dataDir, "s-msgs", 5)
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "messages", "s-msgs",
+		"--from", "3", "--limit", "2", "--format", "json")
+	require.NoError(t, err)
+
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+		Count    int              `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	assert.Equal(t, 2, got.Count)
+	require.Len(t, got.Messages, 2)
+	assert.Equal(t, float64(3), got.Messages[0]["ordinal"])
+}
+
+func TestSessionMessages_DirectionDesc(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-msgs", "proj")
+	seedMessages(t, dataDir, "s-msgs", 4)
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "messages", "s-msgs",
+		"--direction", "desc", "--format", "json")
+	require.NoError(t, err)
+
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+		Count    int              `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	assert.Equal(t, 4, got.Count)
+	require.Len(t, got.Messages, 4)
+	assert.Equal(t, float64(4), got.Messages[0]["ordinal"])
+	assert.Equal(t, float64(3), got.Messages[1]["ordinal"])
+	assert.Equal(t, float64(2), got.Messages[2]["ordinal"])
+	assert.Equal(t, float64(1), got.Messages[3]["ordinal"])
+}
+
+// seedMessagesWithToolCalls inserts one assistant message for sessionID
+// carrying n tool_use blocks, numbered 1..n with ToolName "Bash<i>".
+// Ordinals start at 1. Timestamp is fixed for determinism.
+func seedMessagesWithToolCalls(
+	t *testing.T, dataDir, sessionID string, n int,
+) {
+	t.Helper()
+	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+
+	calls := make([]db.ToolCall, 0, n)
+	for i := range n {
+		calls = append(calls, db.ToolCall{
+			SessionID: sessionID,
+			ToolName:  fmt.Sprintf("Bash%d", i+1),
+			Category:  "shell",
+			ToolUseID: fmt.Sprintf("tu-%d", i+1),
+			InputJSON: `{"command":"echo hi"}`,
+		})
+	}
+	msg := db.Message{
+		SessionID:     sessionID,
+		Ordinal:       1,
+		Role:          "assistant",
+		Content:       "",
+		ContentLength: 0,
+		Timestamp:     "2026-04-01T00:00:00Z",
+		HasToolUse:    true,
+		ToolCalls:     calls,
+	}
+	require.NoError(t, d.InsertMessages([]db.Message{msg}))
+	require.NoError(t, d.Close())
+}
+
+func TestSessionToolCalls_JSONShape(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-tc", "proj")
+	seedMessagesWithToolCalls(t, dataDir, "s-tc", 2)
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "tool-calls", "s-tc", "--format", "json")
+	require.NoError(t, err)
+
+	var got struct {
+		ToolCalls []map[string]any `json:"tool_calls"`
+		Count     int              `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	assert.Equal(t, 2, got.Count)
+	require.Len(t, got.ToolCalls, 2)
+	assert.NotEmpty(t, got.ToolCalls[0]["tool_name"])
+	assert.NotEmpty(t, got.ToolCalls[0]["timestamp"])
+}
+
+func TestSessionToolCalls_HumanTable(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-tc2", "proj")
+	seedMessagesWithToolCalls(t, dataDir, "s-tc2", 2)
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "tool-calls", "s-tc2")
+	require.NoError(t, err)
+
+	for _, token := range []string{
+		"ORDINAL", "TIMESTAMP", "TOOL", "CATEGORY",
+		"Bash1", "Bash2",
+	} {
+		assert.Contains(t, out, token,
+			"human output should contain %q, got: %q", token, out)
+	}
+}
+
+func TestSessionExport_StreamsFromDisk(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+
+	src := filepath.Join(t.TempDir(), "session.jsonl")
+	body := "{\"type\":\"user\",\"content\":\"hello\"}\n" +
+		"{\"type\":\"assistant\",\"content\":\"hi\"}\n"
+	require.NoError(t, os.WriteFile(src, []byte(body), 0o600))
+
+	seedSessionWithOpts(t, dataDir, "s-1", "proj",
+		func(s *db.Session) { s.FilePath = &src })
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "s-1")
+	require.NoError(t, err)
+	assert.Equal(t, body, out)
+}
+
+func TestSessionExport_FailsWhenSourceMissing(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+
+	nonExistent := filepath.Join(t.TempDir(), "gone.jsonl")
+	seedSessionWithOpts(t, dataDir, "s-1", "proj",
+		func(s *db.Session) { s.FilePath = &nonExistent })
+
+	_, err := executeCommand(newRootCommand(),
+		"session", "export", "s-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source file not found")
+}
+
+func TestSessionExport_FailsWhenNotInLocalArchive(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+
+	_, err := executeCommand(newRootCommand(),
+		"session", "export", "unknown-id")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not in local archive")
+	assert.Contains(t, err.Error(), "unknown-id")
+}
+
+// TestSessionSync_UnknownID_ReportsNoFilePath verifies that the
+// sync engine is plumbed in direct mode. No daemon running, no
+// sessions in DB — Execute returns an error whose message contains
+// "no file_path recorded" AND the missing id. Critically the
+// error must NOT be db.ErrReadOnly (that would mean the engine
+// was nil, i.e. direct-backend constructed without a real
+// sync.Engine as in the default newService path).
+func TestSessionSync_UnknownID_ReportsNoFilePath(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+
+	_, err := executeCommand(newRootCommand(),
+		"session", "sync", "missing-id")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing-id")
+	assert.Contains(t, err.Error(), "no file_path recorded",
+		"error should come from directBackend.Sync validation, not ErrReadOnly")
+	assert.NotContains(t, err.Error(), "read-only",
+		"engine must be plumbed; got ErrReadOnly-style message: %v", err)
+}
+
+// TestSessionSync_AgainstReadOnlyDaemon_Refuses verifies the CLI
+// refuses to sync when a pg serve (ReadOnly=true) daemon owns
+// the state file. The refusal must happen before we issue the
+// HTTP call, so the test only needs a live TCP listener — not a
+// real HTTP handler.
+func TestSessionSync_AgainstReadOnlyDaemon_Refuses(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+
+	_, port := freeTCPListener(t)
+	_, err := server.WriteStateFile(
+		dataDir, "127.0.0.1", port, "test", true,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { server.RemoveStateFile(dataDir, port) })
+
+	_, err = executeCommand(newRootCommand(),
+		"session", "sync", "some-id")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read-only",
+		"should refuse against pg serve daemon")
+}
+
+// TestSessionWatch_ExitsOnCancel verifies that `session watch`
+// exits cleanly when the cobra Command's context is cancelled,
+// without hanging on the upstream channel. Any NDJSON emitted
+// to stdout must parse as one JSON object per line. We don't
+// drive DB changes here (poll interval is 1.5s) — this test
+// only asserts the plumbing: service resolution, channel wiring,
+// and the shutdown path.
+//
+// To distinguish a real Watch call from an early-return stub, we
+// also assert the command runs for at least ~150ms: any stub that
+// returns synchronously would complete in single-digit ms.
+func TestSessionWatch_ExitsOnCancel(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	seedSession(t, dataDir, "s-watch", "proj")
+
+	root := newRootCommand()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"session", "watch", "s-watch"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- root.ExecuteContext(ctx) }()
+
+	var execErr error
+	select {
+	case execErr = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session watch did not exit within 3s after ctx cancel")
+	}
+	elapsed := time.Since(start)
+
+	// Clean cancellation must surface as either nil (upstream channel
+	// closed on ctx cancel) or an error that wraps context.Canceled.
+	// Anything else indicates a regression that earlier versions of
+	// this test swallowed by discarding execErr.
+	if execErr != nil && !errors.Is(execErr, context.Canceled) {
+		t.Fatalf("expected nil or context.Canceled, got %v", execErr)
+	}
+
+	// A stub that returns immediately would complete far faster
+	// than the 200ms cancel delay. Require the command to actually
+	// wait on the Watch channel.
+	assert.GreaterOrEqual(t, elapsed, 150*time.Millisecond,
+		"session watch returned too quickly (%v) — "+
+			"likely a stub, not a real Watch", elapsed)
+
+	// Any output must be valid NDJSON. Empty output is fine.
+	for line := range bytes.SplitSeq(buf.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var ev map[string]any
+		require.NoError(t, json.Unmarshal(line, &ev),
+			"non-NDJSON line: %q", line)
+	}
+}
+
+// TestSessionWatch_UnknownID_ExitsOnCancel verifies that
+// `session watch` opens the event channel even for a session
+// id that isn't in the local archive (direct-mode Watch never
+// validates the id — it just polls GetSessionVersion and
+// emits nothing for missing sessions). With a cancelling
+// context the command still exits cleanly.
+func TestSessionWatch_UnknownID_ExitsOnCancel(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+
+	root := newRootCommand()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"session", "watch", "unknown-id"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- root.ExecuteContext(ctx) }()
+
+	var execErr error
+	select {
+	case execErr = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("session watch did not exit within 3s after ctx cancel")
+	}
+	elapsed := time.Since(start)
+
+	if execErr != nil && !errors.Is(execErr, context.Canceled) {
+		t.Fatalf("expected nil or context.Canceled, got %v", execErr)
+	}
+
+	assert.GreaterOrEqual(t, elapsed, 150*time.Millisecond,
+		"session watch returned too quickly (%v) — "+
+			"likely a stub, not a real Watch", elapsed)
+
+	for line := range bytes.SplitSeq(buf.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var ev map[string]any
+		require.NoError(t, json.Unmarshal(line, &ev),
+			"non-NDJSON line: %q", line)
+	}
+}
+
+// TestLooksLikePath covers both POSIX and Windows-style separators
+// so "./session.jsonl" works on Windows and bare session IDs stay
+// classified as IDs regardless of platform.
+func TestLooksLikePath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"abc-123", false},
+		{"550e8400-e29b-41d4-a716-446655440000", false},
+		{"codex:my-session", false},
+		{".", true},
+		{"..", true},
+		{"./session.jsonl", true},
+		{"../parent/session.jsonl", true},
+		{`.\session.jsonl`, true},
+		{`..\parent\session.jsonl`, true},
+		{"subdir/session.jsonl", true},
+		{`subdir\session.jsonl`, true},
+		{"/abs/path.jsonl", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := looksLikePath(tc.in); got != tc.want {
+				t.Fatalf("looksLikePath(%q) = %v, want %v",
+					tc.in, got, tc.want)
+			}
+		})
+	}
+}

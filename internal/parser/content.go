@@ -9,24 +9,29 @@ import (
 
 // ExtractTextContent extracts readable text from message content.
 // content can be a string or a JSON array of blocks.
-// Returns the text, hasThinking, hasToolUse, tool calls, and tool results.
+// Returns: flattened text (with inline [Thinking] markers for UI
+// compatibility), concatenated thinking-block text (no markers),
+// hasThinking, hasToolUse, tool calls, and tool results.
+// Thinking blocks are joined with "\n\n" to give an unambiguous
+// block boundary in the concatenated thinking text.
 func ExtractTextContent(
 	content gjson.Result,
-) (string, bool, bool, []ParsedToolCall, []ParsedToolResult) {
+) (string, string, bool, bool, []ParsedToolCall, []ParsedToolResult) {
 	if content.Type == gjson.String {
-		return content.Str, false, false, nil, nil
+		return content.Str, "", false, false, nil, nil
 	}
 
 	if !content.IsArray() {
-		return "", false, false, nil, nil
+		return "", "", false, false, nil, nil
 	}
 
 	var (
-		parts       []string
-		toolCalls   []ParsedToolCall
-		toolResults []ParsedToolResult
-		hasThinking bool
-		hasToolUse  bool
+		parts         []string
+		thinkingParts []string
+		toolCalls     []ParsedToolCall
+		toolResults   []ParsedToolResult
+		hasThinking   bool
+		hasToolUse    bool
 	)
 	content.ForEach(func(_, block gjson.Result) bool {
 		switch block.Get("type").Str {
@@ -39,6 +44,7 @@ func ExtractTextContent(
 			thinking := block.Get("thinking").Str
 			if thinking != "" {
 				hasThinking = true
+				thinkingParts = append(thinkingParts, thinking)
 				parts = append(parts,
 					"[Thinking]\n"+thinking+"\n[/Thinking]")
 			}
@@ -80,6 +86,7 @@ func ExtractTextContent(
 	})
 
 	return strings.Join(parts, "\n"),
+		strings.Join(thinkingParts, "\n\n"),
 		hasThinking, hasToolUse, toolCalls, toolResults
 }
 

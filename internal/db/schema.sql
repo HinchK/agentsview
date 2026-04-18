@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS messages (
     ordinal        INTEGER NOT NULL,
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
+    thinking_text  TEXT NOT NULL DEFAULT '',
     timestamp      TEXT,
     has_thinking   INTEGER NOT NULL DEFAULT 0,
     has_tool_use   INTEGER NOT NULL DEFAULT 0,

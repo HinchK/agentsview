@@ -52,6 +52,7 @@ function makeMessage(ordinal: number): Message {
     content: `msg ${ordinal}`,
     timestamp: new Date(ordinal * 1000).toISOString(),
     has_thinking: false,
+    thinking_text: "",
     has_tool_use: false,
     content_length: 6,
     model: "",

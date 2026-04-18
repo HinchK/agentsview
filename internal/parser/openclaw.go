@@ -98,7 +98,7 @@ func ParseOpenClawSession(
 		switch role {
 		case "user":
 			content := msg.Get("content")
-			text, hasThinking, hasToolUse, tcs, trs :=
+			text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
 				ExtractTextContent(content)
 			text = strings.TrimSpace(text)
 			if text == "" && len(tcs) == 0 && len(trs) == 0 {
@@ -120,6 +120,7 @@ func ParseOpenClawSession(
 				Content:       text,
 				Timestamp:     ts,
 				HasThinking:   hasThinking,
+				ThinkingText:  thinkingText,
 				HasToolUse:    hasToolUse,
 				ContentLength: len(text),
 				ToolCalls:     tcs,
@@ -130,7 +131,7 @@ func ParseOpenClawSession(
 
 		case "assistant":
 			content := msg.Get("content")
-			text, hasThinking, hasToolUse, tcs, trs :=
+			text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
 				ExtractTextContent(content)
 			text = strings.TrimSpace(text)
 			if text == "" && len(tcs) == 0 && len(trs) == 0 {
@@ -143,6 +144,7 @@ func ParseOpenClawSession(
 				Content:       text,
 				Timestamp:     ts,
 				HasThinking:   hasThinking,
+				ThinkingText:  thinkingText,
 				HasToolUse:    hasToolUse,
 				ContentLength: len(text),
 				ToolCalls:     tcs,

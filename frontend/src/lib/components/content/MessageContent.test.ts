@@ -56,6 +56,7 @@ function makeMessage(
     content: "Token summary",
     timestamp: "2026-02-20T12:30:00Z",
     has_thinking: false,
+    thinking_text: "",
     has_tool_use: false,
     content_length: 13,
     model: "claude-sonnet",

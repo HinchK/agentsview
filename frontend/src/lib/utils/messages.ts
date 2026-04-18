@@ -10,16 +10,32 @@ const SYSTEM_MSG_PREFIXES = [
   "Stop hook feedback:",
 ];
 
+// Subtypes the Claude parser promotes into visible system messages
+// that the SPA renders via SystemBoundaryCard. These must pass
+// through the MessageList filter even though is_system=true.
+const VISIBLE_SYSTEM_SUBTYPES = new Set([
+  "continuation",
+  "resume",
+  "interrupted",
+  "task_notification",
+  "stop_hook",
+]);
+
 /**
  * Returns true if the message is system-injected and should be
  * hidden from the UI. Checks the backend is_system flag first,
  * then falls back to prefix detection for parsers that don't set it.
  *
- * Compact boundary messages are system-flagged but rendered as a
- * divider, so they are kept visible here.
+ * Compact boundary messages and promoted system-subtype messages
+ * (continuation, resume, interrupted, task_notification, stop_hook)
+ * are system-flagged but rendered as dividers/cards, so they are
+ * kept visible here.
  */
 export function isSystemMessage(m: Message): boolean {
   if (m.is_compact_boundary) return false;
+  if (m.source_subtype && VISIBLE_SYSTEM_SUBTYPES.has(m.source_subtype)) {
+    return false;
+  }
   if (m.is_system) return true;
   if (m.role !== "user") return false;
   const trimmed = m.content.trim();
