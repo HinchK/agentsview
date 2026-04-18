@@ -2,6 +2,7 @@ package parser
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -156,53 +157,75 @@ func projectFromWorktreeLayout(path string) string {
 	return ""
 }
 
-// autoMasterPath is indirected so tests can substitute a fixture.
-var autoMasterPath = "/etc/auto_master"
+// autofsMountSource is indirected so tests can supply fixture
+// output in lieu of running mount(8).
+var autofsMountSource = runMountCommand
 
-// autofsPrefixes holds path prefixes that the local autofs config
-// manages, each with a trailing separator so strings.HasPrefix
-// gives component-boundary matches. Populated at package init on
-// darwin; other platforms leave it empty.
+func runMountCommand() ([]byte, error) {
+	return exec.Command("/sbin/mount").Output()
+}
+
+// autofsPrefixes holds path prefixes that autofs is actively
+// managing on this host, each with a trailing separator so
+// strings.HasPrefix gives component-boundary matches. Populated
+// at package init on darwin from the live mount table; other
+// platforms leave it empty.
 //
 // Why we care: os.Stat into an autofs-managed prefix triggers
 // automountd. For the default /home entry macOS resolves the map
 // via /usr/libexec/od_user_homes, which asks opendirectoryd to
 // enumerate every user record. Bulk remote-sync runs whose
 // session cwds all share a /home/<user>/... prefix therefore peg
-// opendirectoryd and automountd at hundreds of percent CPU. The
-// git-root walker skips paths that fall inside these prefixes.
+// opendirectoryd and automountd at hundreds of percent CPU.
 //
-// Discovering the prefix set from auto_master (rather than
-// hardcoding /home) means a host with a real filesystem at /home
-// — and no autofs entry — still gets full git-root resolution.
+// Sourcing the prefix set from mount(8) (rather than parsing
+// /etc/auto_master directly) captures prefixes pulled in via
+// +auto_master directory-service includes, which never appear
+// in the local config file.
 var autofsPrefixes = detectAutofsPrefixes()
 
-// detectAutofsPrefixes reads auto_master and returns the mount
-// points declared as autofs prefixes. Returns nil on non-darwin
-// hosts or when the file is absent/unreadable.
+// detectAutofsPrefixes returns the autofs-managed path prefixes
+// reported by the running mount table. Non-darwin hosts and
+// exec failures both return nil.
 func detectAutofsPrefixes() []string {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
-	data, err := os.ReadFile(autoMasterPath)
+	data, err := autofsMountSource()
 	if err != nil {
 		return nil
 	}
+	return parseMountOutputForAutofs(data)
+}
+
+// parseMountOutputForAutofs extracts the mount points of autofs
+// filesystems from mount(8) output. Typical macOS lines look
+// like:
+//
+//	map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
+//	server.example:/export on /corp/home (autofs, nobrowse)
+//
+// macOS presents the Data volume at / via an APFS firmlink, so
+// /System/Volumes/Data is stripped to match the path form that
+// client code observes.
+func parseMountOutputForAutofs(data []byte) []string {
 	var out []string
 	for line := range strings.SplitSeq(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if !strings.Contains(line, "(autofs") {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
+		_, after, ok := strings.Cut(line, " on ")
+		if !ok {
 			continue
 		}
-		mount := fields[0]
-		// Skip +include directives (e.g. +auto_master) and the
-		// direct-map marker /- — neither corresponds to a prefix
-		// we could match with strings.HasPrefix.
-		if !strings.HasPrefix(mount, "/") || mount == "/-" {
+		rest := after
+		parenIdx := strings.LastIndex(rest, " (")
+		if parenIdx < 0 {
+			continue
+		}
+		mount := strings.TrimSpace(rest[:parenIdx])
+		mount = strings.TrimPrefix(mount, "/System/Volumes/Data")
+		if mount == "" || mount == "/" {
 			continue
 		}
 		out = append(out, strings.TrimRight(mount, "/")+"/")

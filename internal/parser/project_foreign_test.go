@@ -1,13 +1,22 @@
 package parser
 
 import (
+	"errors"
 	"os"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"sync/atomic"
 	"testing"
 )
+
+// autofsTestsSupported reports whether the running OS uses POSIX
+// path separators, which the autofs prefix matching depends on.
+// Windows-normalised paths (\home\...) would not match the /home/
+// prefix form autofs reports, and Windows has no autofs in the
+// first place, so these tests are skipped there.
+func autofsTestsSupported() bool {
+	return runtime.GOOS != "windows"
+}
 
 // TestExtractProjectFromCwd_AutofsUnresolved_SkipsWalk verifies
 // that a cwd under an autofs prefix whose first component does
@@ -16,6 +25,9 @@ import (
 // full git-root walk. Without the skip, statting every ancestor
 // hammers automountd/opendirectoryd via /usr/libexec/od_user_homes.
 func TestExtractProjectFromCwd_AutofsUnresolved_SkipsWalk(t *testing.T) {
+	if !autofsTestsSupported() {
+		t.Skip("autofs tests require POSIX path separators")
+	}
 	origPrefixes := autofsPrefixes
 	defer func() { autofsPrefixes = origPrefixes }()
 	autofsPrefixes = []string{"/home/"}
@@ -46,6 +58,9 @@ func TestExtractProjectFromCwd_AutofsUnresolved_SkipsWalk(t *testing.T) {
 // that a bulk sync with many cwds under the same autofs first
 // component pays for only one stat across the batch.
 func TestExtractProjectFromCwd_AutofsUnresolved_ProbeCached(t *testing.T) {
+	if !autofsTestsSupported() {
+		t.Skip("autofs tests require POSIX path separators")
+	}
 	origPrefixes := autofsPrefixes
 	defer func() { autofsPrefixes = origPrefixes }()
 	autofsPrefixes = []string{"/home/"}
@@ -78,6 +93,9 @@ func TestExtractProjectFromCwd_AutofsUnresolved_ProbeCached(t *testing.T) {
 // still resolve projects to their repository roots. A resolving
 // probe lets the git-root walk proceed normally.
 func TestExtractProjectFromCwd_AutofsResolved_Walks(t *testing.T) {
+	if !autofsTestsSupported() {
+		t.Skip("autofs tests require POSIX path separators")
+	}
 	origPrefixes := autofsPrefixes
 	defer func() { autofsPrefixes = origPrefixes }()
 	autofsPrefixes = []string{"/home/"}
@@ -114,9 +132,13 @@ func TestExtractProjectFromCwd_AutofsResolved_Walks(t *testing.T) {
 // paths outside any autofs-managed prefix still trigger the
 // git-root walk.
 func TestExtractProjectFromCwd_NativePath_StillWalks(t *testing.T) {
+	if !autofsTestsSupported() {
+		t.Skip("autofs tests require POSIX path separators")
+	}
 	origPrefixes := autofsPrefixes
 	defer func() { autofsPrefixes = origPrefixes }()
 	autofsPrefixes = []string{"/home/"}
+	resetAutofsProbes()
 
 	orig := osStat
 	defer func() { osStat = orig }()
@@ -139,9 +161,13 @@ func TestExtractProjectFromCwd_NativePath_StillWalks(t *testing.T) {
 // mounted at /home (no autofs entry) should still get git-root
 // resolution, not a basename-only fallback.
 func TestExtractProjectFromCwd_HomePathWithoutAutofs_StillWalks(t *testing.T) {
+	if !autofsTestsSupported() {
+		t.Skip("autofs tests require POSIX path separators")
+	}
 	origPrefixes := autofsPrefixes
 	defer func() { autofsPrefixes = origPrefixes }()
 	autofsPrefixes = nil
+	resetAutofsProbes()
 
 	orig := osStat
 	defer func() { osStat = orig }()
@@ -159,27 +185,47 @@ func TestExtractProjectFromCwd_HomePathWithoutAutofs_StillWalks(t *testing.T) {
 	}
 }
 
-// TestDetectAutofsPrefixes verifies that /etc/auto_master is parsed
-// into the prefix set. Only darwin is expected to populate this;
-// other platforms return an empty list.
-func TestDetectAutofsPrefixes(t *testing.T) {
-	origPath := autoMasterPath
-	defer func() { autoMasterPath = origPath }()
-
-	tmp := t.TempDir()
-	fixture := filepath.Join(tmp, "auto_master")
-	content := "#\n" +
-		"# Automounter master map\n" +
-		"#\n" +
-		"+auto_master\n" +
-		"#/net           -hosts    -nobrowse\n" +
-		"/home           auto_home -nobrowse,hidefromfinder\n" +
-		"/Network/Servers -fstab\n" +
-		"/-              -static\n"
-	if err := os.WriteFile(fixture, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+// TestParseMountOutputForAutofs exercises the pure mount-output
+// parser. It runs on every platform because it operates on the
+// string form of `mount`'s output.
+func TestParseMountOutputForAutofs(t *testing.T) {
+	// Representative macOS output mixing real filesystems with
+	// autofs entries; includes the /System/Volumes/Data firmlink
+	// prefix that must be stripped.
+	input := []byte(`/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
+devfs on /dev (devfs, local, nobrowse)
+/dev/disk3s6 on /System/Volumes/VM (apfs, local, noexec, journaled, nobrowse, sealed)
+map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
+map -hosts on /System/Volumes/Data/net (autofs, automounted, nobrowse)
+map -fstab on /System/Volumes/Data/Network/Servers (autofs, automounted, nobrowse)
+server.example:/export on /corp/home (autofs, nobrowse)
+`)
+	got := parseMountOutputForAutofs(input)
+	want := []string{
+		"/home/",
+		"/net/",
+		"/Network/Servers/",
+		"/corp/home/",
 	}
-	autoMasterPath = fixture
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parseMountOutputForAutofs() = %v, want %v",
+			got, want)
+	}
+}
+
+// TestDetectAutofsPrefixes uses the injectable mount source so the
+// end-to-end detection path runs without actually invoking mount(8).
+func TestDetectAutofsPrefixes(t *testing.T) {
+	origSrc := autofsMountSource
+	defer func() { autofsMountSource = origSrc }()
+	autofsMountSource = func() ([]byte, error) {
+		return []byte(
+			"map auto_home on /System/Volumes/Data/home " +
+				"(autofs, automounted, nobrowse)\n" +
+				"map -fstab on /System/Volumes/Data/Network/Servers " +
+				"(autofs, automounted, nobrowse)\n",
+		), nil
+	}
 
 	got := detectAutofsPrefixes()
 	if runtime.GOOS != "darwin" {
@@ -189,23 +235,23 @@ func TestDetectAutofsPrefixes(t *testing.T) {
 		}
 		return
 	}
-
 	want := []string{"/home/", "/Network/Servers/"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("detectAutofsPrefixes() = %v, want %v", got, want)
 	}
 }
 
-// TestDetectAutofsPrefixes_MissingFile confirms that a missing
-// auto_master file (unusual but possible) yields an empty list
-// rather than crashing.
-func TestDetectAutofsPrefixes_MissingFile(t *testing.T) {
-	origPath := autoMasterPath
-	defer func() { autoMasterPath = origPath }()
-	autoMasterPath = filepath.Join(t.TempDir(), "does-not-exist")
-
+// TestDetectAutofsPrefixes_MountFails confirms that a mount(8)
+// failure degrades to nil rather than crashing or blocking the
+// git-root walk on unrelated paths.
+func TestDetectAutofsPrefixes_MountFails(t *testing.T) {
+	origSrc := autofsMountSource
+	defer func() { autofsMountSource = origSrc }()
+	autofsMountSource = func() ([]byte, error) {
+		return nil, errors.New("mock mount failure")
+	}
 	if got := detectAutofsPrefixes(); got != nil {
-		t.Errorf("detectAutofsPrefixes() with missing file = %v, want nil",
-			got)
+		t.Errorf("detectAutofsPrefixes() with mount failure = %v, "+
+			"want nil", got)
 	}
 }
