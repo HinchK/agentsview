@@ -1673,10 +1673,10 @@ ______________________________________________________________________
 
 - Modify: `internal/db/session_stats.go`, `internal/db/session_stats_test.go`
 
-- [ ] **Step 1: Failing test** with a fixture git repo and canned session cwds;
+- [x] **Step 1: Failing test** with a fixture git repo and canned session cwds;
   assert `outcome_stats.commits`, `loc_added`, etc.
 
-- [ ] **Step 2: Implement.**
+- [x] **Step 2: Implement.**
 
 ```go
 func (db *DB) computeOutcomeStats(ctx context.Context, s *SessionStats, f StatsFilter, rows []sessionStatsRow) error {
@@ -1718,7 +1718,7 @@ func (db *DB) computeOutcomeStats(ctx context.Context, s *SessionStats, f StatsF
 
 Add `cwd` to `sessionStatsRow` / `loadSessionsInWindow`.
 
-- [ ] **Step 3: Run → PASS. Commit.**
+- [x] **Step 3: Run → PASS. Commit.**
 
 ```bash
 git commit -am "db(stats): aggregate outcome_stats from repo-discovered git data"

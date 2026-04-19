@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"github.com/wesm/agentsview/internal/db/git"
 )
 
 // StatsFilter mirrors the service-layer StatsFilter but lives in db
@@ -101,6 +102,10 @@ func (db *DB) GetSessionStats(
 
 	if err := db.computeAdoption(ctx, stats, rows); err != nil {
 		return nil, fmt.Errorf("computing adoption: %w", err)
+	}
+
+	if err := db.computeOutcomeStats(ctx, stats, f, from, to, rows); err != nil {
+		return nil, fmt.Errorf("computing outcome stats: %w", err)
 	}
 
 	return stats, nil
@@ -350,6 +355,10 @@ type sessionStatsRow struct {
 	toolRetryCount  int
 	compactionCount int
 	editChurnCount  int
+	// cwd is the working directory recorded on the session. Consumed by
+	// computeOutcomeStats to resolve enclosing git repositories; empty
+	// string indicates the session had no recorded cwd and is skipped.
+	cwd string
 }
 
 // loadSessionsInWindow returns the rows the stats pipeline needs.
@@ -415,7 +424,8 @@ func (db *DB) loadSessionsInWindow(
 			WHERE m.session_id = s.id AND m.role = 'assistant'),
 			0) AS assistant_turns,
 		s.outcome, COALESCE(s.health_grade, ''),
-		s.tool_retry_count, s.compaction_count, s.edit_churn_count
+		s.tool_retry_count, s.compaction_count, s.edit_churn_count,
+		COALESCE(s.cwd, '')
 		FROM sessions s WHERE ` + strings.Join(preds, " AND ")
 
 	sqlRows, err := db.getReader().QueryContext(ctx, query, args...)
@@ -441,6 +451,7 @@ func (db *DB) loadSessionsInWindow(
 			&r.totalToolCalls, &r.assistantTurns,
 			&r.outcome, &r.healthGrade,
 			&r.toolRetryCount, &r.compactionCount, &r.editChurnCount,
+			&r.cwd,
 		); err != nil {
 			return nil, fmt.Errorf(
 				"scanning session stats row: %w", err,
@@ -1218,4 +1229,102 @@ func (db *DB) accumulateAdoption(
 		}
 	}
 	return rows.Err()
+}
+
+// computeOutcomeStats populates stats.OutcomeStats by discovering the git
+// repositories enclosing session cwds in the window and aggregating
+// author-filtered commit activity across them. Output stays nil when no
+// session in the window has a recognisable cwd — a signal that the caller
+// has no git-derived outcome data, not a legitimate zero.
+//
+// Each repo is processed independently: a failure from one (bad path,
+// missing git, unreadable config) is logged via the error path but does
+// not abort the aggregation — per-repo errors are swallowed so a single
+// broken checkout can't erase every other repo's numbers. Repos with no
+// resolvable author email are skipped; without an author filter the log
+// aggregation would attribute every other contributor's commits to the
+// local user.
+//
+// PR counts are only populated when f.GHToken is set. When gh is
+// configured, PRsOpened and PRsMerged accumulate across every repo that
+// successfully returned a PRResult; gh failures (unauthenticated,
+// network) are swallowed the same way log failures are. When the token
+// is empty, both pointers stay nil so the JSON output distinguishes
+// "gh not configured" from "configured, zero PRs".
+//
+// Note on git log --author regex: git treats the --author argument as
+// a regex pattern, so emails containing regex metacharacters (e.g.
+// "user+tag@host") match more loosely than a literal would. For v1 this
+// is acceptable — typical emails do not need escaping — but future
+// versions should migrate to --fixed-strings once agentsview can
+// require a git version that supports it on all target platforms.
+//
+// from/to are the absolute window bounds already resolved by
+// windowBounds. They are formatted as RFC3339 UTC before being handed to
+// `git log --since/--until` (git accepts RFC3339) and to
+// `gh pr list --search`, which wants YYYY-MM-DD or RFC3339. The raw
+// f.Since / f.Until strings ("28d", "7d", etc.) are not passed through
+// because git does not understand the compact duration form.
+func (db *DB) computeOutcomeStats(
+	ctx context.Context, s *SessionStats, f StatsFilter,
+	from, to time.Time, rows []sessionStatsRow,
+) error {
+	cwds := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.cwd != "" {
+			cwds = append(cwds, r.cwd)
+		}
+	}
+	repos := git.DiscoverRepos(cwds)
+	if len(repos) == 0 {
+		return nil
+	}
+	since := from.UTC().Format(time.RFC3339)
+	until := to.UTC().Format(time.RFC3339)
+	cache := git.NewCache(db.getWriter())
+	out := &StatsOutcomeStats{}
+	for _, repo := range repos {
+		email := git.AuthorEmail(repo)
+		if email == "" {
+			continue
+		}
+		logRes, err := git.AggregateLogCached(
+			ctx, cache, repo, email, since, until, time.Hour,
+		)
+		if err != nil {
+			// Swallow per-repo errors: a bad repo should not erase
+			// every other repo's contribution to the totals.
+			continue
+		}
+		out.ReposActive++
+		out.Commits += logRes.Commits
+		out.LOCAdded += logRes.LOCAdded
+		out.LOCRemoved += logRes.LOCRemoved
+		out.FilesChanged += logRes.FilesChanged
+
+		if f.GHToken != "" {
+			prRes, err := git.AggregatePRsCached(
+				ctx, cache, repo, since, until,
+				f.GHToken, time.Hour,
+			)
+			if err == nil && prRes != nil {
+				addPtr(&out.PRsOpened, prRes.Opened)
+				addPtr(&out.PRsMerged, prRes.Merged)
+			}
+		}
+	}
+	s.OutcomeStats = out
+	return nil
+}
+
+// addPtr lazily allocates *p on first write, then adds v. Used by
+// computeOutcomeStats so PRsOpened / PRsMerged stay nil when no repo
+// produced a gh result — distinguishing "gh not configured" from a
+// legitimate zero count.
+func addPtr(p **int, v int) {
+	if *p == nil {
+		zero := 0
+		*p = &zero
+	}
+	**p += v
 }

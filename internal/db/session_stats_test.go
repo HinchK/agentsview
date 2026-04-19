@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,6 +38,9 @@ type sessionFixture struct {
 	// session. Set alongside totalToolCalls so tests can control the
 	// tools_per_turn denominator precisely.
 	assistantTurns int
+	// cwd is the working directory recorded on the session. Consumed by
+	// outcome_stats tests that exercise git-repo discovery.
+	cwd string
 }
 
 // hoursAgo returns an RFC3339 timestamp N hours before now in UTC.
@@ -94,6 +100,7 @@ func insertSessionFixture(t *testing.T, d *DB, f sessionFixture) {
 		s.TotalOutputTokens = f.totalOutputTok
 		s.IsAutomated = f.isAutomated
 		s.RelationshipType = f.relationshipType
+		s.Cwd = f.cwd
 	})
 	seedAssistantActivity(t, d, f.id, f.assistantTurns, f.totalToolCalls)
 }
@@ -2453,5 +2460,192 @@ func TestGetSessionStats_Adoption_NoClaude(t *testing.T) {
 	}
 	if stats.Adoption != nil {
 		t.Errorf("Adoption: got %+v want nil", stats.Adoption)
+	}
+}
+
+// skipIfNoGit lets CI environments without git on PATH pass cleanly
+// instead of failing the outcome_stats suite. The stats pipeline
+// tolerates missing git (computeOutcomeStats silently leaves the field
+// nil when the exec fails), but tests that seed a real fixture repo
+// require the binary.
+func skipIfNoGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available on PATH: %v", err)
+	}
+}
+
+// statsRunGit executes a git subcommand inside repo and fails the test
+// on error. Kept local to the stats_test file because the git package
+// test helpers are unexported.
+func statsRunGit(t *testing.T, repo string, env []string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s",
+			strings.Join(args, " "), err, out)
+	}
+}
+
+// statsInitRepo creates a fresh git repo under t.TempDir() with a
+// deterministic author identity (test@example.com). Signing is disabled
+// so the tests don't hang on a GPG prompt when the host has commit
+// signing enabled globally.
+func statsInitRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	statsRunGit(t, repo, nil, "init", "-q", "-b", "main")
+	statsRunGit(t, repo, nil, "config", "user.email", "test@example.com")
+	statsRunGit(t, repo, nil, "config", "user.name", "Test User")
+	statsRunGit(t, repo, nil, "config", "commit.gpgsign", "false")
+	return repo
+}
+
+// statsCommitFile writes content into repo/relpath, stages it, and
+// commits as test@example.com with message. Used by outcome_stats tests
+// that need a handful of commits with known LOC footprints.
+func statsCommitFile(
+	t *testing.T, repo, relpath, content, message string,
+) {
+	t.Helper()
+	p := filepath.Join(repo, relpath)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(p), err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", p, err)
+	}
+	env := []string{
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.com",
+	}
+	statsRunGit(t, repo, nil, "add", "-A")
+	statsRunGit(t, repo, env, "commit", "-q", "-m", message)
+}
+
+// TestGetSessionStats_OutcomeStats_Happy seeds sessions whose cwd
+// points inside a real fixture repo and asserts that the outcome_stats
+// section surfaces the author-filtered commit totals. PRsOpened /
+// PRsMerged must stay nil because no GHToken is supplied — the JSON
+// contract distinguishes "gh not configured" (nil) from "gh configured,
+// zero PRs" (pointer to 0).
+func TestGetSessionStats_OutcomeStats_Happy(t *testing.T) {
+	skipIfNoGit(t)
+	d := testDB(t)
+	ctx := context.Background()
+
+	repo := statsInitRepo(t)
+	// Three commits by test@example.com with known LOC counts.
+	//   c1 a.txt:      +3 -0 (new file, 3 lines)
+	//   c2 a.txt:      +2 -0 (append 2 lines)
+	//   c3 b.txt:      +4 -0 (new file, 4 lines)
+	statsCommitFile(t, repo, "a.txt", "a1\na2\na3\n", "c1")
+	statsCommitFile(t, repo, "a.txt", "a1\na2\na3\na4\na5\n", "c2")
+	statsCommitFile(t, repo, "b.txt", "b1\nb2\nb3\nb4\n", "c3")
+
+	// Two Claude sessions with cwds inside the repo — one at the root,
+	// one in a subdirectory. Both should collapse to the same repo and
+	// counted once in ReposActive.
+	sub := filepath.Join(repo, "subdir")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	insertSessionFixture(t, d, sessionFixture{
+		id: "os1", agent: "claude", userMsgs: 5,
+		startedAt: hoursAgo(5), cwd: repo,
+	})
+	insertSessionFixture(t, d, sessionFixture{
+		id: "os2", agent: "claude", userMsgs: 4,
+		startedAt: hoursAgo(4), cwd: sub,
+	})
+
+	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
+	if err != nil {
+		t.Fatalf("GetSessionStats: %v", err)
+	}
+	out := stats.OutcomeStats
+	if out == nil {
+		t.Fatalf("OutcomeStats: got nil want populated")
+	}
+	if out.ReposActive != 1 {
+		t.Errorf("ReposActive: got %d want 1", out.ReposActive)
+	}
+	if out.Commits != 3 {
+		t.Errorf("Commits: got %d want 3", out.Commits)
+	}
+	if out.LOCAdded != 9 {
+		t.Errorf("LOCAdded: got %d want 9", out.LOCAdded)
+	}
+	if out.LOCRemoved != 0 {
+		t.Errorf("LOCRemoved: got %d want 0", out.LOCRemoved)
+	}
+	// Each commit touches one file: c1 a.txt, c2 a.txt, c3 b.txt -> 3.
+	if out.FilesChanged != 3 {
+		t.Errorf("FilesChanged: got %d want 3", out.FilesChanged)
+	}
+	if out.PRsOpened != nil {
+		t.Errorf("PRsOpened: got %v want nil (no GHToken)",
+			*out.PRsOpened)
+	}
+	if out.PRsMerged != nil {
+		t.Errorf("PRsMerged: got %v want nil (no GHToken)",
+			*out.PRsMerged)
+	}
+}
+
+// TestGetSessionStats_OutcomeStats_NoCwd verifies that sessions without
+// a recorded cwd leave OutcomeStats nil — a pure non-git workload must
+// not surface a fabricated all-zero outcome row. The JSON contract uses
+// omitempty + nil pointer so the section is absent entirely rather than
+// serialising as {"repos_active":0,...}.
+func TestGetSessionStats_OutcomeStats_NoCwd(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSessionFixture(t, d, sessionFixture{
+		id: "nc1", agent: "claude", userMsgs: 5,
+		startedAt: hoursAgo(3),
+		// cwd intentionally empty
+	})
+
+	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
+	if err != nil {
+		t.Fatalf("GetSessionStats: %v", err)
+	}
+	if stats.OutcomeStats != nil {
+		t.Errorf("OutcomeStats: got %+v want nil",
+			stats.OutcomeStats)
+	}
+}
+
+// TestGetSessionStats_OutcomeStats_CwdOutsideRepo verifies that a cwd
+// pointing at a non-git directory (no .git anywhere up the tree) is
+// treated the same as an empty cwd: DiscoverRepos returns nothing and
+// OutcomeStats stays nil. Guards against silently reporting zeros for
+// non-git workflows that happen to record a cwd.
+func TestGetSessionStats_OutcomeStats_CwdOutsideRepo(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	// t.TempDir() is nested under Go's test temp root, which is not
+	// itself inside a git repo on any supported platform.
+	nonRepo := t.TempDir()
+	insertSessionFixture(t, d, sessionFixture{
+		id: "nr1", agent: "claude", userMsgs: 5,
+		startedAt: hoursAgo(3), cwd: nonRepo,
+	})
+
+	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
+	if err != nil {
+		t.Fatalf("GetSessionStats: %v", err)
+	}
+	if stats.OutcomeStats != nil {
+		t.Errorf("OutcomeStats: got %+v want nil",
+			stats.OutcomeStats)
 	}
 }
