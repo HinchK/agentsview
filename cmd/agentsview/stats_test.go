@@ -15,11 +15,11 @@ import (
 	"github.com/wesm/agentsview/internal/db"
 )
 
-// TestPrintSessionStatsHuman_Populated exercises the happy path with
+// TestPrintStatsHuman_Populated exercises the happy path with
 // every optional section present. It does not pin exact text — the
 // golden-file test in Task 20 owns that — but it guards the sections
 // and nil-pointer branches that are hardest to eyeball in the stub.
-func TestPrintSessionStatsHuman_Populated(t *testing.T) {
+func TestPrintStatsHuman_Populated(t *testing.T) {
 	prsOpened := 12
 	prsMerged := 9
 	stats := &db.SessionStats{
@@ -139,8 +139,8 @@ func TestPrintSessionStatsHuman_Populated(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := printSessionStatsHuman(&buf, stats); err != nil {
-		t.Fatalf("printSessionStatsHuman: %v", err)
+	if err := printStatsHuman(&buf, stats); err != nil {
+		t.Fatalf("printStatsHuman: %v", err)
 	}
 	out := buf.String()
 	if len(out) < 200 {
@@ -175,9 +175,9 @@ func TestPrintSessionStatsHuman_Populated(t *testing.T) {
 	}
 }
 
-// TestPrintSessionStatsHuman_Empty guards the zero-session short
+// TestPrintStatsHuman_Empty guards the zero-session short
 // circuit: no optional sections, just the header + "no sessions".
-func TestPrintSessionStatsHuman_Empty(t *testing.T) {
+func TestPrintStatsHuman_Empty(t *testing.T) {
 	stats := &db.SessionStats{
 		SchemaVersion: 1,
 		Window: db.StatsWindow{
@@ -193,8 +193,8 @@ func TestPrintSessionStatsHuman_Empty(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := printSessionStatsHuman(&buf, stats); err != nil {
-		t.Fatalf("printSessionStatsHuman: %v", err)
+	if err := printStatsHuman(&buf, stats); err != nil {
+		t.Fatalf("printStatsHuman: %v", err)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "no sessions") {
@@ -233,18 +233,18 @@ func TestFmtInt64(t *testing.T) {
 	}
 }
 
-// updateGolden toggles regeneration of session_stats_golden.json.
-// Pass `go test ./cmd/agentsview -run TestSessionStatsGolden -update`
+// updateGolden toggles regeneration of stats_golden.json.
+// Pass `go test ./cmd/agentsview -run TestStatsGolden -update`
 // after intentionally changing the fixture or the stats pipeline.
 var updateGolden = flag.Bool(
 	"update", false,
 	"rewrite golden files under testdata/ instead of comparing",
 )
 
-// TestSessionStatsGolden is the end-to-end guard for the v1 JSON
-// schema: it seeds a deterministic fixture DB, runs the full
-// `session stats --format json` CLI path through the root command,
-// and compares the parsed output to testdata/session_stats_golden.json.
+// TestStatsGolden is the end-to-end guard for the v1 JSON schema: it
+// seeds a deterministic fixture DB, runs the full `stats --format
+// json` CLI path through the root command, and compares the parsed
+// output to testdata/stats_golden.json.
 //
 // Determinism comes from four levers:
 //  1. Absolute --since/--until dates so windowBounds never reads
@@ -258,8 +258,8 @@ var updateGolden = flag.Bool(
 //
 // Regenerate after an intentional change with:
 //
-//	go test ./cmd/agentsview -run TestSessionStatsGolden -update
-func TestSessionStatsGolden(t *testing.T) {
+//	go test ./cmd/agentsview -run TestStatsGolden -update
+func TestStatsGolden(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
 	// TZ is stripped by --timezone=UTC but the environment can
@@ -268,14 +268,14 @@ func TestSessionStatsGolden(t *testing.T) {
 	buildGoldenFixtureDB(t, filepath.Join(dataDir, "sessions.db"))
 
 	out, err := executeCommand(newRootCommand(),
-		"session", "stats",
+		"stats",
 		"--format", "json",
 		"--since", "2026-04-01",
 		"--until", "2026-04-15",
 		"--timezone", "UTC",
 	)
 	if err != nil {
-		t.Fatalf("session stats: %v\noutput:\n%s", err, out)
+		t.Fatalf("stats: %v\noutput:\n%s", err, out)
 	}
 
 	var got map[string]any
@@ -285,7 +285,7 @@ func TestSessionStatsGolden(t *testing.T) {
 	delete(got, "generated_at")
 
 	goldenPath := filepath.Join(
-		"testdata", "session_stats_golden.json",
+		"testdata", "stats_golden.json",
 	)
 	if *updateGolden {
 		buf, err := json.MarshalIndent(got, "", "  ")
@@ -321,9 +321,9 @@ func TestSessionStatsGolden(t *testing.T) {
 		gotBuf, _ := json.MarshalIndent(got, "", "  ")
 		wantBuf, _ := json.MarshalIndent(want, "", "  ")
 		t.Fatalf(
-			"session stats JSON mismatch — regenerate with "+
+			"stats JSON mismatch — regenerate with "+
 				"`go test ./cmd/agentsview -run "+
-				"TestSessionStatsGolden -update` if intentional.\n"+
+				"TestStatsGolden -update` if intentional.\n"+
 				"--- got ---\n%s\n--- want ---\n%s",
 			gotBuf, wantBuf,
 		)

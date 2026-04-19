@@ -1,5 +1,5 @@
-// ABOUTME: `session stats` subcommand — window-scoped analytics
-// ABOUTME: emitting the v1 SessionStats JSON schema.
+// ABOUTME: `agentsview stats` top-level command — window-scoped
+// ABOUTME: workspace analytics emitting the v1 SessionStats JSON schema.
 package main
 
 import (
@@ -18,14 +18,15 @@ import (
 	"github.com/wesm/agentsview/internal/service"
 )
 
-func newSessionStatsCommand() *cobra.Command {
+func newStatsCommand() *cobra.Command {
 	var (
 		since, until, agent, timezone, ghToken string
 		includeProjects, excludeProjects       []string
 	)
 	cmd := &cobra.Command{
 		Use:          "stats",
-		Short:        "Window-scoped session analytics (v1 schema)",
+		Short:        "Window-scoped workspace analytics (v1 schema)",
+		GroupID:      groupData,
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,10 +68,12 @@ func newSessionStatsCommand() *cobra.Command {
 			if outputFormat(cmd) == "json" {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(stats)
 			}
-			return printSessionStatsHuman(cmd.OutOrStdout(), stats)
+			return printStatsHuman(cmd.OutOrStdout(), stats)
 		},
 	}
 
+	cmd.Flags().String("format", "human",
+		"Output format: human or json")
 	registerStatsFlags(cmd,
 		&since, &until, &agent, &timezone, &ghToken,
 		&includeProjects, &excludeProjects,
@@ -78,9 +81,9 @@ func newSessionStatsCommand() *cobra.Command {
 	return cmd
 }
 
-// registerStatsFlags wires the `session stats` flags onto cmd. Split out so
-// the long flag-registration block doesn't pad newSessionStatsCommand past
-// the 100-line cap.
+// registerStatsFlags wires the `agentsview stats` flags onto cmd. Split
+// out so the long flag-registration block doesn't pad newStatsCommand
+// past the 100-line cap.
 func registerStatsFlags(
 	cmd *cobra.Command,
 	since, until, agent, timezone, ghToken *string,
@@ -104,11 +107,12 @@ func registerStatsFlags(
 }
 
 // openStatsService opens a SessionService scoped to the local SQLite
-// archive. session stats deliberately bypasses resolveService (and the
-// HTTP daemon transport) because the daemon does not yet expose a
-// /stats endpoint, and resolveService prefers HTTP when one is running.
-// Reading SQLite directly is also write-safe: GetSessionStats only
-// reads, so a writable daemon owning the database is not disturbed.
+// archive. The stats command deliberately bypasses resolveService
+// (and the HTTP daemon transport) because the daemon does not yet
+// expose a /stats endpoint, and resolveService prefers HTTP when one
+// is running. Reading SQLite directly is also write-safe:
+// GetSessionStats only reads, so a writable daemon owning the
+// database is not disturbed.
 func openStatsService(
 	cmd *cobra.Command,
 ) (service.SessionService, func(), error) {
@@ -126,15 +130,15 @@ func openStatsService(
 	return service.NewDirectBackend(d, nil), cleanup, nil
 }
 
-// printSessionStatsHuman renders a human-readable summary of a
-// SessionStats payload. Sections driven by nil-pointer fields are
-// omitted when absent, and a zero-session window prints a short
-// "no sessions" message instead of rows of zeros.
+// printStatsHuman renders a human-readable summary of a SessionStats
+// payload. Sections driven by nil-pointer fields are omitted when
+// absent, and a zero-session window prints a short "no sessions"
+// message instead of rows of zeros.
 //
 // Each helper returns the first write error it encountered so a broken
 // pipe or short write surfaces from the command instead of silently
 // truncating the output. The first error short-circuits rendering.
-func printSessionStatsHuman(w io.Writer, stats *service.SessionStats) error {
+func printStatsHuman(w io.Writer, stats *service.SessionStats) error {
 	ew := &errWriter{w: w}
 	printHeader(ew, stats)
 	if stats.Totals.SessionsAll == 0 {
