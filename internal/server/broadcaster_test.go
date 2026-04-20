@@ -28,7 +28,10 @@ func TestBroadcaster_EmitFansOutToAllSubscribers(t *testing.T) {
 }
 
 func TestBroadcaster_EmitIsNonBlockingOnSlowSubscriber(t *testing.T) {
-	b := NewBroadcaster()
+	// Disable rate limiting so every Emit attempts a broadcast, which
+	// is what exercises the non-blocking select-default path against
+	// a slow subscriber.
+	b := newBroadcasterWithInterval(0)
 	slow, unsub := b.Subscribe()
 	defer unsub()
 
@@ -81,7 +84,9 @@ func TestBroadcaster_UnsubscribeStopsDelivery(t *testing.T) {
 }
 
 func TestBroadcaster_ConcurrentSubscribeAndEmit(t *testing.T) {
-	b := NewBroadcaster()
+	// Disable rate limiting so each subscriber's Emit reliably
+	// produces a broadcast during the race.
+	b := newBroadcasterWithInterval(0)
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Go(func() {
@@ -96,4 +101,87 @@ func TestBroadcaster_ConcurrentSubscribeAndEmit(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+func TestBroadcaster_LeadingEdgeEmitsImmediately(t *testing.T) {
+	b := newBroadcasterWithInterval(time.Second)
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	b.Emit("messages")
+
+	select {
+	case ev := <-sub:
+		if ev.Scope != "messages" {
+			t.Errorf("got scope %q, want %q", ev.Scope, "messages")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("first emit did not broadcast immediately")
+	}
+}
+
+func TestBroadcaster_CoalescesWithinWindow(t *testing.T) {
+	const interval = 100 * time.Millisecond
+	b := newBroadcasterWithInterval(interval)
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	// Leading-edge broadcast drains the first emit.
+	b.Emit("sessions")
+	select {
+	case <-sub:
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("leading-edge emit did not broadcast immediately")
+	}
+
+	// Bursts within the window are coalesced; no broadcast yet.
+	b.Emit("messages")
+	b.Emit("sync")
+	b.Emit("sessions")
+
+	select {
+	case ev := <-sub:
+		t.Fatalf("got early broadcast during rate-limit window: %v", ev)
+	case <-time.After(interval / 2):
+	}
+
+	// After the window elapses a single trailing broadcast arrives
+	// carrying the most recent scope.
+	select {
+	case ev := <-sub:
+		if ev.Scope != "sessions" {
+			t.Errorf("trailing scope %q, want %q", ev.Scope, "sessions")
+		}
+	case <-time.After(interval * 3):
+		t.Fatal("trailing broadcast never arrived")
+	}
+
+	// The three coalesced emits produce exactly one trailing broadcast.
+	select {
+	case ev := <-sub:
+		t.Fatalf("got duplicate broadcast after trailing fire: %v", ev)
+	case <-time.After(interval):
+	}
+}
+
+func TestBroadcaster_EmitAfterIntervalBroadcastsImmediately(t *testing.T) {
+	const interval = 50 * time.Millisecond
+	b := newBroadcasterWithInterval(interval)
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	b.Emit("first")
+	<-sub
+
+	time.Sleep(interval * 2)
+
+	b.Emit("second")
+	select {
+	case ev := <-sub:
+		if ev.Scope != "second" {
+			t.Errorf("got scope %q, want %q", ev.Scope, "second")
+		}
+	case <-time.After(interval):
+		t.Fatal("emit after quiet interval did not broadcast immediately")
+	}
 }
