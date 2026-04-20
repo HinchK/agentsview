@@ -211,6 +211,69 @@ func TestBroadcaster_LeadingEdgeCancelsPendingTrailing(t *testing.T) {
 	}
 }
 
+func TestBroadcaster_StaleTrailingCallbackDoesNotConsumeNewerPending(t *testing.T) {
+	// Narrow race: a trailing callback whose timer already fired is
+	// waiting for b.mu; a leading-edge Emit runs first and a follow-up
+	// rate-limited Emit installs a new pending+timer. Without a
+	// generation token, the stale callback clobbers b.timer and
+	// broadcasts the newer pending event immediately, violating the
+	// rate limit.
+	const interval = 50 * time.Millisecond
+	b := newBroadcasterWithInterval(interval)
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	b.Emit("a")
+	<-sub
+
+	// Rate-limited emit schedules a timer; capture the generation
+	// the scheduled callback will check against when it runs.
+	b.Emit("b")
+	b.mu.Lock()
+	staleGen := b.timerGen
+	b.mu.Unlock()
+
+	// Force the next Emit into the leading branch, invalidating the
+	// prior timer's generation.
+	b.mu.Lock()
+	b.lastEmit = time.Now().Add(-2 * interval)
+	b.mu.Unlock()
+	b.Emit("c")
+	<-sub
+
+	// Rate-limited emit after the leading edge installs a fresh
+	// pending+timer under the new generation.
+	b.Emit("d")
+
+	// Simulate the stale callback from the "b" timer finally acquiring
+	// the lock after being blocked. With the generation check it must
+	// return without touching state; without it, the stale callback
+	// would clear b.timer and broadcast "d" prematurely.
+	b.flushTrailing(staleGen)
+
+	// No premature broadcast in the window right after the stale
+	// callback supposedly ran.
+	select {
+	case ev := <-sub:
+		t.Fatalf("stale callback consumed newer pending: %v", ev)
+	case <-time.After(interval / 2):
+	}
+
+	// The new timer scheduled for "d" must still be live and deliver
+	// "d" on its original schedule. A bug that lets the stale callback
+	// null out b.timer would orphan the new timer here — in which case
+	// the callback still fires, finds pending == nil, and no event
+	// arrives.
+	select {
+	case ev := <-sub:
+		if ev.Scope != "d" {
+			t.Errorf("got scope %q, want d", ev.Scope)
+		}
+	case <-time.After(interval * 3):
+		t.Fatal("new trailing timer did not fire with pending scope")
+	}
+}
+
 func TestBroadcaster_EmitAfterIntervalBroadcastsImmediately(t *testing.T) {
 	const interval = 50 * time.Millisecond
 	b := newBroadcasterWithInterval(interval)

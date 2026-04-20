@@ -39,6 +39,17 @@ type Broadcaster struct {
 	lastEmit    time.Time
 	pending     *Event
 	timer       *time.Timer
+	// timerGen increments each time a leading-edge broadcast
+	// invalidates the trailing state. A flushTrailing callback
+	// captures the generation at schedule time and returns early
+	// if the current generation no longer matches. Without this
+	// token, a callback whose timer already fired but was still
+	// waiting for b.mu could acquire the lock after a leading
+	// emit and a subsequent rate-limited emit had installed a
+	// new pending+timer, then consume that newer pending as if
+	// it were its own and broadcast it immediately — violating
+	// the rate limit and orphaning the newly scheduled timer.
+	timerGen uint64
 }
 
 // NewBroadcaster creates an empty broadcaster with the production
@@ -72,18 +83,19 @@ func (b *Broadcaster) Emit(scope string) {
 	now := time.Now()
 	if b.minInterval == 0 || b.lastEmit.IsZero() ||
 		now.Sub(b.lastEmit) >= b.minInterval {
-		// Leading edge. Cancel any trailing state left over from the
-		// prior window: without this, a timer whose goroutine had
-		// already fired and was waiting on b.mu could acquire it
-		// after this call and deliver a stale coalesced event. Stop
-		// prevents unfired timers from running; clearing pending
-		// makes flushTrailing a no-op for timers whose goroutine
-		// already started.
+		// Leading edge. Invalidate any in-flight trailing state:
+		// bumping timerGen makes a flushTrailing callback whose
+		// timer already fired (but was still waiting for b.mu)
+		// return without touching state. Clearing pending and
+		// stopping the timer handle the common cases where the
+		// callback has not yet started; the generation token
+		// covers the narrower race where it has.
 		b.pending = nil
 		if b.timer != nil {
 			b.timer.Stop()
 			b.timer = nil
 		}
+		b.timerGen++
 		b.lastEmit = now
 		b.broadcastLocked(Event{Scope: scope})
 		return
@@ -91,18 +103,27 @@ func (b *Broadcaster) Emit(scope string) {
 
 	b.pending = &Event{Scope: scope}
 	if b.timer == nil {
+		gen := b.timerGen
 		wait := b.minInterval - now.Sub(b.lastEmit)
-		b.timer = time.AfterFunc(wait, b.flushTrailing)
+		b.timer = time.AfterFunc(wait, func() {
+			b.flushTrailing(gen)
+		})
 	}
 }
 
 // flushTrailing is invoked by the trailing-edge timer. It delivers
 // the most recent coalesced scope (if any) and clears the timer so
-// future emits can schedule a new one.
-func (b *Broadcaster) flushTrailing() {
+// future emits can schedule a new one. gen is the generation the
+// timer captured at schedule time; a mismatch means a leading-edge
+// broadcast has since invalidated this callback, so it returns
+// without touching any state.
+func (b *Broadcaster) flushTrailing(gen uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if gen != b.timerGen {
+		return
+	}
 	b.timer = nil
 	if b.pending == nil {
 		return
