@@ -346,8 +346,10 @@ func (c *Config) loadFile() error {
 		RemoteAccess                   bool           `toml:"remote_access"`
 		DisableUpdateCheck             bool           `toml:"disable_update_check"`
 		PG                             PGConfig       `toml:"pg"`
+		EventsCoalesceInterval         time.Duration  `toml:"events_coalesce_interval"`
 	}
-	if _, err := toml.DecodeFile(path, &file); err != nil {
+	meta, err := toml.DecodeFile(path, &file)
+	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
 	}
 	if file.GithubToken != "" {
@@ -401,6 +403,12 @@ func (c *Config) loadFile() error {
 	}
 	if file.PG.ExcludeProjects != nil && c.PG.ExcludeProjects == nil {
 		c.PG.ExcludeProjects = file.PG.ExcludeProjects
+	}
+	// IsDefined distinguishes "unset" (leave default 10s) from an
+	// explicit "0s" (disable coalescing). Checking != 0 would silently
+	// ignore the latter.
+	if meta.IsDefined("events_coalesce_interval") {
+		c.EventsCoalesceInterval = file.EventsCoalesceInterval
 	}
 
 	// Parse config-file dir arrays for agents that have a

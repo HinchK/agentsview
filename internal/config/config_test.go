@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/pflag"
@@ -749,6 +750,52 @@ func TestLoadFile_ResultContentBlockedCategories(t *testing.T) {
 						i, v, tt.want[i],
 					)
 				}
+			}
+		})
+	}
+}
+
+func TestLoadFile_EventsCoalesceInterval(t *testing.T) {
+	tests := []struct {
+		name   string
+		config map[string]any
+		want   time.Duration
+	}{
+		{
+			"NoConfigFileUsesDefault",
+			map[string]any{},
+			10 * time.Second,
+		},
+		{
+			"ConfigFileOverrides",
+			map[string]any{
+				"events_coalesce_interval": "5s",
+			},
+			5 * time.Second,
+		},
+		{
+			"ConfigFileExplicitZeroDisables",
+			map[string]any{
+				"events_coalesce_interval": "0s",
+			},
+			0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := setupTestEnv(t)
+			writeConfig(t, dir, tt.config)
+
+			cfg, err := LoadMinimal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.EventsCoalesceInterval != tt.want {
+				t.Errorf(
+					"EventsCoalesceInterval = %v, want %v",
+					cfg.EventsCoalesceInterval, tt.want,
+				)
 			}
 		})
 	}
