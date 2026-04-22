@@ -26,12 +26,14 @@ import (
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
-// Bumped to 15: Codex parser now subtracts cached_input_tokens
-// from input_tokens before storing, matching the Anthropic
-// convention that downstream cost and usage queries assume.
-// Prior rows double-counted cached tokens at the full input
-// rate; re-parsing rewrites token_usage and context_tokens.
-const dataVersion = 15
+// Bumped to 16: Codex parser now filters synthetic
+// <turn_aborted> system messages from the user-message stream.
+// Prior rows had inflated user_message_count for review sessions
+// that were aborted mid-turn (e.g., roborev codex exec runs),
+// which prevented IsAutomatedSession from gating them on the
+// single-turn requirement. Re-parsing rewrites user_message_count
+// so the is_automated backfill can classify them correctly.
+const dataVersion = 16
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
