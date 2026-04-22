@@ -109,6 +109,101 @@ func TestBackfillIsAutomatedMarkerIdempotent(t *testing.T) {
 	}
 }
 
+// TestIncrementalUpdateReclassifiesOnPatternChange covers the
+// case where the classifier gained a new pattern after a row
+// was originally inserted. The row took the incremental path on
+// subsequent parses, so UpsertSession never ran again to set
+// is_automated. UpdateSessionIncremental must re-evaluate.
+func TestIncrementalUpdateReclassifiesOnPatternChange(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	// Simulate a pre-existing single-turn session whose
+	// first_message now matches a classifier pattern but whose
+	// stored is_automated is stale at 0.
+	insertSession(t, d, "changelog-inc", "proj", func(s *Session) {
+		fm := "You are generating a changelog for myrepo version 1.0.0."
+		s.FirstMessage = &fm
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+	_, err := d.getWriter().Exec(
+		"UPDATE sessions SET is_automated = 0 WHERE id = 'changelog-inc'",
+	)
+	requireNoError(t, err, "force stale is_automated=0")
+
+	// Incremental update with umc still <= 1.
+	err = d.UpdateSessionIncremental(
+		"changelog-inc", nil, 2, 1, 1024, 100, 0, 0, false, false,
+	)
+	requireNoError(t, err, "incremental update")
+
+	got, err := d.GetSession(ctx, "changelog-inc")
+	requireNoError(t, err, "get changelog-inc")
+	if !got.IsAutomated {
+		t.Error("is_automated should be re-set after incremental update")
+	}
+}
+
+// TestIncrementalUpdateClearsWhenCountGrows covers the existing
+// guard: when user_message_count grows past 1, is_automated must
+// be cleared even if first_message still matches a pattern.
+func TestIncrementalUpdateClearsWhenCountGrows(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "grew-past-one", "proj", func(s *Session) {
+		fm := "You are a code reviewer. Review the code."
+		s.FirstMessage = &fm
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+	})
+	// After UpsertSession the row is correctly is_automated=1.
+	pre, err := d.GetSession(ctx, "grew-past-one")
+	requireNoError(t, err, "get pre")
+	if !pre.IsAutomated {
+		t.Fatalf("precondition: expected is_automated=1 after upsert")
+	}
+
+	// Incremental update pushes umc > 1 — must clear.
+	err = d.UpdateSessionIncremental(
+		"grew-past-one", nil, 7, 3, 2048, 200, 0, 0, false, false,
+	)
+	requireNoError(t, err, "incremental update")
+
+	got, err := d.GetSession(ctx, "grew-past-one")
+	requireNoError(t, err, "get grew-past-one")
+	if got.IsAutomated {
+		t.Error("is_automated should be cleared when umc grows > 1")
+	}
+}
+
+// TestIncrementalUpdateLeavesNonMatching covers a non-automated
+// single-turn session: re-evaluation must NOT set is_automated
+// when first_message doesn't match any pattern.
+func TestIncrementalUpdateLeavesNonMatching(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "normal-single", "proj", func(s *Session) {
+		fm := "Fix the login bug please"
+		s.FirstMessage = &fm
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+
+	err := d.UpdateSessionIncremental(
+		"normal-single", nil, 2, 1, 1024, 100, 0, 0, false, false,
+	)
+	requireNoError(t, err, "incremental update")
+
+	got, err := d.GetSession(ctx, "normal-single")
+	requireNoError(t, err, "get normal-single")
+	if got.IsAutomated {
+		t.Error("is_automated should stay 0 for non-matching first_message")
+	}
+}
+
 func TestBackfillIsAutomatedBumpsLocalModifiedAt(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()

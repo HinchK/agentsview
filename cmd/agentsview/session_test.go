@@ -121,6 +121,27 @@ func TestSessionGet_Human(t *testing.T) {
 		"human output should contain project, got: %q", out)
 }
 
+// TestSessionGet_BareIDFindsPrefixed covers the case where a user
+// passes a bare UUID (e.g. copied from a Codex session file name)
+// for a session whose stored ID carries an agent prefix. The CLI
+// retries the lookup with each registered IDPrefix.
+func TestSessionGet_BareIDFindsPrefixed(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)
+	bareID := "019da6a6-8c67-7c23-b102-ef48502852d0"
+	seedSessionWithOpts(t, dataDir, "codex:"+bareID, "proj",
+		func(s *db.Session) { s.Agent = "codex" })
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "get", bareID, "--format", "json")
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &got),
+		"stdout should be valid JSON: %q", out)
+	assert.Equal(t, "codex:"+bareID, got["id"])
+}
+
 func TestSessionList_JSONShape(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("AGENT_VIEWER_DATA_DIR", dataDir)

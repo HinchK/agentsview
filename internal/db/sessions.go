@@ -1065,6 +1065,13 @@ func (db *DB) GetSessionForIncremental(
 // user_message_count, file_size, file_mtime, and token
 // aggregates. All values are absolute (not deltas) so the
 // update is idempotent on retry.
+//
+// is_automated is recomputed from the current first_message and
+// the new user_message_count so that classifier additions reach
+// rows that only ever take the incremental path. Without this,
+// a row whose first parse predates a new pattern would stay
+// is_automated=0 indefinitely (UpsertSession sets the flag once
+// at insert; the incremental path never re-evaluates it).
 func (db *DB) UpdateSessionIncremental(
 	id string,
 	endedAt *string,
@@ -1076,17 +1083,29 @@ func (db *DB) UpdateSessionIncremental(
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// is_automated requires single-turn (user_message_count <= 1).
-	// When the count grows past 1, clear the flag in SQL without
-	// an extra SELECT. UpsertSession already sets the flag for new
-	// sessions, so the only incremental transition is clearing it.
+	isAutomated := false
+	if userMsgCount <= 1 {
+		var fm sql.NullString
+		err := db.getReader().QueryRow(
+			"SELECT first_message FROM sessions WHERE id = ?", id,
+		).Scan(&fm)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf(
+				"reading first_message for incremental update %s: %w",
+				id, err,
+			)
+		}
+		if fm.Valid {
+			isAutomated = IsAutomatedSession(fm.String)
+		}
+	}
+
 	_, err := db.getWriter().Exec(`
 		UPDATE sessions SET
 			ended_at = COALESCE(?, ended_at),
 			message_count = ?,
 			user_message_count = ?,
-			is_automated = CASE WHEN ? > 1 THEN 0
-				ELSE is_automated END,
+			is_automated = ?,
 			file_size = ?,
 			file_mtime = ?,
 			total_output_tokens = ?,
@@ -1094,7 +1113,7 @@ func (db *DB) UpdateSessionIncremental(
 			has_total_output_tokens = ?,
 			has_peak_context_tokens = ?
 		WHERE id = ?`,
-		endedAt, msgCount, userMsgCount, userMsgCount,
+		endedAt, msgCount, userMsgCount, isAutomated,
 		fileSize, fileMtime,
 		totalOutputTokens, peakContextTokens,
 		hasTotalOutputTokens, hasPeakContextTokens, id,

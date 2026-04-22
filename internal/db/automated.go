@@ -30,7 +30,7 @@ var automatedPrefixes = []string{
 	"# Fix Request",
 	"You are a helpful assistant working on a software project.",
 	"You are combining multiple code review outputs into a single GitHub PR comment.",
-	"You are generating a changelog for agentsview",
+	"You are generating a changelog",
 }
 
 // automatedSubstrings are patterns matched anywhere in the

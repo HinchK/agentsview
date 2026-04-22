@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/wesm/agentsview/internal/parser"
 	"github.com/wesm/agentsview/internal/service"
 )
 
@@ -24,7 +27,9 @@ func newSessionGetCommand() *cobra.Command {
 			}
 			defer cleanup()
 
-			detail, err := svc.Get(cmd.Context(), args[0])
+			detail, err := lookupSessionWithPrefixes(
+				cmd.Context(), svc, args[0],
+			)
 			if err != nil {
 				return err
 			}
@@ -37,6 +42,42 @@ func newSessionGetCommand() *cobra.Command {
 			return printSessionDetailHuman(cmd.OutOrStdout(), detail)
 		},
 	}
+}
+
+// lookupSessionWithPrefixes resolves a session ID, accommodating
+// bare UUIDs by retrying with each registered agent prefix
+// (codex:, copilot:, gemini:, ...) when the exact lookup misses.
+// Stored IDs are prefixed for non-Claude agents, so a user
+// copying a UUID from a session file name would otherwise see a
+// confusing "not found" error.
+func lookupSessionWithPrefixes(
+	ctx context.Context,
+	svc service.SessionService,
+	id string,
+) (*service.SessionDetail, error) {
+	detail, err := svc.Get(ctx, id)
+	if err != nil || detail != nil {
+		return detail, err
+	}
+	// If the user already supplied a prefixed ID (contains ":")
+	// or a host-prefixed remote ID ("host~..."), don't second-
+	// guess them — the exact lookup is authoritative.
+	if strings.ContainsAny(id, ":~") {
+		return nil, nil
+	}
+	for _, def := range parser.Registry {
+		if def.IDPrefix == "" {
+			continue
+		}
+		detail, err := svc.Get(ctx, def.IDPrefix+id)
+		if err != nil {
+			return nil, err
+		}
+		if detail != nil {
+			return detail, nil
+		}
+	}
+	return nil, nil
 }
 
 // printSessionDetailHuman writes a compact key/value summary of

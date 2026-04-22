@@ -173,11 +173,34 @@ func TestIsAutomatedSession(t *testing.T) {
 			false,
 		},
 
-		// agentsview changelog generator (release tooling)
+		// changelog generator (release tooling) — pattern is
+		// project-agnostic so the same script template can run
+		// against any repo.
 		{
-			"AgentsviewChangelogGenerator",
+			"ChangelogGeneratorAgentsview",
 			"You are generating a changelog for agentsview version 0.23.2.\n\nIMPORTANT: Do NOT use any tools.",
 			true,
+		},
+		{
+			"ChangelogGeneratorRoborev",
+			"You are generating a changelog for roborev version 0.45.0.\n\nIMPORTANT: Do NOT use any tools.",
+			true,
+		},
+		{
+			"ChangelogGeneratorMsgvault",
+			"You are generating a changelog for msgvault version 0.6.5.\n\nIMPORTANT: Do NOT use any tools.",
+			true,
+		},
+		{
+			"ChangelogSummaryGenerator",
+			"You are generating a changelog/summary for runfolio commits.\n\nIMPORTANT: Do NOT use any tools.",
+			true,
+		},
+		// Negative: "changelog" appearing later in normal prose
+		{
+			"ChangelogPhraseInProse",
+			"Can you help me write a script that is generating a changelog for our release?",
+			false,
 		},
 	}
 
