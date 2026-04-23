@@ -298,6 +298,7 @@ func truncateLogFile(path string, limit int64) {
 }
 
 func mustOpenDB(cfg config.Config) *db.DB {
+	applyClassifierConfig(cfg)
 	database, err := db.Open(cfg.DBPath)
 	if err != nil {
 		fatal("opening database: %v", err)
