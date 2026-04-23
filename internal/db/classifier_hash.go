@@ -14,7 +14,12 @@ import (
 // by including the pattern slices in the hash. Bumping this
 // constant invalidates every stored hash and forces a
 // backfill on next open of any DB.
-const classifierAlgorithmVersion = 1
+//
+// (2: heals DBs poisoned by the orphan-copy classification gap
+// in ResyncAll prior to the ForceBackfillIsAutomated wiring.
+// Without this bump, those DBs already have the v1 hash stored
+// and would skip the backfill on Open.)
+const classifierAlgorithmVersion = 2
 
 // ClassifierHash returns a stable hex-encoded SHA-256 over
 // the algorithm version, all built-in pattern slices, and the

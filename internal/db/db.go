@@ -669,6 +669,28 @@ func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
 	return nil
 }
 
+// ForceBackfillIsAutomated reclassifies is_automated across
+// every session, ignoring any cached classifier hash. ResyncAll
+// calls this after CopyOrphanedDataFrom because orphan-copied
+// rows carry is_automated values computed against the *old* DB's
+// classifier set; the temp DB's at-Open backfill already ran on
+// an empty table and stamped the current hash, so without this
+// call those rows would be permanently stuck with stale flags.
+func (db *DB) ForceBackfillIsAutomated() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	w := db.getWriter()
+	if _, err := w.Exec(
+		`DELETE FROM stats WHERE key = ?`,
+		ClassifierHashKey,
+	); err != nil {
+		return fmt.Errorf(
+			"clearing classifier hash: %w", err,
+		)
+	}
+	return db.backfillIsAutomatedLocked(w)
+}
+
 func batchUpdateAutomated(
 	w *sql.DB, ids []string, val int,
 ) error {

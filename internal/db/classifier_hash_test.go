@@ -61,7 +61,7 @@ func TestClassifierHashTagSeparation(t *testing.T) {
 // the test must be updated to match. The check exists to
 // surface accidental version-constant edits during review.
 func TestClassifierHashCurrentAlgoVersion(t *testing.T) {
-	if classifierAlgorithmVersion != 1 {
+	if classifierAlgorithmVersion != 2 {
 		t.Fatalf(
 			"classifierAlgorithmVersion changed to %d; "+
 				"update this test and confirm matching "+

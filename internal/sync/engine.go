@@ -988,6 +988,17 @@ func (e *Engine) ResyncAll(
 		// Non-fatal: worst case, renames/soft-deletes are lost.
 	}
 
+	// Reclassify is_automated across every row. Orphan-copied
+	// rows carry is_automated values computed against the OLD
+	// DB's classifier set; the temp DB's at-Open backfill ran on
+	// an empty table and stamped the current hash, so without
+	// this pass those rows would be permanently stuck with stale
+	// flags. Non-fatal: worst case, some sessions keep their
+	// pre-resync classification until the next algorithm bump.
+	if err := newDB.ForceBackfillIsAutomated(); err != nil {
+		log.Printf("resync: reclassify is_automated: %v", err)
+	}
+
 	// 5. Close newDB and swap files, then reopen origDB.
 	newDB.Close()
 
