@@ -1241,6 +1241,7 @@ func isCodexSystemMessage(content string) bool {
 		strings.HasPrefix(content, "<environment_context>") ||
 		strings.HasPrefix(content, "<INSTRUCTIONS>") ||
 		strings.HasPrefix(trimmed, "<turn_aborted>") ||
+		strings.HasPrefix(trimmed, "<skill>") ||
 		isCodexSubagentNotification(content)
 }
 

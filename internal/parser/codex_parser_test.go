@@ -984,6 +984,33 @@ func TestParseCodexSession_EdgeCases(t *testing.T) {
 		assert.Equal(t, "Actual user message", msgs[0].Content)
 	})
 
+	// Codex injects skill template content as role=user JSONL
+	// entries when the model invokes a skill. These look like
+	// follow-up user turns to a naive count, which inflates
+	// user_message_count past the single-turn classifier gate
+	// and prevents automated sessions from being recognized.
+	// Treat them as system content and drop from the message
+	// list, the same way <environment_context> and similar
+	// envelopes are handled.
+	t.Run("skips skill template injections", func(t *testing.T) {
+		skill := "<skill>\n  <name>roborev:fix</name>\n  <path>" +
+			"/Users/wesm/.codex/skills/roborev-fix/SKILL.md</path>\n" +
+			"---\nname: roborev:fix\n..."
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "You are a code reviewer.", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", skill, "2024-01-01T10:00:02Z"),
+			testjsonl.CodexMsgJSON("assistant", "OK", "2024-01-01T10:00:03Z"),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "You are a code reviewer.", msgs[0].Content)
+		assert.Equal(t, "OK", msgs[1].Content)
+		assert.Equal(t, 1, sess.UserMessageCount,
+			"skill injection must not count as a user turn")
+	})
+
 	t.Run("fallback ID from filename", func(t *testing.T) {
 		content := testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1)
 		sess, _ := runCodexParserTest(t, "test.jsonl", content, false)
