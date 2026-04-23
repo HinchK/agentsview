@@ -124,28 +124,30 @@ session already has user turns but no preview string:
 `first_message` into it. The column is nullable, so read into a `sql.NullString`
 and copy the value (or empty) into the field.
 
-**`internal/sync/engine.go`** — in `tryIncrementalJSONL`, alongside the existing
-data-version and file-identity fall-through checks (currently around
-`:2186-2214`), add:
+**`internal/sync/engine.go`** — `tryIncrementalJSONL` already receives
+`agent parser.AgentType`. In that function, alongside the existing data-version
+and file-identity fall-through checks (currently around `:2186-2214`), add:
 
 ```go
-// If the stored preview is empty despite having user turns, the
-// Claude parser skipped every user message so far (e.g. a session
-// that opens with /clear). A full parse gives the newly-appended
-// real user message a chance to become first_message.
-if inc.FirstMessage == "" && inc.UserMsgCount > 0 {
+// Claude-only: if the stored preview is empty despite having user
+// turns, the Claude parser skipped every user message so far
+// (e.g. a session that opens with /clear). A full parse gives the
+// newly-appended real user message a chance to become first_message.
+//
+// Other agents (e.g. Codex) can legitimately have UserMsgCount > 0
+// with an empty first_message — codex inserts orphan subagent
+// notifications as Role=user messages via insertMessage, which
+// bypasses the firstMessage setter — so the fall-through must be
+// gated on agent type.
+if agent == parser.AgentClaude &&
+    inc.FirstMessage == "" && inc.UserMsgCount > 0 {
     return processResult{}, false
 }
 ```
 
-This is gated on `UserMsgCount > 0` so sessions that legitimately have no user
-messages yet still take the incremental path. The `currentSize <= inc.FileSize`
-early return (`:2192`) already guarantees we only fall through when the file has
-new bytes, bounding the extra full-parse cost.
-
-Non-Claude agents never produce an empty `first_message` when real user messages
-exist, so the gate is functionally a no-op for them. Gating on agent explicitly
-would add a field to `IncrementalInfo` for no gain.
+The `currentSize <= inc.FileSize` early return (`:2192`) already guarantees we
+only fall through when the file has new bytes, bounding the extra full-parse
+cost.
 
 ## Tests
 
