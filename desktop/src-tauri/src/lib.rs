@@ -1411,12 +1411,30 @@ mod tests {
         perms.set_mode(0o700);
         fs::set_permissions(&script_path, perms).expect("set executable permissions");
 
-        let started = Instant::now();
-        let result = try_run_login_shell_env(
-            script_path.to_str().expect("script path utf-8"),
-            Duration::from_millis(120),
-        );
-        let elapsed = started.elapsed();
+        // Linux can return ETXTBSY (OS error 26) on execve when a
+        // parallel test thread's fork briefly holds a writable fd
+        // for the script we just wrote. Retry a few times on that
+        // race so cargo test -j N doesn't flake.
+        let mut attempts_left = 5;
+        let (result, elapsed) = loop {
+            let started = Instant::now();
+            let result = try_run_login_shell_env(
+                script_path.to_str().expect("script path utf-8"),
+                Duration::from_millis(120),
+            );
+            let elapsed = started.elapsed();
+            match &result {
+                Err(LoginShellEnvError::Spawn(e)) if e.raw_os_error() == Some(26) => {
+                    attempts_left -= 1;
+                    if attempts_left == 0 {
+                        break (result, elapsed);
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                _ => break (result, elapsed),
+            }
+        };
         let _ = fs::remove_file(&script_path);
 
         match result {
