@@ -583,7 +583,7 @@ func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
 		`SELECT value FROM stats WHERE key = ?`,
 		classifierHashStatsKey,
 	).Scan(&stored)
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf(
 			"probing classifier hash: %w", err,
 		)
@@ -647,6 +647,9 @@ func (db *DB) backfillIsAutomatedLocked(w *sql.DB) error {
 		)
 	}
 
+	// stats.value is INTEGER affinity; SQLite stores hex text
+	// here verbatim. Switching to STRICT tables would require
+	// moving this row to a TEXT-typed table.
 	if _, err := w.Exec(
 		`INSERT INTO stats (key, value) VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
