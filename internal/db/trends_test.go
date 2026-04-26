@@ -266,6 +266,67 @@ func TestGetTrendsTermsSQLiteUsesMessageTimestampRange(t *testing.T) {
 	}
 }
 
+func TestGetTrendsTermsSQLiteDoesNotFilterBySessionTimestamp(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	start := "not-a-time"
+	insertSession(t, d, "s1", "proj-a", func(s *Session) {
+		s.StartedAt = &start
+		s.MessageCount = 1
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d,
+		Message{SessionID: "s1", Ordinal: 0, Role: "user", Content: "seam", Timestamp: "2024-06-05T09:00:00Z", ContentLength: 4},
+	)
+	terms, err := ParseTrendTerms([]string{"seam"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetTrendsTerms(ctx, AnalyticsFilter{
+		From: "2024-06-05", To: "2024-06-05", Timezone: "UTC",
+	}, terms, "day")
+	if err != nil {
+		t.Fatalf("GetTrendsTerms: %v", err)
+	}
+	if got := trendSeriesByTerm(got.Series)["seam"].Total; got != 1 {
+		t.Fatalf("message timestamp total = %d, want 1", got)
+	}
+}
+
+func TestGetTrendsTermsSQLiteAppliesDayAndHourToMessageTimestamp(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	start := "2024-06-04T08:00:00Z"
+	insertSession(t, d, "s1", "proj-a", func(s *Session) {
+		s.StartedAt = &start
+		s.MessageCount = 2
+		s.UserMessageCount = 2
+	})
+	insertMessages(t, d,
+		Message{SessionID: "s1", Ordinal: 0, Role: "user", Content: "seam", Timestamp: "2024-06-05T09:00:00Z", ContentLength: 4},
+		Message{SessionID: "s1", Ordinal: 1, Role: "user", Content: "seam", Timestamp: "2024-06-05T10:00:00Z", ContentLength: 4},
+	)
+	terms, err := ParseTrendTerms([]string{"seam"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dow := 2
+	hour := 9
+	got, err := d.GetTrendsTerms(ctx, AnalyticsFilter{
+		From:      "2024-06-05",
+		To:        "2024-06-05",
+		Timezone:  "UTC",
+		DayOfWeek: &dow,
+		Hour:      &hour,
+	}, terms, "day")
+	if err != nil {
+		t.Fatalf("GetTrendsTerms: %v", err)
+	}
+	if got := trendSeriesByTerm(got.Series)["seam"].Total; got != 1 {
+		t.Fatalf("hour-filtered message total = %d, want 1", got)
+	}
+}
+
 func TestGetTrendsTermsSQLiteTimestampFallback(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()

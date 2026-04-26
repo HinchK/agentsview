@@ -97,16 +97,38 @@ func buildAnalyticsWhere(
 	dateCol string,
 	pb *paramBuilder,
 ) string {
+	return buildAnalyticsWhereWithDate(f, dateCol, pb, true)
+}
+
+// buildAnalyticsWhereWithoutDate returns common analytics
+// predicates without adding session date bounds. Trends uses
+// this because date, day, and hour filters are evaluated
+// against message timestamps instead of session timestamps.
+func buildAnalyticsWhereWithoutDate(
+	f db.AnalyticsFilter,
+	pb *paramBuilder,
+) string {
+	return buildAnalyticsWhereWithDate(f, "", pb, false)
+}
+
+func buildAnalyticsWhereWithDate(
+	f db.AnalyticsFilter,
+	dateCol string,
+	pb *paramBuilder,
+	includeDate bool,
+) string {
 	preds := []string{
 		"message_count > 0",
 		"relationship_type NOT IN ('subagent', 'fork')",
 		"deleted_at IS NULL",
 	}
-	utcFrom, utcTo := analyticsUTCRange(f)
-	preds = append(preds,
-		dateCol+" >= "+pb.add(utcFrom)+"::timestamptz")
-	preds = append(preds,
-		dateCol+" <= "+pb.add(utcTo)+"::timestamptz")
+	if includeDate {
+		utcFrom, utcTo := analyticsUTCRange(f)
+		preds = append(preds,
+			dateCol+" >= "+pb.add(utcFrom)+"::timestamptz")
+		preds = append(preds,
+			dateCol+" <= "+pb.add(utcTo)+"::timestamptz")
+	}
 	if f.Machine != "" {
 		preds = append(preds,
 			"machine = "+pb.add(f.Machine))

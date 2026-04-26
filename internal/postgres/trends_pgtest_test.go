@@ -74,6 +74,57 @@ func TestStoreGetTrendsTerms(t *testing.T) {
 	}
 }
 
+func TestStoreGetTrendsTermsUsesMessageTimestampFilters(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_trends_terms_message_filters_test")
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'trends-pg-message-filters-001', 'test-machine',
+			'alpha', 'claude',
+			'2024-06-04T08:00:00Z'::timestamptz, 2, 2
+		)`)
+	if err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, is_system
+		) VALUES
+			('trends-pg-message-filters-001', 0, 'user', 'seam',
+			 '2024-06-05T09:00:00Z'::timestamptz, 4, FALSE),
+			('trends-pg-message-filters-001', 1, 'user', 'seam',
+			 '2024-06-05T10:00:00Z'::timestamptz, 4, FALSE)`)
+	if err != nil {
+		t.Fatalf("insert messages: %v", err)
+	}
+	terms, err := db.ParseTrendTerms([]string{"seam"})
+	if err != nil {
+		t.Fatalf("ParseTrendTerms: %v", err)
+	}
+	dow := 2
+	hour := 9
+	got, err := store.GetTrendsTerms(ctx, db.AnalyticsFilter{
+		From:      "2024-06-05",
+		To:        "2024-06-05",
+		Timezone:  "UTC",
+		DayOfWeek: &dow,
+		Hour:      &hour,
+	}, terms, "day")
+	if err != nil {
+		t.Fatalf("GetTrendsTerms: %v", err)
+	}
+	if got.MessageCount != 1 {
+		t.Fatalf("message count = %d, want 1", got.MessageCount)
+	}
+	if got := trendSeriesByTerm(got.Series)["seam"].Total; got != 1 {
+		t.Fatalf("message timestamp filtered total = %d, want 1", got)
+	}
+}
+
 func trendBucketDates(buckets []db.TrendBucket) []string {
 	dates := make([]string, len(buckets))
 	for i, bucket := range buckets {

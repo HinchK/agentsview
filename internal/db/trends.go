@@ -66,8 +66,9 @@ func (db *DB) GetTrendsTerms(
 	sessionFilter := f
 	sessionFilter.From = ""
 	sessionFilter.To = ""
-	dateCol := "COALESCE(NULLIF(s.started_at, ''), s.created_at)"
-	where, args := sessionFilter.buildWhere(dateCol)
+	sessionFilter.DayOfWeek = nil
+	sessionFilter.Hour = nil
+	where, args := sessionFilter.buildWhereWithoutDate()
 	query := `SELECT m.content, COALESCE(m.timestamp, ''),
 			COALESCE(s.started_at, ''), s.created_at
 		FROM sessions s

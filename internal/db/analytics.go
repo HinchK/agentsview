@@ -116,6 +116,21 @@ func (f AnalyticsFilter) utcRange() (string, string) {
 func (f AnalyticsFilter) buildWhere(
 	dateCol string,
 ) (string, []any) {
+	return f.buildWhereWithDate(dateCol, true)
+}
+
+// buildWhereWithoutDate returns common analytics predicates
+// without adding session date bounds. Callers that evaluate
+// date windows against message timestamps should use this to
+// avoid pre-filtering by the parent session timestamp.
+func (f AnalyticsFilter) buildWhereWithoutDate() (string, []any) {
+	return f.buildWhereWithDate("", false)
+}
+
+func (f AnalyticsFilter) buildWhereWithDate(
+	dateCol string,
+	includeDate bool,
+) (string, []any) {
 	preds := []string{
 		"message_count > 0",
 		"relationship_type NOT IN ('subagent', 'fork')",
@@ -123,11 +138,13 @@ func (f AnalyticsFilter) buildWhere(
 	}
 	var args []any
 
-	utcFrom, utcTo := f.utcRange()
-	preds = append(preds, dateCol+" >= ?")
-	args = append(args, utcFrom)
-	preds = append(preds, dateCol+" <= ?")
-	args = append(args, utcTo)
+	if includeDate {
+		utcFrom, utcTo := f.utcRange()
+		preds = append(preds, dateCol+" >= ?")
+		args = append(args, utcFrom)
+		preds = append(preds, dateCol+" <= ?")
+		args = append(args, utcTo)
+	}
 
 	if f.Machine != "" {
 		preds = append(preds, "machine = ?")

@@ -29,12 +29,10 @@ func (s *Store) GetTrendsTerms(
 	sessionFilter := f
 	sessionFilter.From = ""
 	sessionFilter.To = ""
+	sessionFilter.DayOfWeek = nil
+	sessionFilter.Hour = nil
 	pb := &paramBuilder{}
-	where := buildAnalyticsWhere(
-		sessionFilter,
-		"COALESCE(s.started_at, s.created_at)",
-		pb,
-	)
+	where := buildAnalyticsWhereWithoutDate(sessionFilter, pb)
 	query := `SELECT m.content,
 			COALESCE(TO_CHAR(m.timestamp AT TIME ZONE 'UTC',
 				'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
