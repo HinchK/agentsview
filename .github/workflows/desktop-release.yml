@@ -161,6 +161,17 @@ jobs:
           node-version: "24"
 
       - name: Setup MinGW
+        id: setup_mingw
+        continue-on-error: true
+        uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Setup MinGW (retry on transient failure)
+        if: steps.setup_mingw.outcome == 'failure'
         uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c  # v2
         with:
           msystem: MINGW64
