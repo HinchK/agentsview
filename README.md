@@ -300,10 +300,9 @@ agentsview pg serve      # serve web UI from PG (read-only)
 
 ### Automatic push (background service)
 
-To keep a shared PostgreSQL database current without running `pg push` by
-hand, run the auto-push daemon. It watches your session directories and
-pushes shortly after new sessions are recorded, with a periodic floor as a
-safety net:
+To keep a shared PostgreSQL database current without running `pg push` by hand,
+run the auto-push daemon. It watches your session directories and pushes shortly
+after new sessions are recorded, with a periodic floor as a safety net:
 
 ```bash
 agentsview pg push --watch                 # foreground, Ctrl-C to stop
@@ -311,16 +310,16 @@ agentsview pg push --watch --debounce 1m   # custom coalesce window
 agentsview pg push --watch --interval 5m   # custom floor interval
 ```
 
-The daemon reads the same `[pg]` config as `pg push`, so the PostgreSQL
-DSN must be set in your config file (or an environment variable it
-expands). Protect the config file, since it holds credentials:
+The daemon reads the same `[pg]` config as `pg push`, so the PostgreSQL DSN must
+be set in your config file (or an environment variable it expands). Protect the
+config file, since it holds credentials:
 
 ```bash
 chmod 600 ~/.agentsview/config.toml
 ```
 
-To run it unattended as an OS service (launchd on macOS,
-`systemd --user` on Linux):
+To run it unattended as an OS service (launchd on macOS, `systemd --user` on
+Linux):
 
 ```bash
 agentsview pg service install     # generate the unit, enable + start it
@@ -329,9 +328,9 @@ agentsview pg service logs -f     # follow the service log
 agentsview pg service uninstall   # stop and remove
 ```
 
-**Linux headless machines:** systemd `--user` services stop at logout and
-do not start at boot unless lingering is enabled for your user. `install`
-detects this and prints the command; you can also run it yourself:
+**Linux headless machines:** systemd `--user` services stop at logout and do not
+start at boot unless lingering is enabled for your user. `install` detects this
+and prints the command; you can also run it yourself:
 
 ```bash
 loginctl enable-linger "$USER"
@@ -342,9 +341,18 @@ configuration.
 
 ## Privacy
 
-No telemetry, no analytics, no accounts. All data stays on your machine. The
-server binds to `127.0.0.1` by default. The only outbound request is an optional
-update check on startup (disable with `--no-update-check`).
+agentsview sends a limited anonymous `daemon_active` telemetry ping to PostHog
+when the server starts and every 24 hours while it runs, using a stable random
+install ID as the event `DistinctId`. The event includes
+`application=agentsview`, app version, commit, OS, and CPU architecture, with
+`$process_person_profile=false` and `$geoip_disable=true`. It does not include
+session, project, prompt, file path, account, or machine identity. Disable
+telemetry with `AGENTSVIEW_TELEMETRY_ENABLED=0` or `TELEMETRY_ENABLED=0`.
+Telemetry is also hard-disabled in Go test binaries, regardless of environment.
+
+All session data stays on your machine. The server binds to `127.0.0.1` by
+default. The update check is optional and can be disabled with
+`--no-update-check`.
 
 ## Documentation
 
@@ -369,7 +377,7 @@ make install        # install to ~/.local/bin
 ```
 
 ```bash
-make test           # Go tests (CGO_ENABLED=1 -tags fts5)
+make test           # Go tests (CGO_ENABLED=1 -tags "fts5,kit_posthog_disabled")
 make lint           # golangci-lint + NilAway
 make nilaway        # NilAway through custom golangci-lint
 make e2e            # Playwright E2E tests
