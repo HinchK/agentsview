@@ -13,8 +13,15 @@ import (
 )
 
 // DiscoverKimiSessions finds all wire.jsonl files under the Kimi
-// sessions directory. The directory structure is:
-// <sessionsDir>/<project-hash>/<session-uuid>/wire.jsonl
+// sessions directory. It supports two layouts:
+//
+// Legacy (".kimi/sessions"):
+//
+//	<sessionsDir>/<project-hash>/<session-uuid>/wire.jsonl
+//
+// New (".kimi-code/sessions"):
+//
+//	<sessionsDir>/<workdir>_<hash>/session_<uuid>/agents/<agent>/wire.jsonl
 func DiscoverKimiSessions(sessionsDir string) []DiscoveredFile {
 	if sessionsDir == "" {
 		return nil
@@ -41,17 +48,53 @@ func DiscoverKimiSessions(sessionsDir string) []DiscoveredFile {
 			if !isDirOrSymlink(sessEntry, projDir) {
 				continue
 			}
-			wirePath := filepath.Join(
-				projDir, sessEntry.Name(), "wire.jsonl",
-			)
-			if _, err := os.Stat(wirePath); err != nil {
+
+			sessDir := filepath.Join(projDir, sessEntry.Name())
+
+			// Legacy layout.
+			wirePath := filepath.Join(sessDir, "wire.jsonl")
+			if _, err := os.Stat(wirePath); err == nil {
+				// The project and session names become ':'-delimited
+				// session-ID components; skip sessions whose names
+				// cannot round-trip through FindKimiSourceFile.
+				if kimiIDComponentsValid(
+					projEntry.Name(), sessEntry.Name(),
+				) {
+					files = append(files, DiscoveredFile{
+						Path:    wirePath,
+						Project: DecodeKimiProjectDir(projEntry.Name()),
+						Agent:   AgentKimi,
+					})
+				}
 				continue
 			}
-			files = append(files, DiscoveredFile{
-				Path:    wirePath,
-				Project: projEntry.Name(),
-				Agent:   AgentKimi,
-			})
+
+			// New .kimi-code layout.
+			agentsDir := filepath.Join(sessDir, "agents")
+			agentEntries, err := os.ReadDir(agentsDir)
+			if err != nil {
+				continue
+			}
+			for _, agentEntry := range agentEntries {
+				if !isDirOrSymlink(agentEntry, agentsDir) {
+					continue
+				}
+				wirePath = filepath.Join(
+					agentsDir, agentEntry.Name(), "wire.jsonl",
+				)
+				if _, err := os.Stat(wirePath); err == nil &&
+					kimiIDComponentsValid(
+						projEntry.Name(),
+						sessEntry.Name(),
+						agentEntry.Name(),
+					) {
+					files = append(files, DiscoveredFile{
+						Path:    wirePath,
+						Project: DecodeKimiProjectDir(projEntry.Name()),
+						Agent:   AgentKimi,
+					})
+				}
+			}
 		}
 	}
 
@@ -62,27 +105,122 @@ func DiscoverKimiSessions(sessionsDir string) []DiscoveredFile {
 }
 
 // FindKimiSourceFile locates a Kimi session file by its raw
-// session ID (without the "kimi:" prefix). The raw ID has the
-// format "<project-hash>:<session-uuid>", which maps to
-// <sessionsDir>/<project-hash>/<session-uuid>/wire.jsonl.
+// session ID (without the "kimi:" prefix). Supported raw ID formats:
+//
+// Legacy:
+//
+//	<project-hash>:<session-uuid>
+//	  → <sessionsDir>/<project-hash>/<session-uuid>/wire.jsonl
+//
+// New (.kimi-code):
+//
+//	<workdir>_<hash>:<agent>:<session-uuid>
+//	  → <sessionsDir>/<workdir>_<hash>/<session-uuid>/agents/<agent>/wire.jsonl
 func FindKimiSourceFile(sessionsDir, rawID string) string {
 	if sessionsDir == "" {
 		return ""
 	}
 
-	projHash, sessionUUID, ok := strings.Cut(rawID, ":")
-	if !ok || !IsValidSessionID(projHash) ||
-		!IsValidSessionID(sessionUUID) {
-		return ""
+	parts := strings.Split(rawID, ":")
+	for _, p := range parts {
+		if !IsValidSessionID(p) {
+			return ""
+		}
 	}
 
-	candidate := filepath.Join(
-		sessionsDir, projHash, sessionUUID, "wire.jsonl",
-	)
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate
+	switch len(parts) {
+	case 2:
+		// Legacy layout.
+		candidate := filepath.Join(
+			sessionsDir, parts[0], parts[1], "wire.jsonl",
+		)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	case 3:
+		// New .kimi-code layout.
+		candidate := filepath.Join(
+			sessionsDir, parts[0], parts[2], "agents", parts[1], "wire.jsonl",
+		)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
 	}
 	return ""
+}
+
+// kimiSessionIDFromPath extracts the raw Kimi session ID from its
+// wire.jsonl path. Legacy paths yield "<project>:<session>"; .kimi-code
+// paths yield "<workdir>:<agent>:<session>".
+func kimiSessionIDFromPath(path string) string {
+	dir := filepath.Dir(path)
+	base := filepath.Base(dir)
+	parent := filepath.Dir(dir)
+	if filepath.Base(parent) == "agents" {
+		// New layout: .../<workdir>_<hash>/session_<uuid>/agents/<agent>/wire.jsonl
+		agentID := base
+		sessionDir := filepath.Dir(parent)
+		sessionUUID := filepath.Base(sessionDir)
+		workdirDir := filepath.Dir(sessionDir)
+		projHash := filepath.Base(workdirDir)
+		return projHash + ":" + agentID + ":" + sessionUUID
+	}
+
+	// Legacy layout: .../<project-hash>/<session-uuid>/wire.jsonl
+	sessionUUID := base
+	projHash := filepath.Base(parent)
+	return projHash + ":" + sessionUUID
+}
+
+// DecodeKimiProjectDir extracts a human-readable project name from a
+// .kimi-code session directory. The directory is encoded as
+// "wd_<workdir>_<12-hex-hash>" (e.g. "wd_kimi-code_057f5c09ee3f"),
+// where the workdir name may itself contain underscores or hyphens.
+// Legacy .kimi sessions use opaque project hashes, which do not
+// carry the "wd_" prefix and are returned unchanged.
+func DecodeKimiProjectDir(dirName string) string {
+	if dirName == "" || !strings.HasPrefix(dirName, "wd_") {
+		return dirName
+	}
+	name := strings.TrimPrefix(dirName, "wd_")
+	if i := strings.LastIndex(name, "_"); i > 0 && isKimiHash(name[i+1:]) {
+		name = name[:i]
+	}
+	return name
+}
+
+// isKimiHash reports whether s is a 12-character hexadecimal hash of
+// the kind .kimi-code appends to its workdir directory names.
+func isKimiHash(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isHex := (c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'f') ||
+			(c >= 'A' && c <= 'F')
+		if !isHex {
+			return false
+		}
+	}
+	return true
+}
+
+// kimiIDComponentsValid reports whether the given path-derived
+// components can form a session ID that FindKimiSourceFile can
+// round-trip back to the source file. Each component must itself be a
+// valid session ID (alphanumeric, '-', '_'); a ':' or any other
+// character outside that set would break the ':'-delimited ID split
+// and validation. Sessions with such names are skipped at discovery
+// time rather than imported in a state that cannot be resynced.
+func kimiIDComponentsValid(components ...string) bool {
+	for _, c := range components {
+		if !IsValidSessionID(c) {
+			return false
+		}
+	}
+	return true
 }
 
 // ParseKimiSession parses a Kimi wire.jsonl file.
@@ -105,13 +243,9 @@ func ParseKimiSession(
 
 	lr := newLineReader(f, maxLineSize)
 
-	// Extract session ID from path:
-	// .../sessions/<project-hash>/<session-uuid>/wire.jsonl
-	dir := filepath.Dir(path) // .../sessions/<project-hash>/<session-uuid>
-	sessionUUID := filepath.Base(dir)
-	projHash := filepath.Base(filepath.Dir(dir))
-
-	sessionID := projHash + ":" + sessionUUID
+	// Extract session ID from path. Both legacy and .kimi-code
+	// layouts are supported.
+	sessionID := kimiSessionIDFromPath(path)
 
 	var (
 		messages     []ParsedMessage
