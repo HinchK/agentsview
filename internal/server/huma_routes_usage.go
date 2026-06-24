@@ -33,6 +33,9 @@ type UsageFilterInput struct {
 	Termination      string `query:"termination" doc:"Filter by termination status"`
 	IncludeOneShot   bool   `query:"include_one_shot" default:"true" doc:"Include one-shot sessions"`
 	IncludeAutomated bool   `query:"include_automated" doc:"Include automated sessions"`
+	NoDefaultRange   bool   `query:"no_default_range" doc:"Preserve omitted from/to without applying default range"`
+	Breakdowns       bool   `query:"breakdowns" default:"true" doc:"Include per-model, per-project, and per-agent breakdowns"`
+	SessionCounts    bool   `query:"session_counts" default:"true" doc:"Include distinct session counts"`
 }
 
 type usageTopSessionsInput struct {
@@ -53,33 +56,41 @@ func usageFilterFromInput(in UsageFilterInput) (db.UsageFilter, error) {
 	if _, err := time.LoadLocation(tz); err != nil {
 		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid timezone: "+tz)
 	}
-	from, to := defaultDateRange(in.From, in.To)
-	if !timeutil.IsValidDate(from) || !timeutil.IsValidDate(to) {
-		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid date format: use YYYY-MM-DD")
+	from, to := in.From, in.To
+	if !in.NoDefaultRange {
+		from, to = defaultDateRange(in.From, in.To)
 	}
-	if from > to {
+	if (from != "" && !timeutil.IsValidDate(from)) ||
+		(to != "" && !timeutil.IsValidDate(to)) {
+		return db.UsageFilter{}, apiError(
+			http.StatusBadRequest,
+			"invalid date format: use YYYY-MM-DD",
+		)
+	}
+	if from != "" && to != "" && from > to {
 		return db.UsageFilter{}, apiError(http.StatusBadRequest, "from must not be after to")
 	}
 	if in.ActiveSince != "" && !timeutil.IsValidTimestamp(in.ActiveSince) {
 		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid active_since: use RFC3339 timestamp")
 	}
 	return db.UsageFilter{
-		From:             from,
-		To:               to,
-		Agent:            in.Agent,
-		Project:          in.Project,
-		Machine:          in.Machine,
-		ExcludeProject:   in.ExcludeProject,
-		ExcludeAgent:     in.ExcludeAgent,
-		ExcludeModel:     in.ExcludeModel,
-		Model:            in.Model,
-		Timezone:         tz,
-		MinUserMessages:  in.MinUserMessages,
-		ExcludeOneShot:   !in.IncludeOneShot,
-		ExcludeAutomated: !in.IncludeAutomated,
-		ActiveSince:      in.ActiveSince,
-		Termination:      in.Termination,
-		Breakdowns:       true,
+		From:              from,
+		To:                to,
+		Agent:             in.Agent,
+		Project:           in.Project,
+		Machine:           in.Machine,
+		ExcludeProject:    in.ExcludeProject,
+		ExcludeAgent:      in.ExcludeAgent,
+		ExcludeModel:      in.ExcludeModel,
+		Model:             in.Model,
+		Timezone:          tz,
+		MinUserMessages:   in.MinUserMessages,
+		ExcludeOneShot:    !in.IncludeOneShot,
+		ExcludeAutomated:  !in.IncludeAutomated,
+		ActiveSince:       in.ActiveSince,
+		Termination:       in.Termination,
+		Breakdowns:        in.Breakdowns,
+		SkipSessionCounts: !in.SessionCounts,
 	}, nil
 }
 
@@ -106,11 +117,17 @@ func (s *Server) humaUsageSummary(
 		To:            f.To,
 		Totals:        result.Totals,
 		Daily:         result.Daily,
-		ProjectTotals: foldProjectTotals(result.Daily),
-		ModelTotals:   foldModelTotals(result.Daily),
-		AgentTotals:   foldAgentTotals(result.Daily),
 		SessionCounts: result.SessionCounts,
 		CacheStats:    computeCacheStats(result.Totals),
+	}
+	if f.Breakdowns {
+		resp.ProjectTotals = foldProjectTotals(result.Daily)
+		resp.ModelTotals = foldModelTotals(result.Daily)
+		resp.AgentTotals = foldAgentTotals(result.Daily)
+	} else {
+		resp.ProjectTotals = []ProjectTotal{}
+		resp.ModelTotals = []ModelTotal{}
+		resp.AgentTotals = []AgentTotal{}
 	}
 	return &jsonOutput[UsageSummaryResponse]{Body: resp}, nil
 }
@@ -122,6 +139,12 @@ func (s *Server) humaUsageComparison(
 	f, err := usageFilterFromInput(in.UsageFilterInput)
 	if err != nil {
 		return nil, err
+	}
+	if in.NoDefaultRange && (f.From == "" || f.To == "") {
+		return nil, apiError(
+			http.StatusBadRequest,
+			"usage comparison requires from and to when no_default_range is true",
+		)
 	}
 	comparison, err := s.computeUsageComparison(ctx, f, in.CurrentCost)
 	if err != nil {
