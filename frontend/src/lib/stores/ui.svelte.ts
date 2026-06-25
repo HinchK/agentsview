@@ -80,6 +80,45 @@ const HIGH_CONTRAST_KEY = "agentsview-high-contrast";
 export const FONT_SCALE_STEPS = [90, 100, 110, 120, 130];
 const FONT_SCALE_DEFAULT = 100;
 
+type DesktopTauriWebviewWindow = {
+  setZoom(scaleFactor: number): Promise<void>;
+};
+
+type DesktopTauriBridge = {
+  webviewWindow?: {
+    getCurrentWebviewWindow?: () => DesktopTauriWebviewWindow;
+  };
+};
+
+function currentDesktopWebviewWindow():
+  | DesktopTauriWebviewWindow
+  | undefined {
+  if (!IS_DESKTOP || typeof window === "undefined") return;
+  const tauri =
+    (window as Window & { __TAURI__?: DesktopTauriBridge })
+      .__TAURI__;
+  return tauri?.webviewWindow?.getCurrentWebviewWindow?.();
+}
+
+function syncDesktopZoom(scaleFactor: number): boolean {
+  const webview = currentDesktopWebviewWindow();
+  if (!webview) return false;
+  void webview.setZoom(scaleFactor).catch(() => {
+    // ignore
+  });
+  return true;
+}
+
+function composedRootZoom(
+  fontScale: number, zoomLevel: number,
+): string {
+  let scale = fontScale / 100;
+  if (IS_DESKTOP && !currentDesktopWebviewWindow()) {
+    scale *= zoomLevel / 100;
+  }
+  return String(scale);
+}
+
 function readStoredZoom(): number {
   if (!IS_DESKTOP) return ZOOM_DEFAULT;
   try {
@@ -262,27 +301,30 @@ class UIStore {
         }
       });
 
-      // Apply the composed root zoom: font scale (web and desktop)
-      // multiplied by the desktop window zoom (desktop only). "zoom"
-      // is non-standard but supported in WebKit/Chromium.
+      // Apply the root font scale in the document; desktop zoom
+      // falls back to CSS when the native webview bridge is absent.
       $effect(() => {
-        const desktopZoom = IS_DESKTOP ? this.zoomLevel / 100 : 1;
-        const scale = this.fontScale / 100;
-        const effective =
-          Math.round(desktopZoom * scale * 10000) / 10000;
         (
           document.documentElement.style as unknown as
             Record<string, string>
-        ).zoom = String(effective);
+        ).zoom = composedRootZoom(
+          this.fontScale,
+          this.zoomLevel,
+        );
       });
 
       // Persist the desktop window zoom (desktop only).
       $effect(() => {
-        if (!IS_DESKTOP) return;
-        try {
-          localStorage?.setItem(ZOOM_KEY, String(this.zoomLevel));
-        } catch {
-          // ignore
+        if (IS_DESKTOP) {
+          syncDesktopZoom(this.zoomLevel / 100);
+          try {
+            localStorage?.setItem(
+              ZOOM_KEY,
+              String(this.zoomLevel),
+            );
+          } catch {
+            // ignore
+          }
         }
       });
 

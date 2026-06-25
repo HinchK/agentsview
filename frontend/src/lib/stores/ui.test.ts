@@ -159,6 +159,109 @@ describe("UIStore", () => {
     });
   });
 
+  describe("desktop zoom bridge", () => {
+    it("routes desktop zoom steps through the native webview bridge", async () => {
+      const tauriWindow = window as Window & {
+        __TAURI__?: unknown;
+      };
+      const originalUrl = window.location.href;
+      const hadTauri = Object.prototype.hasOwnProperty.call(
+        tauriWindow,
+        "__TAURI__",
+      );
+      const originalTauri = tauriWindow.__TAURI__;
+      const setZoom = vi.fn(() => Promise.resolve());
+      const getCurrentWebviewWindow = vi.fn(() => ({
+        setZoom,
+      }));
+
+      Object.defineProperty(tauriWindow, "__TAURI__", {
+        value: {
+          webviewWindow: {
+            getCurrentWebviewWindow,
+          },
+        },
+        writable: true,
+        configurable: true,
+      });
+      window.history.replaceState({}, "", "?desktop");
+
+      try {
+        // @ts-expect-error -- cache bust for fresh UIStore
+        const mod = await import("./ui.svelte.js?desktopZoomBridge");
+        await tick();
+        setZoom.mockClear();
+
+        mod.ui.zoomIn();
+        await tick();
+
+        expect(mod.ui.zoomLevel).toBe(110);
+        expect(getCurrentWebviewWindow).toHaveBeenCalled();
+        expect(setZoom).toHaveBeenLastCalledWith(1.1);
+
+        mod.ui.zoomOut();
+        await tick();
+
+        expect(mod.ui.zoomLevel).toBe(100);
+        expect(setZoom).toHaveBeenLastCalledWith(1);
+
+        mod.ui.zoomIn();
+        await tick();
+        mod.ui.resetZoom();
+        await tick();
+
+        expect(mod.ui.zoomLevel).toBe(100);
+        expect(setZoom).toHaveBeenLastCalledWith(1);
+      } finally {
+        window.history.replaceState({}, "", originalUrl);
+        if (hadTauri) {
+          Object.defineProperty(tauriWindow, "__TAURI__", {
+            value: originalTauri,
+            writable: true,
+            configurable: true,
+          });
+        } else {
+          delete tauriWindow.__TAURI__;
+        }
+      }
+    });
+
+    it("falls back to CSS zoom on desktop pages without the Tauri bridge", async () => {
+      const tauriWindow = window as Window & {
+        __TAURI__?: unknown;
+      };
+      const originalUrl = window.location.href;
+      const hadTauri = Object.prototype.hasOwnProperty.call(
+        tauriWindow,
+        "__TAURI__",
+      );
+      const originalTauri = tauriWindow.__TAURI__;
+      delete tauriWindow.__TAURI__;
+      window.history.replaceState({}, "", "?desktop");
+
+      try {
+        // @ts-expect-error -- cache bust for fresh UIStore
+        const mod = await import("./ui.svelte.js?desktopCssFallback");
+        mod.ui.zoomLevel = 200;
+        mod.ui.setFontScale(110);
+        await tick();
+
+        expect(
+          document.documentElement.style.getPropertyValue("zoom"),
+        ).toBe("2.2");
+      } finally {
+        window.history.replaceState({}, "", originalUrl);
+        if (hadTauri) {
+          Object.defineProperty(tauriWindow, "__TAURI__", {
+            value: originalTauri,
+            writable: true,
+            configurable: true,
+          });
+        }
+      }
+    });
+  });
+
   describe("theme initialization", () => {
     it("should fall back to light when stored theme is absent", () => {
       expect(ui.theme).toBeDefined();
@@ -768,8 +871,28 @@ describe("UIStore", () => {
 
     it("composes desktop window zoom with font scale", async () => {
       const original = globalThis.localStorage;
+      const tauriWindow = window as Window & {
+        __TAURI__?: unknown;
+      };
+      const hadTauri = Object.prototype.hasOwnProperty.call(
+        tauriWindow,
+        "__TAURI__",
+      );
+      const originalTauri = tauriWindow.__TAURI__;
+      const setZoom = vi.fn(() => Promise.resolve());
       Object.defineProperty(globalThis, "localStorage", {
         value: { getItem: vi.fn(() => null), setItem: vi.fn() },
+        writable: true,
+        configurable: true,
+      });
+      Object.defineProperty(tauriWindow, "__TAURI__", {
+        value: {
+          webviewWindow: {
+            getCurrentWebviewWindow: () => ({
+              setZoom,
+            }),
+          },
+        },
         writable: true,
         configurable: true,
       });
@@ -782,7 +905,8 @@ describe("UIStore", () => {
         await tick();
         expect(
           document.documentElement.style.getPropertyValue("zoom"),
-        ).toBe("2.2");
+        ).toBe("1.1");
+        expect(setZoom).toHaveBeenLastCalledWith(2);
       } finally {
         window.history.replaceState({}, "", "/");
         Object.defineProperty(globalThis, "localStorage", {
@@ -790,6 +914,15 @@ describe("UIStore", () => {
           writable: true,
           configurable: true,
         });
+        if (hadTauri) {
+          Object.defineProperty(tauriWindow, "__TAURI__", {
+            value: originalTauri,
+            writable: true,
+            configurable: true,
+          });
+        } else {
+          delete tauriWindow.__TAURI__;
+        }
       }
     });
 

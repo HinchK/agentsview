@@ -94,7 +94,7 @@ test.describe("Appearance accessibility", () => {
     await expect(sp.messageRows.first()).toBeVisible();
   });
 
-  test("desktop window zoom and text size compose multiplicatively", async ({
+  test("desktop window zoom stays separate from text size in the browser", async ({
     page,
   }) => {
     await page.addInitScript(() => {
