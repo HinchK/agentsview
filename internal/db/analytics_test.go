@@ -1938,6 +1938,389 @@ func TestGetAnalyticsTopSessions(t *testing.T) {
 		}
 	})
 
+	t.Run("ByDurationRanksByActiveDuration", func(t *testing.T) {
+		insertSession(t, d, "wall-dominant", "project-gamma", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-02T09:00:00Z")
+			s.EndedAt = Ptr("2024-06-02T11:00:00Z")
+			s.MessageCount = 3
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("wall-dominant", 0, "noop", "2024-06-02T09:00:00Z"),
+			func() Message {
+				m := asstMsgAt(
+					"wall-dominant",
+					1,
+					"idle wait",
+					"2024-06-02T10:59:00Z",
+				)
+				m.HasToolUse = true
+				return m
+			}(),
+			userMsgAt(
+				"wall-dominant",
+				2,
+				"done",
+				"2024-06-02T11:00:00Z",
+			),
+		)
+
+		insertSession(t, d, "actively-working", "project-gamma", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-02T09:30:00Z")
+			s.EndedAt = Ptr("2024-06-02T09:50:00Z")
+			s.MessageCount = 3
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("actively-working", 0, "start", "2024-06-02T09:30:00Z"),
+			func() Message {
+				m := asstMsgAt(
+					"actively-working",
+					1,
+					"tooling",
+					"2024-06-02T09:35:00Z",
+				)
+				m.HasToolUse = true
+				return m
+			}(),
+			userMsgAt("actively-working", 2, "finish", "2024-06-02T09:50:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(
+			ctx, AnalyticsFilter{Project: "project-gamma"}, "duration",
+		)
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		assert.Equal(t, "duration", resp.Metric, "Metric")
+		require.Len(t, resp.Sessions, 2, "sessions")
+		assert.Equal(t, "actively-working", resp.Sessions[0].ID, "top session by active duration")
+		assert.Equal(t, 20.0, resp.Sessions[0].DurationMin, "active total duration")
+		// 5 min user->asst gap + a 15 min gap capped at the 5 min idle
+		// cap = 10.
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "active duration")
+		assert.Equal(t, 120.0, resp.Sessions[1].DurationMin, "wall-only duration")
+		// 119 min idle gap capped to 5 + a 1 min gap = 6, so the
+		// mostly-idle 2-hour session ranks below the engaged 20-min one.
+		assert.Equal(t, 6.0, resp.Sessions[1].ActiveDurationMin, "idle active duration")
+	})
+
+	t.Run("ByDurationKeepsNearTieOrderBeforeDisplayRounding", func(t *testing.T) {
+		// Two sessions whose active durations differ only below the
+		// display-rounding granularity (2.504 vs 2.496 min). Both render
+		// as "2.5", but the raw value must decide the rank. The single
+		// gap stays under the 5 min idle cap so the clamp does not
+		// flatten the sub-second difference.
+		insertSession(t, d, "near-tie-longer", "project-precision", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-03T09:00:00.000Z")
+			s.EndedAt = Ptr("2024-06-03T09:02:30.240Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("near-tie-longer", 0, "start", "2024-06-03T09:00:00.000Z"),
+			asstMsgAt("near-tie-longer", 1, "work", "2024-06-03T09:02:30.240Z"),
+		)
+
+		insertSession(t, d, "near-tie-shorter", "project-precision", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-03T09:00:00.000Z")
+			s.EndedAt = Ptr("2024-06-03T09:02:29.760Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("near-tie-shorter", 0, "start", "2024-06-03T09:00:00.000Z"),
+			asstMsgAt("near-tie-shorter", 1, "work", "2024-06-03T09:02:29.760Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project: "project-precision",
+			From:    "2024-06-03",
+			To:      "2024-06-03",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 2, "precision sessions")
+		assert.Equal(t, "near-tie-longer", resp.Sessions[0].ID, "raw active duration should decide the rank")
+		assert.Equal(t, 2.5, resp.Sessions[0].ActiveDurationMin, "display rounding")
+		assert.Equal(t, 2.5, resp.Sessions[1].ActiveDurationMin, "display rounding")
+	})
+
+	t.Run("ByDurationRanksByActiveDurationInGoFallback", func(t *testing.T) {
+		for i := range 201 {
+			id := fmt.Sprintf("dst-wall-%03d", i)
+			insertSession(t, d, id, "project-dst", func(s *Session) {
+				s.StartedAt = Ptr("2026-03-10T09:00:00Z")
+				s.EndedAt = Ptr("2026-03-10T11:00:00Z")
+				s.MessageCount = 3
+			})
+			insertMessages(
+				t,
+				d,
+				userMsgAt(id, 0, "noop", "2026-03-10T09:00:00Z"),
+				func() Message {
+					m := asstMsgAt(
+						id,
+						1,
+						"idle wait",
+						"2026-03-10T10:59:00Z",
+					)
+					m.HasToolUse = true
+					return m
+				}(),
+				userMsgAt(id, 2, "done", "2026-03-10T11:00:00Z"),
+			)
+		}
+
+		insertSession(t, d, "dst-actively-working", "project-dst", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-10T09:30:00Z")
+			s.EndedAt = Ptr("2026-03-10T09:50:00Z")
+			s.MessageCount = 3
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("dst-actively-working", 0, "start", "2026-03-10T09:30:00Z"),
+			func() Message {
+				m := asstMsgAt(
+					"dst-actively-working",
+					1,
+					"tooling",
+					"2026-03-10T09:35:00Z",
+				)
+				m.HasToolUse = true
+				return m
+			}(),
+			userMsgAt("dst-actively-working", 2, "finish", "2026-03-10T09:50:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-dst",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.NotEmpty(t, resp.Sessions, "sessions")
+		assert.Equal(t, "dst-actively-working", resp.Sessions[0].ID, "top session by active duration in fallback")
+		// 5 + 5 (15 min gap capped at the 5 min idle cap) = 10.
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "fallback active duration")
+	})
+
+	t.Run("ByDurationKeepsNearTieOrderInGoFallback", func(t *testing.T) {
+		// Same near-tie invariant as the SQLite SQL case, but the
+		// timezone filter forces the Go fallback ranking path.
+		insertSession(t, d, "dst-near-tie-longer", "project-dst-precision", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-10T09:00:00.000Z")
+			s.EndedAt = Ptr("2026-03-10T09:02:30.240Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("dst-near-tie-longer", 0, "start", "2026-03-10T09:00:00.000Z"),
+			asstMsgAt("dst-near-tie-longer", 1, "work", "2026-03-10T09:02:30.240Z"),
+		)
+
+		insertSession(t, d, "dst-near-tie-shorter", "project-dst-precision", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-10T09:00:00.000Z")
+			s.EndedAt = Ptr("2026-03-10T09:02:29.760Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("dst-near-tie-shorter", 0, "start", "2026-03-10T09:00:00.000Z"),
+			asstMsgAt("dst-near-tie-shorter", 1, "work", "2026-03-10T09:02:29.760Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-dst-precision",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 2, "fallback precision sessions")
+		assert.Equal(t, "dst-near-tie-longer", resp.Sessions[0].ID, "fallback should keep raw active ordering")
+		assert.Equal(t, 2.5, resp.Sessions[0].ActiveDurationMin, "fallback display rounding")
+		assert.Equal(t, 2.5, resp.Sessions[1].ActiveDurationMin, "fallback display rounding")
+	})
+
+	t.Run("ByDurationCapsLongGapsAndCountsGeneration", func(t *testing.T) {
+		// No tool calls anywhere: under the old tool-execution-only
+		// definition this session scored 0. The clamp counts every gap
+		// -- model generation included -- and bounds the one long idle
+		// gap at the 5 min cap: 4 (gen) + 60->5 (idle cap) + 1 = 10.
+		insertSession(t, d, "clamp-mixed", "project-clamp-sql", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-04T09:00:00Z")
+			s.EndedAt = Ptr("2024-06-04T10:05:00Z")
+			s.MessageCount = 4
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("clamp-mixed", 0, "start", "2024-06-04T09:00:00Z"),
+			asstMsgAt("clamp-mixed", 1, "thinking", "2024-06-04T09:04:00Z"),
+			userMsgAt("clamp-mixed", 2, "back", "2024-06-04T10:04:00Z"),
+			asstMsgAt("clamp-mixed", 3, "reply", "2024-06-04T10:05:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project: "project-clamp-sql",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 1, "clamp session")
+		assert.Equal(t, "clamp-mixed", resp.Sessions[0].ID)
+		assert.Equal(t, 65.0, resp.Sessions[0].DurationMin, "wall duration")
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "clamped active duration")
+	})
+
+	t.Run("ByDurationCapsLongGapsAndCountsGenerationInGoFallback", func(t *testing.T) {
+		// Same clamp + generation accounting as the SQLite SQL case,
+		// exercised through the timezone-aware Go fallback path.
+		insertSession(t, d, "dst-clamp-mixed", "project-clamp-fallback", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-10T09:00:00Z")
+			s.EndedAt = Ptr("2026-03-10T10:05:00Z")
+			s.MessageCount = 4
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("dst-clamp-mixed", 0, "start", "2026-03-10T09:00:00Z"),
+			asstMsgAt("dst-clamp-mixed", 1, "thinking", "2026-03-10T09:04:00Z"),
+			userMsgAt("dst-clamp-mixed", 2, "back", "2026-03-10T10:04:00Z"),
+			asstMsgAt("dst-clamp-mixed", 3, "reply", "2026-03-10T10:05:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-clamp-fallback",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 1, "fallback clamp session")
+		assert.Equal(t, "dst-clamp-mixed", resp.Sessions[0].ID)
+		assert.Equal(t, 65.0, resp.Sessions[0].DurationMin, "wall duration")
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "fallback clamped active duration")
+	})
+
+	t.Run("ByDurationExcludesReversedAndEmptyTimestamps", func(t *testing.T) {
+		// A reversed (ended < started) or empty-timestamp session can
+		// still accumulate positive message-gap active duration, so
+		// without an eligibility guard it would rank into the duration
+		// list. The SQL path must reject both, matching DuckDB and the Go
+		// fallback.
+		insertSession(t, d, "elig-valid", "project-elig-sql", func(s *Session) {
+			s.StartedAt = Ptr("2024-07-01T09:00:00Z")
+			s.EndedAt = Ptr("2024-07-01T09:30:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-valid", 0, "start", "2024-07-01T09:00:00Z"),
+			asstMsgAt("elig-valid", 1, "work", "2024-07-01T09:03:00Z"),
+		)
+
+		insertSession(t, d, "elig-reversed", "project-elig-sql", func(s *Session) {
+			s.StartedAt = Ptr("2024-07-01T10:00:00Z")
+			s.EndedAt = Ptr("2024-07-01T09:00:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-reversed", 0, "start", "2024-07-01T09:00:00Z"),
+			asstMsgAt("elig-reversed", 1, "work", "2024-07-01T09:04:00Z"),
+		)
+
+		insertSession(t, d, "elig-empty", "project-elig-sql", func(s *Session) {
+			s.StartedAt = Ptr("")
+			s.EndedAt = Ptr("")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-empty", 0, "start", "2024-07-01T09:00:00Z"),
+			asstMsgAt("elig-empty", 1, "work", "2024-07-01T09:04:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(
+			ctx, AnalyticsFilter{Project: "project-elig-sql"}, "duration",
+		)
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		var ids []string
+		for _, s := range resp.Sessions {
+			ids = append(ids, s.ID)
+		}
+		assert.Equal(t, []string{"elig-valid"}, ids,
+			"reversed and empty duration rows must be excluded")
+	})
+
+	t.Run("ByDurationExcludesReversedAndEmptyTimestampsInGoFallback", func(t *testing.T) {
+		// Same eligibility guard as the SQL path, but the timezone filter
+		// forces the Go fallback ranking path. Parity matters because the
+		// ranking is by message-gap active duration, which stays positive
+		// regardless of reversed or missing wall-clock timestamps.
+		insertSession(t, d, "elig-fb-valid", "project-elig-fb", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-12T09:00:00Z")
+			s.EndedAt = Ptr("2026-03-12T09:30:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-fb-valid", 0, "start", "2026-03-12T09:00:00Z"),
+			asstMsgAt("elig-fb-valid", 1, "work", "2026-03-12T09:03:00Z"),
+		)
+
+		insertSession(t, d, "elig-fb-reversed", "project-elig-fb", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-12T10:00:00Z")
+			s.EndedAt = Ptr("2026-03-12T09:00:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-fb-reversed", 0, "start", "2026-03-12T09:00:00Z"),
+			asstMsgAt("elig-fb-reversed", 1, "work", "2026-03-12T09:04:00Z"),
+		)
+
+		insertSession(t, d, "elig-fb-empty", "project-elig-fb", func(s *Session) {
+			s.StartedAt = Ptr("")
+			s.EndedAt = Ptr("")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-fb-empty", 0, "start", "2026-03-12T09:00:00Z"),
+			asstMsgAt("elig-fb-empty", 1, "work", "2026-03-12T09:04:00Z"),
+		)
+		// created_at is not bound by UpsertSession and otherwise defaults
+		// to insertion time, which the date filter would drop before the
+		// eligibility guard is reached. Pin it into the filter window so
+		// this row genuinely exercises the empty-timestamp NULLIF guard
+		// rather than being excluded by the date range.
+		_, err := d.getWriter().Exec(
+			"UPDATE sessions SET created_at = ? WHERE id = ?",
+			"2026-03-12T00:00:00Z", "elig-fb-empty",
+		)
+		require.NoError(t, err, "pin elig-fb-empty created_at")
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-elig-fb",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		var ids []string
+		for _, s := range resp.Sessions {
+			ids = append(ids, s.ID)
+		}
+		assert.Equal(t, []string{"elig-fb-valid"}, ids,
+			"reversed and empty duration rows must be excluded in fallback")
+	})
+
 	t.Run("DefaultMetric", func(t *testing.T) {
 		resp, err := d.GetAnalyticsTopSessions(
 			ctx, baseFilter(), "",

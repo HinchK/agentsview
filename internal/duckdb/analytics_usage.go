@@ -1573,7 +1573,9 @@ func processDuckSessionVelocity(
 	toolCount int,
 ) {
 	const maxCycleSec = 1800.0
-	const maxGapSec = 300.0
+	// Shared with the Top Sessions "active duration" SQL so the two
+	// "active" definitions stay in lockstep.
+	const maxGapSec = db.ActiveGapCapSec
 
 	for _, acc := range accums {
 		acc.sessions++
@@ -1695,11 +1697,31 @@ func (s *Store) GetAnalyticsTopSessions(
 		f, "COALESCE(s.started_at, s.created_at)", "s.", true, true)
 	durationExpr := "(epoch(s.ended_at) - epoch(s.started_at)) / 60.0"
 	durationSelectExpr := "COALESCE(" + durationExpr + ", 0)"
+	activeDurationExpr := fmt.Sprintf(`
+		(
+			SELECT COALESCE(SUM(
+				CASE
+					WHEN inner2.delta_ms <= 0 THEN 0
+					WHEN inner2.delta_ms > %[1]d THEN %[1]d
+					ELSE inner2.delta_ms
+				END), 0) / 60000.0
+			FROM (
+				SELECT CAST(
+					ROUND(epoch(
+						LEAD(m2.timestamp) OVER (ORDER BY m2.ordinal)
+						- m2.timestamp
+					) * 1000) AS BIGINT
+				) AS delta_ms
+				FROM messages m2
+				WHERE m2.session_id = s.id
+			) inner2
+		)`, db.ActiveGapCapMs)
+	activeDurationSelectExpr := "COALESCE(" + activeDurationExpr + ", 0)"
 	orderExpr := "s.message_count DESC, s.id ASC"
 	switch metric {
 	case "duration":
 		where += " AND s.started_at IS NOT NULL AND s.ended_at IS NOT NULL AND s.ended_at >= s.started_at"
-		orderExpr = durationExpr + " DESC, s.id ASC"
+		orderExpr = activeDurationSelectExpr + " DESC, s.id ASC"
 	case "output_tokens":
 		where += " AND s.has_total_output_tokens = TRUE"
 		orderExpr = "s.total_output_tokens DESC, s.id ASC"
@@ -1707,6 +1729,7 @@ func (s *Store) GetAnalyticsTopSessions(
 	query := `
 		SELECT s.id, s.project, s.first_message, s.message_count,
 			s.total_output_tokens, ` + durationSelectExpr + ` AS duration_min,
+			` + activeDurationSelectExpr + ` AS active_duration_min,
 			s.started_at, s.ended_at, s.termination_status
 		FROM sessions s
 		WHERE ` + where + `
@@ -1724,7 +1747,8 @@ func (s *Store) GetAnalyticsTopSessions(
 		var startedRaw, endedRaw any
 		if err := rows.Scan(
 			&row.ID, &row.Project, &row.FirstMessage, &row.MessageCount,
-			&row.OutputTokens, &row.DurationMin, &startedRaw, &endedRaw,
+			&row.OutputTokens, &row.DurationMin, &row.ActiveDurationMin,
+			&startedRaw, &endedRaw,
 			&row.TerminationStatus,
 		); err != nil {
 			return db.TopSessionsResponse{}, fmt.Errorf("scanning duckdb analytics top session: %w", err)
@@ -1733,6 +1757,8 @@ func (s *Store) GetAnalyticsTopSessions(
 		endedAt := formatDBTime(endedRaw)
 		row.StartedAt = &startedAt
 		row.EndedAt = &endedAt
+		row.DurationMin = round1(row.DurationMin)
+		row.ActiveDurationMin = round1(row.ActiveDurationMin)
 		out.Sessions = append(out.Sessions, row)
 	}
 	if err := rows.Err(); err != nil {

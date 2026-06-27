@@ -2635,7 +2635,9 @@ func processSessionVelocity(
 	toolCount int,
 ) {
 	const maxCycleSec = 1800.0
-	const maxGapSec = 300.0
+	// Shared with the Top Sessions "active duration" SQL so the two
+	// "active" definitions stay in lockstep.
+	const maxGapSec = ActiveGapCapSec
 
 	for _, a := range accums {
 		a.sessions++
@@ -4387,13 +4389,14 @@ func round1(v float64) float64 {
 
 // TopSession holds summary info for a ranked session.
 type TopSession struct {
-	ID           string  `json:"id"`
-	Project      string  `json:"project"`
-	FirstMessage *string `json:"first_message"`
-	DisplayName  *string `json:"display_name,omitempty"`
-	MessageCount int     `json:"message_count"`
-	OutputTokens int     `json:"output_tokens"`
-	DurationMin  float64 `json:"duration_min"`
+	ID                string  `json:"id"`
+	Project           string  `json:"project"`
+	FirstMessage      *string `json:"first_message"`
+	DisplayName       *string `json:"display_name,omitempty"`
+	MessageCount      int     `json:"message_count"`
+	OutputTokens      int     `json:"output_tokens"`
+	DurationMin       float64 `json:"duration_min"`
+	ActiveDurationMin float64 `json:"active_duration_min"`
 	// StartedAt and EndedAt are included so the frontend can
 	// derive a recency-based status tier — the StatusDot in the
 	// Top Sessions column needs the same time window inputs as
@@ -4407,6 +4410,44 @@ type TopSession struct {
 type TopSessionsResponse struct {
 	Metric   string       `json:"metric"`
 	Sessions []TopSession `json:"sessions"`
+}
+
+// ActiveGapCapSec and ActiveGapCapMs bound how much a single
+// inter-message gap can contribute to "active" time: a gap below the cap
+// (5 minutes) counts in full -- model generation, tool execution, or a
+// quick human turnaround -- while anything longer is treated as idle
+// beyond the cap. Defined once and shared by the velocity "active
+// minutes" metric and the Top Sessions "active duration" SQL so the two
+// definitions cannot drift. timing_test.go asserts the two stay equal.
+const (
+	ActiveGapCapSec = 300.0
+	ActiveGapCapMs  = 300_000
+)
+
+// sqliteActiveDurationExpr builds the correlated-subquery SQL that computes a
+// session's active duration in minutes: the sum of consecutive inter-message
+// gaps with each gap capped at ActiveGapCapMs. sessionIDCol is the outer
+// reference to correlate on (for example "sessions.id"). Shared by the in-SQL
+// and timezone-aware Go fallback Top Sessions paths so the two cannot drift.
+func sqliteActiveDurationExpr(sessionIDCol string) string {
+	return fmt.Sprintf(`
+		(
+			SELECT COALESCE(SUM(
+				CASE
+					WHEN inner2.delta_ms <= 0 THEN 0
+					WHEN inner2.delta_ms > %[1]d THEN %[1]d
+					ELSE inner2.delta_ms
+				END), 0) / 60000.0
+			FROM (
+				SELECT CAST(
+				  ROUND(
+					(julianday(LEAD(m2.timestamp) OVER (ORDER BY m2.ordinal))
+					  - julianday(m2.timestamp)) * 86400000
+					) AS INTEGER
+				) AS delta_ms
+			FROM messages m2
+				WHERE m2.session_id = %[2]s
+			) inner2)`, ActiveGapCapMs, sessionIDCol)
 }
 
 // GetAnalyticsTopSessions returns the top 10 sessions by the
@@ -4427,13 +4468,16 @@ func (db *DB) GetAnalyticsTopSessions(
 	durationExpr := `ROUND((julianday(ended_at) -
 		julianday(started_at)) * 1440, 1)`
 	durationSelectExpr := "COALESCE(" + durationExpr + ", 0)"
+	activeDurationSelectExpr := "COALESCE(" +
+		sqliteActiveDurationExpr("sessions.id") + ", 0)"
+	needsGoSort := metric == "duration"
 	var orderExpr string
 	switch metric {
 	case "output_tokens":
 		where += " AND has_total_output_tokens = TRUE"
 		orderExpr = "total_output_tokens DESC, id ASC"
 	case "duration":
-		orderExpr = durationExpr + " DESC, id ASC"
+		orderExpr = activeDurationSelectExpr + " DESC, id ASC"
 		where += " AND NULLIF(started_at, '') IS NOT NULL" +
 			" AND NULLIF(ended_at, '') IS NOT NULL" +
 			" AND julianday(ended_at) >= julianday(started_at)"
@@ -4445,6 +4489,7 @@ func (db *DB) GetAnalyticsTopSessions(
 	query := `SELECT id, project, first_message,
 		COALESCE(display_name, session_name) AS display_name,
 		message_count, total_output_tokens, ` + durationSelectExpr + `,
+		` + activeDurationSelectExpr + `,
 		started_at, ended_at, termination_status
 		FROM sessions WHERE ` + where +
 		` ORDER BY ` + orderExpr + ` LIMIT 10`
@@ -4463,6 +4508,7 @@ func (db *DB) GetAnalyticsTopSessions(
 			&row.ID, &row.Project, &row.FirstMessage,
 			&row.DisplayName, &row.MessageCount,
 			&row.OutputTokens, &row.DurationMin,
+			&row.ActiveDurationMin,
 			&row.StartedAt, &row.EndedAt,
 			&row.TerminationStatus,
 		); err != nil {
@@ -4475,6 +4521,8 @@ func (db *DB) GetAnalyticsTopSessions(
 		return TopSessionsResponse{},
 			fmt.Errorf("iterating top sessions: %w", err)
 	}
+	sessions := rankTopSessions(resp.Sessions, needsGoSort)
+	resp.Sessions = sessions
 	return resp, nil
 }
 
@@ -4495,6 +4543,7 @@ func (db *DB) getAnalyticsTopSessionsGo(
 	}
 
 	var orderExpr string
+	needsGoSort := metric == "duration"
 	switch metric {
 	case "output_tokens":
 		where += " AND has_total_output_tokens = TRUE"
@@ -4502,20 +4551,39 @@ func (db *DB) getAnalyticsTopSessionsGo(
 	case "duration":
 		orderExpr = `(julianday(ended_at) -
 			julianday(started_at)) * 1440 DESC, id ASC`
-		where += " AND started_at IS NOT NULL" +
-			" AND ended_at IS NOT NULL"
+		where += " AND NULLIF(started_at, '') IS NOT NULL" +
+			" AND NULLIF(ended_at, '') IS NOT NULL" +
+			" AND julianday(ended_at) >= julianday(started_at)"
 	default:
 		metric = "messages"
 		orderExpr = "message_count DESC, id ASC"
+	}
+
+	limitClause := " LIMIT 200"
+	if f.HasTimeFilter() || needsGoSort {
+		limitClause = ""
+	}
+
+	// Active duration is only consumed for the duration metric. Compute it
+	// in the outer query (matching the in-SQL path) rather than issuing a
+	// per-row follow-up query: the per-row form held the outer rows iterator
+	// open while acquiring a second reader connection for each row, an
+	// unbounded N+1 that could exhaust the capped reader pool and deadlock
+	// under concurrent requests.
+	activeDurationSelectExpr := "0.0"
+	if needsGoSort {
+		activeDurationSelectExpr = "COALESCE(" +
+			sqliteActiveDurationExpr("sessions.id") + ", 0)"
 	}
 
 	query := `SELECT id, ` + dateCol + `, project,
 		first_message,
 		COALESCE(display_name, session_name) AS display_name,
 		message_count, total_output_tokens,
+		` + activeDurationSelectExpr + ` AS active_duration_min,
 		started_at, ended_at, termination_status
 		FROM sessions WHERE ` + where +
-		` ORDER BY ` + orderExpr + ` LIMIT 200`
+		` ORDER BY ` + orderExpr + limitClause
 
 	rows, err := db.getReader().QueryContext(ctx, query, args...)
 	if err != nil {
@@ -4530,9 +4598,11 @@ func (db *DB) getAnalyticsTopSessionsGo(
 		var firstMsg, displayName, startedAt, endedAt *string
 		var termStatus *string
 		var mc, outputTokens int
+		var activeDurationMin float64
 		if err := rows.Scan(
 			&id, &ts, &project, &firstMsg,
 			&displayName, &mc, &outputTokens,
+			&activeDurationMin,
 			&startedAt, &endedAt, &termStatus,
 		); err != nil {
 			return TopSessionsResponse{},
@@ -4562,6 +4632,7 @@ func (db *DB) getAnalyticsTopSessionsGo(
 			MessageCount:      mc,
 			OutputTokens:      outputTokens,
 			DurationMin:       durMin,
+			ActiveDurationMin: activeDurationMin,
 			StartedAt:         startedAt,
 			EndedAt:           endedAt,
 			TerminationStatus: termStatus,
@@ -4575,6 +4646,7 @@ func (db *DB) getAnalyticsTopSessionsGo(
 	if sessions == nil {
 		sessions = []TopSession{}
 	}
+	sessions = rankTopSessions(sessions, needsGoSort)
 	if len(sessions) > 10 {
 		sessions = sessions[:10]
 	}
@@ -4583,4 +4655,24 @@ func (db *DB) getAnalyticsTopSessionsGo(
 		Metric:   metric,
 		Sessions: sessions,
 	}, nil
+}
+
+func rankTopSessions(sessions []TopSession, needsGoSort bool) []TopSession {
+	if sessions == nil {
+		return []TopSession{}
+	}
+	if needsGoSort && len(sessions) > 1 {
+		sort.SliceStable(sessions, func(i, j int) bool {
+			if sessions[i].ActiveDurationMin != sessions[j].ActiveDurationMin {
+				return sessions[i].ActiveDurationMin >
+					sessions[j].ActiveDurationMin
+			}
+			return sessions[i].ID < sessions[j].ID
+		})
+	}
+	for i := range sessions {
+		sessions[i].DurationMin = round1(sessions[i].DurationMin)
+		sessions[i].ActiveDurationMin = round1(sessions[i].ActiveDurationMin)
+	}
+	return sessions
 }

@@ -1152,6 +1152,180 @@ func TestStoreAnalyticsTopSessionsDisplayName(t *testing.T) {
 	assert.Equal(t, "User renamed title", *custom.DisplayName)
 }
 
+func TestStoreAnalyticsTopSessionsMessagesAllowRunningSessions(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			started_at, ended_at, message_count,
+			user_message_count
+		) VALUES
+			('pg-running-session', 'test-machine', 'test-project',
+			 'claude', 'still running',
+			 '2026-03-12T13:00:00Z'::timestamptz,
+			 NULL,
+			 12, 3),
+			('pg-finished-session', 'test-machine', 'test-project',
+			 'claude', 'finished',
+			 '2026-03-12T11:00:00Z'::timestamptz,
+			 '2026-03-12T11:30:00Z'::timestamptz,
+			 10, 2)
+	`)
+	require.NoError(t, err, "inserting top sessions")
+
+	top, err := store.GetAnalyticsTopSessions(
+		context.Background(),
+		db.AnalyticsFilter{
+			From: "2026-03-12",
+			To:   "2026-03-12",
+		},
+		"messages",
+	)
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+
+	byID := map[string]db.TopSession{}
+	for _, session := range top.Sessions {
+		byID[session.ID] = session
+	}
+
+	running, ok := byID["pg-running-session"]
+	require.True(t, ok, "running session missing from top sessions")
+	assert.Equal(t, 0.0, running.DurationMin)
+}
+
+func TestStoreAnalyticsTopSessionsDurationUsesClampedActiveDuration(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	// Unique date so only these two sessions match the filter,
+	// regardless of what other tests leave behind in the schema.
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			started_at, ended_at, message_count, user_message_count
+		) VALUES
+			('pg-clamp-wall', 'test-machine', 'clamp-parity',
+			 'claude', 'wall start',
+			 '2027-07-15T09:00:00Z'::timestamptz,
+			 '2027-07-15T11:00:00Z'::timestamptz,
+			 3, 2),
+			('pg-clamp-active', 'test-machine', 'clamp-parity',
+			 'claude', 'active start',
+			 '2027-07-15T09:30:00Z'::timestamptz,
+			 '2027-07-15T09:50:00Z'::timestamptz,
+			 3, 2)
+	`)
+	require.NoError(t, err, "inserting sessions")
+
+	_, err = store.DB().Exec(`
+		INSERT INTO messages
+			(session_id, ordinal, role, content, timestamp) VALUES
+			('pg-clamp-wall', 0, 'user', 'noop',
+			 '2027-07-15T09:00:00Z'::timestamptz),
+			('pg-clamp-wall', 1, 'assistant', 'idle wait',
+			 '2027-07-15T10:59:00Z'::timestamptz),
+			('pg-clamp-wall', 2, 'user', 'done',
+			 '2027-07-15T11:00:00Z'::timestamptz),
+			('pg-clamp-active', 0, 'user', 'start',
+			 '2027-07-15T09:30:00Z'::timestamptz),
+			('pg-clamp-active', 1, 'assistant', 'tooling',
+			 '2027-07-15T09:35:00Z'::timestamptz),
+			('pg-clamp-active', 2, 'user', 'finish',
+			 '2027-07-15T09:50:00Z'::timestamptz)
+	`)
+	require.NoError(t, err, "inserting messages")
+
+	top, err := store.GetAnalyticsTopSessions(
+		context.Background(),
+		db.AnalyticsFilter{From: "2027-07-15", To: "2027-07-15"},
+		"duration",
+	)
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+	require.Len(t, top.Sessions, 2)
+
+	// Active duration ranks ahead of wall: the engaged 20-min session
+	// (5 min gap + a 15 min gap capped at the 5 min idle cap = 10)
+	// beats the mostly-idle 2-hour session (119 min capped to 5 + a
+	// 1 min gap = 6). Generation gaps count even with no tool calls.
+	assert.Equal(t, "pg-clamp-active", top.Sessions[0].ID)
+	assert.Equal(t, 20.0, top.Sessions[0].DurationMin)
+	assert.Equal(t, 10.0, top.Sessions[0].ActiveDurationMin)
+	assert.Equal(t, "pg-clamp-wall", top.Sessions[1].ID)
+	assert.Equal(t, 120.0, top.Sessions[1].DurationMin)
+	assert.Equal(t, 6.0, top.Sessions[1].ActiveDurationMin)
+}
+
+func TestStoreAnalyticsTopSessionsDurationExcludesReversedTimestamps(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	// A reversed session (ended_at < started_at) still accumulates
+	// positive message-gap active duration, so without an eligibility
+	// guard it would rank into the duration list ordered by active
+	// duration. PostgreSQL must reject it, matching SQLite and DuckDB.
+	// (Empty-string timestamps are not representable in timestamptz
+	// columns, so only the reversed case applies on this backend.)
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			started_at, ended_at, message_count, user_message_count
+		) VALUES
+			('pg-elig-valid', 'test-machine', 'elig-parity',
+			 'claude', 'valid start',
+			 '2027-08-20T09:00:00Z'::timestamptz,
+			 '2027-08-20T09:30:00Z'::timestamptz,
+			 2, 1),
+			('pg-elig-reversed', 'test-machine', 'elig-parity',
+			 'claude', 'reversed start',
+			 '2027-08-20T10:00:00Z'::timestamptz,
+			 '2027-08-20T09:00:00Z'::timestamptz,
+			 2, 1)
+	`)
+	require.NoError(t, err, "inserting sessions")
+
+	_, err = store.DB().Exec(`
+		INSERT INTO messages
+			(session_id, ordinal, role, content, timestamp) VALUES
+			('pg-elig-valid', 0, 'user', 'start',
+			 '2027-08-20T09:00:00Z'::timestamptz),
+			('pg-elig-valid', 1, 'assistant', 'work',
+			 '2027-08-20T09:03:00Z'::timestamptz),
+			('pg-elig-reversed', 0, 'user', 'start',
+			 '2027-08-20T09:00:00Z'::timestamptz),
+			('pg-elig-reversed', 1, 'assistant', 'work',
+			 '2027-08-20T09:04:00Z'::timestamptz)
+	`)
+	require.NoError(t, err, "inserting messages")
+
+	top, err := store.GetAnalyticsTopSessions(
+		context.Background(),
+		db.AnalyticsFilter{From: "2027-08-20", To: "2027-08-20"},
+		"duration",
+	)
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+
+	ids := []string{}
+	for _, session := range top.Sessions {
+		ids = append(ids, session.ID)
+	}
+	assert.Equal(t, []string{"pg-elig-valid"}, ids,
+		"reversed duration row must be excluded")
+}
+
 func TestStoreWriteMethodsReturnReadOnly(t *testing.T) {
 	pgURL := testPGURL(t)
 

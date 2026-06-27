@@ -2015,7 +2015,9 @@ func (s *Store) GetAnalyticsVelocity(
 	byComplexity := make(map[string]*velocityAccumulator)
 
 	const maxCycleSec = 1800.0
-	const maxGapSec = 300.0
+	// Shared with the Top Sessions "active duration" SQL so the two
+	// "active" definitions stay in lockstep.
+	const maxGapSec = db.ActiveGapCapSec
 
 	for _, sid := range sessionIDs {
 		info := sessionMap[sid]
@@ -2212,7 +2214,8 @@ func (s *Store) GetAnalyticsTopSessions(
 		orderExpr = "total_output_tokens DESC, id ASC"
 	case "duration":
 		where += " AND started_at IS NOT NULL" +
-			" AND ended_at IS NOT NULL"
+			" AND ended_at IS NOT NULL" +
+			" AND ended_at >= started_at"
 	default:
 		metric = "messages"
 	}
@@ -2221,12 +2224,33 @@ func (s *Store) GetAnalyticsTopSessions(
 	if f.HasTimeFilter() || needsGoSort {
 		limitClause = ""
 	}
+	activeDurationSelectExpr := fmt.Sprintf(`COALESCE(
+		  (
+			SELECT COALESCE(SUM(
+				CASE
+					WHEN inner2.delta_ms <= 0 THEN 0
+					WHEN inner2.delta_ms > %[1]d THEN %[1]d
+					ELSE inner2.delta_ms
+				END), 0) / 60000.0
+			FROM (
+				SELECT CAST(
+					round(EXTRACT(EPOCH FROM (
+						LEAD(m2.timestamp) OVER (ORDER BY m2.ordinal)
+						- m2.timestamp
+					)) * 1000)
+				AS BIGINT) AS delta_ms
+				FROM messages m2
+				WHERE m2.session_id = sessions.id
+			) inner2
+		), 0)`, db.ActiveGapCapMs)
+
 	query := `SELECT id, ` + pgDateCol + `, project,
 		first_message,
 		COALESCE(display_name, session_name) AS display_name,
 		message_count, total_output_tokens,
-		EXTRACT(EPOCH FROM ended_at - started_at)
+		COALESCE(EXTRACT(EPOCH FROM ended_at - started_at), 0)
 			AS duration_sec,
+		` + activeDurationSelectExpr + ` AS active_duration_min,
 		started_at, ended_at,
 		termination_status
 		FROM sessions WHERE ` + where +
@@ -2250,11 +2274,11 @@ func (s *Store) GetAnalyticsTopSessions(
 		var startedAt, endedAt *time.Time
 		var firstMsg, displayName, termStatus *string
 		var mc, outputTokens int
-		var durationSec *float64
+		var durationSec, activeDurationMin float64
 		if err := rows.Scan(
 			&id, &ts, &project, &firstMsg,
 			&displayName, &mc, &outputTokens,
-			&durationSec, &startedAt, &endedAt,
+			&durationSec, &activeDurationMin, &startedAt, &endedAt,
 			&termStatus,
 		); err != nil {
 			return db.TopSessionsResponse{},
@@ -2269,12 +2293,7 @@ func (s *Store) GetAnalyticsTopSessions(
 		if timeIDs != nil && !timeIDs[id] {
 			continue
 		}
-		durMin := 0.0
-		if durationSec != nil {
-			durMin = *durationSec / 60.0
-		} else if needsGoSort {
-			continue
-		}
+		durMin := durationSec / 60.0
 		var startedStr, endedStr *string
 		if startedAt != nil {
 			s := FormatISO8601(*startedAt)
@@ -2292,6 +2311,7 @@ func (s *Store) GetAnalyticsTopSessions(
 			MessageCount:      mc,
 			OutputTokens:      outputTokens,
 			DurationMin:       durMin,
+			ActiveDurationMin: activeDurationMin,
 			StartedAt:         startedStr,
 			EndedAt:           endedStr,
 			TerminationStatus: termStatus,
@@ -2637,8 +2657,8 @@ func (s *Store) populateFrustrationMarkers(
 	})
 }
 
-// rankTopSessions sorts sessions by duration (if
-// needsGoSort), truncates to top 10, and rounds DurationMin.
+// rankTopSessions sorts sessions by active duration (if
+// needsGoSort), truncates to top 10, and rounds duration fields.
 func rankTopSessions(
 	sessions []db.TopSession, needsGoSort bool,
 ) []db.TopSession {
@@ -2647,10 +2667,10 @@ func rankTopSessions(
 	}
 	if needsGoSort && len(sessions) > 1 {
 		sort.SliceStable(sessions, func(i, j int) bool {
-			if sessions[i].DurationMin !=
-				sessions[j].DurationMin {
-				return sessions[i].DurationMin >
-					sessions[j].DurationMin
+			if sessions[i].ActiveDurationMin !=
+				sessions[j].ActiveDurationMin {
+				return sessions[i].ActiveDurationMin >
+					sessions[j].ActiveDurationMin
 			}
 			return sessions[i].ID < sessions[j].ID
 		})
@@ -2661,6 +2681,8 @@ func rankTopSessions(
 	for i := range sessions {
 		sessions[i].DurationMin = math.Round(
 			sessions[i].DurationMin*10) / 10
+		sessions[i].ActiveDurationMin = math.Round(
+			sessions[i].ActiveDurationMin*10) / 10
 	}
 	return sessions
 }
