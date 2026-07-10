@@ -57,6 +57,7 @@ class AnalyticsStore {
   isPinned: boolean = $state(false);
   windowDays: number = $state(365);
   granularity: Granularity = $state("day");
+  skillsGranularity: Granularity = $state("week");
   metric: HeatmapMetric = $state("messages");
   selectedDate: string | null = $state(null);
   project: string = $state("");
@@ -701,15 +702,19 @@ class AnalyticsStore {
     );
   }
 
-  async fetchSkills(): Promise<FetchResult> {
+  async fetchSkills(
+    granularity: Granularity = this.skillsGranularity,
+  ): Promise<FetchResult> {
     return await this.executeFetch(
       "skills",
       () =>
-        AnalyticsService.getApiV1AnalyticsSkills(
-          this.filterParams(),
-        ) as unknown as Promise<SkillsAnalyticsResponse>,
+        AnalyticsService.getApiV1AnalyticsSkills({
+          ...this.filterParams(),
+          granularity,
+      }) as unknown as Promise<SkillsAnalyticsResponse>,
       (data) => {
         this.skills = data;
+        this.skillsGranularity = granularity;
       },
       () => this.skills !== null,
     );
@@ -827,6 +832,11 @@ class AnalyticsStore {
   setGranularity(g: Granularity) {
     this.granularity = g;
     this.fetchActivity();
+  }
+
+  async setSkillsGranularity(g: Granularity): Promise<FetchResult> {
+    if (this.skillsGranularity === g) return "ok";
+    return await this.fetchSkills(g);
   }
 
   setMetric(m: HeatmapMetric) {

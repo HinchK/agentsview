@@ -1030,7 +1030,7 @@ func assertDuckAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
 	resp, err := store.GetAnalyticsSkills(ctx, db.AnalyticsFilter{
 		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
 		Model: "gpt-4o",
-	})
+	}, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	assert.Equal(t, 1, resp.TotalSkillCalls, "TotalSkillCalls")
 	assert.Equal(t, 1, resp.DistinctSkills, "DistinctSkills")

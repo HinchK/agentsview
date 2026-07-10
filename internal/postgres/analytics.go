@@ -2203,9 +2203,10 @@ func (s *Store) GetAnalyticsTools(
 	return db.BuildToolsAnalytics(toolRows), nil
 }
 
-// GetAnalyticsSkills returns skill usage analytics.
+// GetAnalyticsSkills returns skill usage analytics. granularity picks
+// the trend bucket size (day, week, or month); empty defaults to week.
 func (s *Store) GetAnalyticsSkills(
-	ctx context.Context, f db.AnalyticsFilter,
+	ctx context.Context, f db.AnalyticsFilter, granularity string,
 ) (db.SkillsAnalyticsResponse, error) {
 	pb := &paramBuilder{}
 	where := buildAnalyticsWhereWithoutDate(f, pb)
@@ -2249,7 +2250,9 @@ func (s *Store) GetAnalyticsSkills(
 			fmt.Errorf("iterating skill sessions: %w", err)
 	}
 	if len(sessionIDs) == 0 {
-		return db.BuildSkillsAnalytics(nil), nil
+		return db.BuildSkillsAnalytics(
+			nil, f.From, f.To, granularity,
+		), nil
 	}
 
 	var skillRows []db.SkillAnalyticsRow
@@ -2319,7 +2322,9 @@ func (s *Store) GetAnalyticsSkills(
 		return db.SkillsAnalyticsResponse{}, err
 	}
 
-	return db.BuildSkillsAnalytics(skillRows), nil
+	return db.BuildSkillsAnalytics(
+		skillRows, f.From, f.To, granularity,
+	), nil
 }
 
 // --- Velocity ---

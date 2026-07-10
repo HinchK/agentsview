@@ -15,6 +15,7 @@
   import VelocityMetrics from "./VelocityMetrics.svelte";
   import ToolUsage from "./ToolUsage.svelte";
   import TopSkills from "./TopSkills.svelte";
+  import SkillTrend from "./SkillTrend.svelte";
   import AgentComparison from "./AgentComparison.svelte";
   import SessionHealthSection from "./SessionHealthSection.svelte";
   import TopSessions from "./TopSessions.svelte";
@@ -584,6 +585,10 @@
 
       <div class="chart-panel wide">
         <TopSkills />
+      </div>
+
+      <div class="chart-panel wide">
+        <SkillTrend />
       </div>
 
       <div class="chart-panel wide">

@@ -2805,7 +2805,7 @@ func TestDuckGetAnalyticsSkillsAggregatesAcrossWeeks(t *testing.T) {
 
 	resp, err := store.GetAnalyticsSkills(ctx, db.AnalyticsFilter{
 		From: "2026-01-01", To: "2026-01-31", Timezone: "UTC",
-	})
+	}, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	require.Len(t, resp.BySkill, 1, "BySkill")
 	assert.Equal(t, "deploy", resp.BySkill[0].SkillName)
@@ -2863,7 +2863,7 @@ func TestDuckGetAnalyticsSkillsFiltersByMessageDate(t *testing.T) {
 
 	resp, err := store.GetAnalyticsSkills(ctx, db.AnalyticsFilter{
 		From: "2026-02-01", To: "2026-02-28", Timezone: "UTC",
-	})
+	}, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	require.Len(t, resp.BySkill, 1, "BySkill")
 	assert.Equal(t, "deploy", resp.BySkill[0].SkillName)

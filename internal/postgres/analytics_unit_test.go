@@ -299,6 +299,7 @@ func TestGetAnalyticsSkillsAggregatesToolCallsInSQL(t *testing.T) {
 			From: "2024-06-01",
 			To:   "2024-06-30",
 		},
+		"week",
 	)
 	require.NoError(t, err, "GetAnalyticsSkills")
 
@@ -367,6 +368,7 @@ func TestGetAnalyticsSkillsModelFilterUsesMatchingMessages(t *testing.T) {
 			To:    "2024-06-30",
 			Model: "gpt-4o",
 		},
+		"week",
 	)
 	require.NoError(t, err, "GetAnalyticsSkills")
 

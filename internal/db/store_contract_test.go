@@ -512,7 +512,7 @@ func contractAnalyticsTrendsAndUsage(
 	skills, err := store.GetAnalyticsSkills(ctx, AnalyticsFilter{
 		From: "2026-01-10",
 		To:   "2026-01-10",
-	})
+	}, "week")
 	require.NoError(t, err)
 	require.Equal(t, 1, skills.TotalSkillCalls)
 	require.Equal(t, 1, skills.DistinctSkills)

@@ -2741,7 +2741,7 @@ func TestGetAnalyticsSkills(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("EmptyDB", func(t *testing.T) {
-		resp, err := d.GetAnalyticsSkills(ctx, baseFilter())
+		resp, err := d.GetAnalyticsSkills(ctx, baseFilter(), "week")
 		require.NoError(t, err, "GetAnalyticsSkills")
 		assert.Equal(t, 0, resp.TotalSkillCalls, "TotalSkillCalls")
 		assert.Equal(t, 0, resp.DistinctSkills, "DistinctSkills")
@@ -2797,7 +2797,7 @@ func TestGetAnalyticsSkills(t *testing.T) {
 	insertMessages(t, d, sk3m1)
 
 	t.Run("Aggregates", func(t *testing.T) {
-		resp, err := d.GetAnalyticsSkills(ctx, baseFilter())
+		resp, err := d.GetAnalyticsSkills(ctx, baseFilter(), "week")
 		require.NoError(t, err, "GetAnalyticsSkills")
 		assert.Equal(t, 5, resp.TotalSkillCalls, "TotalSkillCalls")
 		assert.Equal(t, 2, resp.DistinctSkills, "DistinctSkills")
@@ -2827,7 +2827,7 @@ func TestGetAnalyticsSkills(t *testing.T) {
 	})
 
 	t.Run("Trend", func(t *testing.T) {
-		resp, err := d.GetAnalyticsSkills(ctx, baseFilter())
+		resp, err := d.GetAnalyticsSkills(ctx, baseFilter(), "week")
 		require.NoError(t, err, "GetAnalyticsSkills")
 		require.Len(t, resp.Trend, 2, "Trend")
 		assert.Equal(t, "2024-05-27", resp.Trend[0].Date, "first week")
@@ -2840,38 +2840,38 @@ func TestGetAnalyticsSkills(t *testing.T) {
 	t.Run("Filters", func(t *testing.T) {
 		f := baseFilter()
 		f.Project = "alpha"
-		resp, err := d.GetAnalyticsSkills(ctx, f)
+		resp, err := d.GetAnalyticsSkills(ctx, f, "week")
 		require.NoError(t, err, "project GetAnalyticsSkills")
 		assert.Equal(t, 4, resp.TotalSkillCalls, "project TotalSkillCalls")
 
 		f = baseFilter()
 		f.Agent = "claude"
-		resp, err = d.GetAnalyticsSkills(ctx, f)
+		resp, err = d.GetAnalyticsSkills(ctx, f, "week")
 		require.NoError(t, err, "agent GetAnalyticsSkills")
 		assert.Equal(t, 3, resp.TotalSkillCalls, "agent TotalSkillCalls")
 
 		f = baseFilter()
 		f.Machine = "linux"
-		resp, err = d.GetAnalyticsSkills(ctx, f)
+		resp, err = d.GetAnalyticsSkills(ctx, f, "week")
 		require.NoError(t, err, "machine GetAnalyticsSkills")
 		assert.Equal(t, 1, resp.TotalSkillCalls, "machine TotalSkillCalls")
 
 		f = baseFilter()
 		f.From = "2024-06-01"
 		f.To = "2024-06-01"
-		resp, err = d.GetAnalyticsSkills(ctx, f)
+		resp, err = d.GetAnalyticsSkills(ctx, f, "week")
 		require.NoError(t, err, "date GetAnalyticsSkills")
 		assert.Equal(t, 3, resp.TotalSkillCalls, "date TotalSkillCalls")
 
 		f = baseFilter()
 		f.ExcludeAutomated = true
-		resp, err = d.GetAnalyticsSkills(ctx, f)
+		resp, err = d.GetAnalyticsSkills(ctx, f, "week")
 		require.NoError(t, err, "automation GetAnalyticsSkills")
 		assert.Equal(t, 4, resp.TotalSkillCalls, "automation TotalSkillCalls")
 	})
 
 	t.Run("EmptyDateRange", func(t *testing.T) {
-		resp, err := d.GetAnalyticsSkills(ctx, emptyFilter())
+		resp, err := d.GetAnalyticsSkills(ctx, emptyFilter(), "week")
 		require.NoError(t, err, "GetAnalyticsSkills")
 		assert.Equal(t, 0, resp.TotalSkillCalls, "TotalSkillCalls")
 		assert.Equal(t, 0, resp.DistinctSkills, "DistinctSkills")
@@ -2914,7 +2914,7 @@ func TestGetAnalyticsSkillsUsesMessageTimestamp(t *testing.T) {
 	}
 	insertMessages(t, d, fbMsg)
 
-	resp, err := d.GetAnalyticsSkills(ctx, filter)
+	resp, err := d.GetAnalyticsSkills(ctx, filter, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	require.Len(t, resp.BySkill, 2, "BySkill")
 
@@ -2973,7 +2973,7 @@ func TestGetAnalyticsSkillsSpreadsTrendAcrossWeeks(t *testing.T) {
 	}
 	insertMessages(t, d, early, late)
 
-	resp, err := d.GetAnalyticsSkills(ctx, filter)
+	resp, err := d.GetAnalyticsSkills(ctx, filter, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	require.Len(t, resp.BySkill, 1, "BySkill")
 	assert.Equal(t, 3, resp.BySkill[0].CallCount, "rolled-up CallCount")
@@ -2991,6 +2991,78 @@ func TestGetAnalyticsSkillsSpreadsTrendAcrossWeeks(t *testing.T) {
 	}, trend, "each call buckets into its own message-timestamp week")
 }
 
+func TestBuildSkillsAnalyticsTrendGranularity(t *testing.T) {
+	rows := []SkillAnalyticsRow{
+		{SessionID: "a", SkillName: "deploy", Date: "2024-06-04", Count: 1},
+		{SessionID: "a", SkillName: "deploy", Date: "2024-06-05", Count: 2},
+		{SessionID: "b", SkillName: "review", Date: "2024-07-19", Count: 1},
+	}
+
+	tests := []struct {
+		name        string
+		granularity string
+		want        []SkillTrendEntry
+	}{
+		{
+			name:        "day keeps each date",
+			granularity: "day",
+			want: []SkillTrendEntry{
+				{Date: "2024-06-04", BySkill: map[string]int{"deploy": 1}},
+				{Date: "2024-06-05", BySkill: map[string]int{"deploy": 2}},
+				{Date: "2024-07-19", BySkill: map[string]int{"review": 1}},
+			},
+		},
+		{
+			name:        "week folds onto the ISO Monday",
+			granularity: "week",
+			want: []SkillTrendEntry{
+				{Date: "2024-06-03", BySkill: map[string]int{"deploy": 3}},
+				{Date: "2024-07-15", BySkill: map[string]int{"review": 1}},
+			},
+		},
+		{
+			name:        "month folds onto the first of the month",
+			granularity: "month",
+			want: []SkillTrendEntry{
+				{Date: "2024-06-01", BySkill: map[string]int{"deploy": 3}},
+				{Date: "2024-07-01", BySkill: map[string]int{"review": 1}},
+			},
+		},
+		{
+			name:        "empty defaults to week",
+			granularity: "",
+			want: []SkillTrendEntry{
+				{Date: "2024-06-03", BySkill: map[string]int{"deploy": 3}},
+				{Date: "2024-07-15", BySkill: map[string]int{"review": 1}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := BuildSkillsAnalytics(rows, "", "", tt.granularity)
+			assert.Equal(t, tt.want, resp.Trend, "Trend buckets")
+		})
+	}
+}
+
+func TestBuildSkillsAnalyticsIncludesEmptyTrendBuckets(t *testing.T) {
+	rows := []SkillAnalyticsRow{
+		{SessionID: "a", SkillName: "deploy", Date: "2024-06-03", Count: 2},
+		{SessionID: "b", SkillName: "deploy", Date: "2024-06-17", Count: 1},
+	}
+
+	resp := BuildSkillsAnalytics(
+		rows, "2024-06-03", "2024-06-17", "week",
+	)
+
+	assert.Equal(t, []SkillTrendEntry{
+		{Date: "2024-06-03", BySkill: map[string]int{"deploy": 2}},
+		{Date: "2024-06-10", BySkill: map[string]int{}},
+		{Date: "2024-06-17", BySkill: map[string]int{"deploy": 1}},
+	}, resp.Trend)
+}
+
 func TestBuildSkillsAnalyticsLastUsedChronological(t *testing.T) {
 	// The fractional-second timestamp is chronologically later but
 	// lexically smaller ('.' sorts before 'Z'), so a string compare
@@ -3006,7 +3078,7 @@ func TestBuildSkillsAnalyticsLastUsedChronological(t *testing.T) {
 		},
 	}
 
-	resp := BuildSkillsAnalytics(rows)
+	resp := BuildSkillsAnalytics(rows, "", "", "week")
 	require.Len(t, resp.BySkill, 1, "BySkill")
 	assert.Equal(t, "2024-06-10T09:00:00.500Z",
 		resp.BySkill[0].LastUsedAt,
@@ -3087,7 +3159,7 @@ func TestGetAnalyticsSkillsDateBoundaries(t *testing.T) {
 		mkCall(2, "2024-07-05T10:00:00Z"), // after To
 	)
 
-	resp, err := d.GetAnalyticsSkills(ctx, filter)
+	resp, err := d.GetAnalyticsSkills(ctx, filter, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	require.Len(t, resp.BySkill, 1, "BySkill")
 	assert.Equal(t, "deploy", resp.BySkill[0].SkillName)
@@ -3164,7 +3236,7 @@ func TestGetAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
 	resp, err := d.GetAnalyticsSkills(ctx, AnalyticsFilter{
 		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
 		Model: "gpt-4o",
-	})
+	}, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	assert.Equal(t, 1, resp.TotalSkillCalls, "TotalSkillCalls")
 	assert.Equal(t, 1, resp.DistinctSkills, "DistinctSkills")
@@ -3185,7 +3257,7 @@ func TestGetAnalyticsToolsCanceled(t *testing.T) {
 func TestGetAnalyticsSkillsCanceled(t *testing.T) {
 	d := testDB(t)
 	ctx := canceledCtx()
-	_, err := d.GetAnalyticsSkills(ctx, baseFilter())
+	_, err := d.GetAnalyticsSkills(ctx, baseFilter(), "week")
 	requireCanceledErr(t, err)
 }
 

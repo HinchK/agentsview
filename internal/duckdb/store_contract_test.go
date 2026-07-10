@@ -344,7 +344,7 @@ func duckContractAnalyticsTrendsAndUsage(
 	require.NoError(t, err)
 	require.Equal(t, 1, tools.TotalCalls)
 
-	skills, err := store.GetAnalyticsSkills(ctx, filter)
+	skills, err := store.GetAnalyticsSkills(ctx, filter, "week")
 	require.NoError(t, err)
 	require.Equal(t, 1, skills.TotalSkillCalls)
 	require.Equal(t, 1, skills.DistinctSkills)
