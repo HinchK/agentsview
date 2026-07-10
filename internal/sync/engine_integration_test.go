@@ -1164,6 +1164,48 @@ func TestSyncEngineOpenCodeStorageSameMtimeContentChangeUsesFingerprint(
 		"successful rewrite must bump local_modified_at for push windows")
 }
 
+func TestWatcherOverflowReverifiesSameStatOpenCodeStorage(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	storage.addSession(
+		t, "proj", "overflow-same-stat",
+		"/home/user/code/opencode-app", "Overflow Guard",
+		1779012000000, 1779012030000,
+	)
+	storage.addMessage(
+		t, "overflow-same-stat", "msg-user", "user",
+		1779012000000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, "overflow-same-stat", "msg-user", "part-user",
+		"original prompt", 1779012000000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	require.Equal(t, 1, stats.Synced)
+	const sessionID = "opencode:overflow-same-stat"
+	assertMessageContent(t, env.db, sessionID, "original prompt")
+	partInfo, err := os.Stat(partPath)
+	require.NoError(t, err)
+
+	storage.addTextPart(
+		t, "overflow-same-stat", "msg-user", "part-user",
+		"modified prompt", 1779012000000,
+	)
+	require.NoError(t, os.Chtimes(partPath, partInfo.ModTime(), partInfo.ModTime()))
+	rewrittenInfo, err := os.Stat(partPath)
+	require.NoError(t, err)
+	require.Equal(t, partInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, partInfo.ModTime(), rewrittenInfo.ModTime())
+
+	stats = env.engine.SyncAllAfterWatcherOverflow(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	assert.Equal(t, 1, stats.Synced,
+		"overflow recovery must reparse event-sensitive storage sessions")
+	assertMessageContent(t, env.db, sessionID, "modified prompt")
+}
+
 func TestSyncEngineKiroSQLiteUpdatePaths(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
 	ks := createKiroSQLiteDB(t, env.kiroDir)
@@ -9649,9 +9691,9 @@ func TestIncrementalSync_CodexAppend(t *testing.T) {
 	)
 	env.engine.SyncAll(context.Background(), nil)
 
-	assertSessionMessageCount(
-		t, env.db, "codex:inc-cx", 1,
-	)
+	before := fetchMessages(t, env.db, "codex:inc-cx")
+	require.Len(t, before, 1)
+	firstMessageID := before[0].ID
 
 	// Append new messages.
 	appended := testjsonl.JoinJSONL(
@@ -9669,18 +9711,519 @@ func TestIncrementalSync_CodexAppend(t *testing.T) {
 
 	env.engine.SyncPaths([]string{path})
 
-	assertSessionMessageCount(
-		t, env.db, "codex:inc-cx", 2,
-	)
-	assertMessageRoles(
-		t, env.db, "codex:inc-cx", "user", "assistant",
-	)
+	msgs := fetchMessages(t, env.db, "codex:inc-cx")
+	require.Len(t, msgs, 2)
+	assert.Equal(t, firstMessageID, msgs[0].ID,
+		"incremental append must preserve the existing message row")
+	assert.Equal(t, "hello", msgs[0].Content)
+	assert.Equal(t, "world", msgs[1].Content)
+	assert.Equal(t, []string{"user", "assistant"},
+		[]string{msgs[0].Role, msgs[1].Role})
 
 	// Verify session_id on all messages.
-	msgs := fetchMessages(t, env.db, "codex:inc-cx")
 	for i, m := range msgs {
 		assert.Equal(t, "codex:inc-cx", m.SessionID, "msgs[%d].SessionID = %q, want codex:inc-cx", i, m.SessionID)
 	}
+
+	sess, err := env.db.GetSessionFull(context.Background(), "codex:inc-cx")
+	require.NoError(t, err, "GetSessionFull after append")
+	require.NotNil(t, sess)
+	assert.True(t, sess.LastWriteIncremental)
+	assert.Equal(t, 2, sess.NextOrdinal)
+	assert.Equal(t, 2, sess.MessageCount)
+	assert.Equal(t, 1, sess.UserMessageCount)
+}
+
+func TestSyncPathsCodexSameStatInPlaceRewriteUsesContentHash(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f5"
+	original := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "alpha request", tsEarlyS1),
+	)
+	rewritten := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "bravo request", tsEarlyS1),
+	)
+	require.Len(t, rewritten, len(original), "transcript fixtures must have equal length")
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", original,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.FileHash)
+	beforeHash := *before.FileHash
+	beforeInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	env.engine.InjectSkipCache(map[string]int64{
+		path: beforeInfo.ModTime().UnixNano(),
+	})
+
+	require.NoError(t, os.WriteFile(path, []byte(rewritten), 0o644))
+	require.NoError(t, os.Chtimes(path, beforeInfo.ModTime(), beforeInfo.ModTime()))
+	afterInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, beforeInfo.Size(), afterInfo.Size(), "rewrite must keep file size")
+	require.Equal(t, beforeInfo.ModTime(), afterInfo.ModTime(), "rewrite must keep mtime")
+	require.True(t, os.SameFile(beforeInfo, afterInfo), "rewrite must keep file identity")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "bravo request", msgs[0].Content)
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.FileHash)
+	assert.False(t, after.LastWriteIncremental,
+		"same-size rewrite must use a full replacement")
+	assert.NotEqual(t, beforeHash, *after.FileHash)
+	wantHash, err := sync.ComputeFileHash(path)
+	require.NoError(t, err)
+	assert.Equal(t, wantHash, *after.FileHash)
+}
+
+func TestSyncAllCodexPathRewriterSameStatRewriteUsesContentHash(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	database := dbtest.OpenTestDB(t)
+	firstRoot := filepath.Join(t.TempDir(), "sessions")
+	secondRoot := filepath.Join(t.TempDir(), "sessions")
+	const (
+		uuid       = "019eb791-cf7d-75c1-8439-9ed74c1229f6"
+		remoteRoot = "/home/test/.codex/sessions"
+	)
+	original := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "alpha request", tsEarlyS1),
+	)
+	rewritten := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "bravo request", tsEarlyS1),
+	)
+	require.Len(t, rewritten, len(original), "transcript fixtures must have equal length")
+	relPath := filepath.Join(
+		"2024", "01", "01",
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	firstPath := filepath.Join(firstRoot, relPath)
+	secondPath := filepath.Join(secondRoot, relPath)
+	dbtest.WriteTestFile(t, firstPath, []byte(original))
+	firstInfo, err := os.Stat(firstPath)
+	require.NoError(t, err)
+	dbtest.WriteTestFile(t, secondPath, []byte(rewritten))
+	require.NoError(t, os.Chtimes(secondPath, firstInfo.ModTime(), firstInfo.ModTime()))
+	secondInfo, err := os.Stat(secondPath)
+	require.NoError(t, err)
+	require.Equal(t, firstInfo.Size(), secondInfo.Size())
+	require.Equal(t, firstInfo.ModTime(), secondInfo.ModTime())
+
+	rewriter := func(path string) string {
+		for _, root := range []string{firstRoot, secondRoot} {
+			rel, relErr := filepath.Rel(root, path)
+			if relErr == nil && !strings.HasPrefix(rel, "..") {
+				return "host:" + filepath.ToSlash(filepath.Join(remoteRoot, rel))
+			}
+		}
+		return "host:" + filepath.ToSlash(path)
+	}
+	firstEngine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {firstRoot}},
+		Machine:   "host", IDPrefix: "host~", PathRewriter: rewriter, Ephemeral: true,
+	})
+	runSyncAndAssert(t, firstEngine, sync.SyncStats{TotalSessions: 1, Synced: 1})
+	before, err := database.GetSessionFull(context.Background(), "host~codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.FileHash)
+	beforeHash := *before.FileHash
+
+	secondEngine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {secondRoot}},
+		Machine:   "host", IDPrefix: "host~", PathRewriter: rewriter, Ephemeral: true,
+	})
+	runSyncAndAssert(t, secondEngine, sync.SyncStats{TotalSessions: 1, Synced: 1})
+
+	msgs := fetchMessages(t, database, "host~codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "bravo request", msgs[0].Content)
+	after, err := database.GetSessionFull(context.Background(), "host~codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.FileHash)
+	assert.False(t, after.LastWriteIncremental)
+	assert.NotEqual(t, beforeHash, *after.FileHash)
+	wantHash, err := sync.ComputeFileHash(secondPath)
+	require.NoError(t, err)
+	assert.Equal(t, wantHash, *after.FileHash)
+}
+
+func TestIncrementalSync_CodexLifecycleTailUpdatesTermination(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e7"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:02Z","payload":{"type":"task_complete"}}`,
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	before := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, before, 1)
+	firstMessageID := before[0].ID
+	sess, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after initial parse")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "awaiting_user", *sess.TerminationStatus)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for task_started append")
+	_, err = f.WriteString(
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:03Z","payload":{"type":"task_started"}}` + "\n",
+	)
+	require.NoError(t, err, "append task_started")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after task_started")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "tool_call_pending", *sess.TerminationStatus)
+	assert.True(t, sess.LastWriteIncremental)
+	afterStarted := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, afterStarted, 1)
+	assert.Equal(t, firstMessageID, afterStarted[0].ID,
+		"message-less lifecycle tail must not replace messages")
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for task_complete append")
+	_, err = f.WriteString(
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:04Z","payload":{"type":"task_complete"}}` + "\n",
+	)
+	require.NoError(t, err, "append task_complete")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after task_complete")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "awaiting_user", *sess.TerminationStatus)
+	assert.True(t, sess.LastWriteIncremental)
+	afterComplete := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, afterComplete, 1)
+	assert.Equal(t, firstMessageID, afterComplete[0].ID)
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for message-bearing lifecycle append")
+	_, err = f.WriteString(testjsonl.JoinJSONL(
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:05Z","payload":{"type":"task_started"}}`,
+		testjsonl.CodexMsgJSON(
+			"assistant", "working", "2024-01-01T10:00:06Z",
+		),
+	))
+	require.NoError(t, err, "append message-bearing lifecycle tail")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after message-bearing tail")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "tool_call_pending", *sess.TerminationStatus)
+	assert.True(t, sess.LastWriteIncremental)
+	afterMessage := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, afterMessage, 2)
+	assert.Equal(t, firstMessageID, afterMessage[0].ID)
+	assert.Equal(t, "working", afterMessage[1].Content)
+}
+
+func TestIncrementalSync_CodexStaleProjectForcesFullReparse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e8"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/home/user/code/agentsview", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.Equal(t, "agentsview", before.Project)
+	require.NoError(t, env.db.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec(
+			"UPDATE sessions SET project = ? WHERE id = ?",
+			"roborev_ci_28293_3831737461", "codex:"+uuid,
+		)
+		return err
+	}))
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(
+		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5) + "\n",
+	)
+	require.NoError(t, err, "append assistant message")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, "agentsview", after.Project)
+	assert.False(t, after.LastWriteIncremental,
+		"project repair must use the authoritative full parse")
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 2)
+}
+
+func TestSyncSingleSessionCodexAppendForcesFullReplacement(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e9"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Original title"}`+"\n",
+	), 0o644))
+	env.engine.SyncAll(context.Background(), nil)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(
+		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5) + "\n",
+	)
+	require.NoError(t, err, "append assistant message")
+	require.NoError(t, f.Close())
+
+	require.NoError(t, env.engine.SyncSingleSession("codex:"+uuid))
+
+	sess, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.SessionName)
+	assert.Equal(t, "Original title", *sess.SessionName)
+	assert.False(t, sess.LastWriteIncremental,
+		"per-file ForceParse must take the full replacement path")
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, []string{"hello", "world"},
+		[]string{msgs[0].Content, msgs[1].Content})
+}
+
+func TestSyncPathsCodexEqualFingerprintTitleOnlyRefreshesName(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229eb"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "keep this message", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Original title"}`+"\n",
+	), 0o644))
+	transcriptTime := time.Now().Add(-2 * time.Hour)
+	indexTime := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, transcriptTime, transcriptTime))
+	require.NoError(t, os.Chtimes(indexPath, indexTime, indexTime))
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	require.NotNil(t, before.FileSize)
+	require.NotNil(t, before.FileMtime)
+	assert.Equal(t, "Original title", *before.SessionName)
+	rolloutInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, rolloutInfo.Size(), *before.FileSize,
+		"stored transcript size precondition")
+	require.Less(t, rolloutInfo.ModTime().UnixNano(), *before.FileMtime,
+		"index mtime must determine the composite fingerprint")
+
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Renamed title"}`+"\n",
+	), 0o644))
+	storedMtime := time.Unix(0, *before.FileMtime)
+	require.NoError(t, os.Chtimes(indexPath, storedMtime, storedMtime),
+		"restore index mtime after title-only rewrite")
+	indexInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+	require.Equal(t, *before.FileMtime, indexInfo.ModTime().UnixNano(),
+		"title-only rewrite keeps the stored composite mtime")
+
+	env.engine.SyncPaths([]string{path})
+
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "Renamed title", *after.SessionName)
+	assert.False(t, after.LastWriteIncremental,
+		"title refresh must use an authoritative full replacement")
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "keep this message", msgs[0].Content)
+}
+
+func TestSyncPathsCodexIndexEventReloadsSameStatTitle(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f7"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "keep this message", tsEarlyS1),
+	)
+	env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, parser.CodexSessionIndexFilename)
+	original := `{"id":"` + uuid + `","thread_name":"Alpha title"}` + "\n"
+	rewritten := `{"id":"` + uuid + `","thread_name":"Bravo title"}` + "\n"
+	require.Len(t, rewritten, len(original), "index fixtures must have equal length")
+	require.NoError(t, os.WriteFile(indexPath, []byte(original), 0o644))
+	stableTime := time.Unix(1_800_000_000, 456_000_000)
+	require.NoError(t, os.Chtimes(indexPath, stableTime, stableTime))
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	assert.Equal(t, "Alpha title", *before.SessionName)
+	indexInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(indexPath, []byte(rewritten), 0o644))
+	require.NoError(t, os.Chtimes(indexPath, indexInfo.ModTime(), indexInfo.ModTime()))
+	rewrittenInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+	require.Equal(t, indexInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, indexInfo.ModTime(), rewrittenInfo.ModTime())
+
+	env.engine.SyncPaths([]string{indexPath})
+
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "Bravo title", *after.SessionName)
+	assert.False(t, after.LastWriteIncremental,
+		"index event refresh must use a full replacement")
+}
+
+func TestWatcherOverflowReloadsSameStatCodexIndexTitle(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f8"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "keep overflow message", tsEarlyS1),
+	)
+	env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, parser.CodexSessionIndexFilename)
+	original := `{"id":"` + uuid + `","thread_name":"Alpha title"}` + "\n"
+	rewritten := `{"id":"` + uuid + `","thread_name":"Bravo title"}` + "\n"
+	require.Len(t, rewritten, len(original), "index fixtures must have equal length")
+	require.NoError(t, os.WriteFile(indexPath, []byte(original), 0o644))
+	stableTime := time.Unix(1_800_000_001, 456_000_000)
+	require.NoError(t, os.Chtimes(indexPath, stableTime, stableTime))
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	assert.Equal(t, "Alpha title", *before.SessionName)
+	indexInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(indexPath, []byte(rewritten), 0o644))
+	require.NoError(t, os.Chtimes(indexPath, indexInfo.ModTime(), indexInfo.ModTime()))
+	rewrittenInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+	require.Equal(t, indexInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, indexInfo.ModTime(), rewrittenInfo.ModTime())
+
+	stats := env.engine.SyncAllAfterWatcherOverflow(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "Bravo title", *after.SessionName)
+	assert.False(t, after.LastWriteIncremental)
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "keep overflow message", msgs[0].Content)
 }
 
 // TestIncrementalSync_CodexStoresEffectiveMtime pins that the incremental
@@ -9747,6 +10290,8 @@ func TestIncrementalSync_CodexStoresEffectiveMtime(t *testing.T) {
 	require.NoError(t, err, "GetSessionFull")
 	require.NotNil(t, sess, "session present")
 	require.NotNil(t, sess.FileMtime, "file_mtime stored")
+	assert.True(t, sess.LastWriteIncremental,
+		"an unchanged-title append should stay on the incremental path")
 
 	// Compare against re-stats (not the requested Chtimes values) so the
 	// assertion is robust to filesystem mtime granularity.
@@ -9760,7 +10305,7 @@ func TestIncrementalSync_CodexStoresEffectiveMtime(t *testing.T) {
 		"effective mtime exceeds the plain rollout mtime")
 }
 
-func TestIncrementalSync_CodexAppendFullReparseStoresRawFileSize(t *testing.T) {
+func TestIncrementalSync_CodexPartialTailCommitsOnlySafeRecords(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -9780,14 +10325,18 @@ func TestIncrementalSync_CodexAppendFullReparseStoresRawFileSize(t *testing.T) {
 	env.engine.SyncAll(context.Background(), nil)
 	assertSessionMessageCount(t, env.db, "codex:"+uuid, 1)
 
-	appended := testjsonl.JoinJSONL(
+	completeTail := testjsonl.JoinJSONL(
 		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5),
 	)
+	partialLine := testjsonl.CodexMsgJSON(
+		"assistant", "completed later", "2024-01-01T10:00:10Z",
+	)
+	partialAt := len(partialLine) / 2
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err, "open for append")
-	_, err = f.WriteString(appended)
+	_, err = f.WriteString(completeTail)
 	require.NoError(t, err, "append complete message")
-	_, err = f.WriteString(`{"timestamp":"2024-01-01T10:00:10Z"`)
+	_, err = f.WriteString(partialLine[:partialAt])
 	require.NoError(t, err, "append partial trailing JSON")
 	require.NoError(t, f.Close(), "close after append")
 
@@ -9799,20 +10348,166 @@ func TestIncrementalSync_CodexAppendFullReparseStoresRawFileSize(t *testing.T) {
 	require.NotNil(t, sess, "session present")
 	require.NotNil(t, sess.FileSize, "file_size stored")
 	require.NotNil(t, sess.FileHash, "file_hash stored")
+	require.True(t, sess.LastWriteIncremental)
 
-	live, err := os.ReadFile(path)
+	safeSize := int64(len(initial) + len(completeTail))
+	require.Equal(t, safeSize, *sess.FileSize,
+		"incremental cursor stops before the partial record")
+	safePrefix, err := os.ReadFile(path)
 	require.NoError(t, err, "read live transcript")
-	// Codex does not advertise incremental append, so re-syncing the appended
-	// transcript is a full re-parse that stores the raw file size and hash
-	// (including the ignored partial trailing line). The parsed-snapshot vs
-	// partial-tail distinction is enforced at parse-diff time via
-	// CodexTranscriptConsumedSize, not in the stored fingerprint.
-	require.Equal(t, int64(len(live)), *sess.FileSize,
-		"full Codex re-parse stores the raw file size")
-	sum := sha256.Sum256(live)
+	sum := sha256.Sum256(safePrefix[:safeSize])
 	wantHash := fmt.Sprintf("%x", sum[:])
 	assert.Equal(t, wantHash, *sess.FileHash,
-		"stored Codex hash matches the whole-file fingerprint")
+		"stored Codex hash covers only the committed safe prefix")
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "reopen for append")
+	_, err = f.WriteString(partialLine[partialAt:] + "\n")
+	require.NoError(t, err, "complete partial record")
+	_, err = f.WriteString(testjsonl.CodexMsgJSON(
+		"assistant", "after partial", "2024-01-01T10:00:11Z",
+	) + "\n")
+	require.NoError(t, err, "append later record")
+	require.NoError(t, f.Close(), "close completed transcript")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 4)
+	assert.Equal(t, []string{
+		"hello", "world", "completed later", "after partial",
+	}, []string{msgs[0].Content, msgs[1].Content, msgs[2].Content, msgs[3].Content})
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after partial completion")
+	require.NotNil(t, sess)
+	info, err := os.Stat(path)
+	require.NoError(t, err, "stat completed transcript")
+	require.NotNil(t, sess.FileSize)
+	assert.Equal(t, info.Size(), *sess.FileSize)
+	assert.True(t, sess.LastWriteIncremental)
+}
+
+func TestIncrementalSync_CodexZeroConsumedPartialTailRetriesAtSameMtime(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229ec"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	completeLine := testjsonl.CodexMsgJSON(
+		"assistant", "arrived after partial write", tsEarlyS5,
+	)
+	partialAt := len(completeLine) / 2
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open transcript for partial append")
+	_, err = f.WriteString(completeLine[:partialAt])
+	require.NoError(t, err, "append incomplete record")
+	require.NoError(t, f.Close())
+	fixedMtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(path, fixedMtime, fixedMtime))
+
+	env.engine.SyncPaths([]string{path})
+
+	intermediate, err := env.db.GetSessionFull(
+		context.Background(), "codex:"+uuid,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, intermediate)
+	require.NotNil(t, intermediate.FileSize)
+	assert.Equal(t, int64(len(initial)), *intermediate.FileSize,
+		"an incomplete record must not advance the committed offset")
+	assert.Equal(t, 1, intermediate.MessageCount)
+	assert.False(t, intermediate.LastWriteIncremental,
+		"zero consumed bytes must not write an incremental update")
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "reopen transcript to complete record")
+	_, err = f.WriteString(completeLine[partialAt:] + "\n")
+	require.NoError(t, err, "complete record")
+	require.NoError(t, f.Close())
+	require.NoError(t, os.Chtimes(path, fixedMtime, fixedMtime),
+		"restore the exact mtime cached by the partial pass")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, []string{"hello", "arrived after partial write"},
+		[]string{msgs[0].Content, msgs[1].Content})
+	final, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, final)
+	require.NotNil(t, final.FileSize)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, info.Size(), *final.FileSize)
+	assert.True(t, final.LastWriteIncremental)
+}
+
+func TestIncrementalSync_CodexUnsafeStoredOffsetForcesFullReparse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229ea"
+	safePrefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	completedLine := testjsonl.CodexMsgJSON(
+		"assistant", "completed record", tsEarlyS5,
+	)
+	partialAt := len(completedLine) / 2
+	unsafeSnapshot := safePrefix + completedLine[:partialAt]
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+		unsafeSnapshot,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	initial, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, initial)
+	require.NotNil(t, initial.FileSize)
+	assert.Equal(t, int64(len(unsafeSnapshot)), *initial.FileSize,
+		"full parse records the raw snapshot size even when it ends mid-record")
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 1)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open unsafe snapshot for completion")
+	_, err = f.WriteString(completedLine[partialAt:] + "\n")
+	require.NoError(t, err, "complete stored mid-record line")
+	_, err = f.WriteString(testjsonl.CodexMsgJSON(
+		"assistant", "later record", "2024-01-01T10:00:06Z",
+	) + "\n")
+	require.NoError(t, err, "append later record")
+	require.NoError(t, f.Close())
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 3)
+	assert.Equal(t, []string{"hello", "completed record", "later record"},
+		[]string{msgs[0].Content, msgs[1].Content, msgs[2].Content})
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.False(t, after.LastWriteIncremental,
+		"unsafe stored offset must force an authoritative message replacement")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NotNil(t, after.FileSize)
+	assert.Equal(t, info.Size(), *after.FileSize)
 }
 
 func TestIncrementalSync_CodexExecAppendRetainsEvents(t *testing.T) {
@@ -10071,6 +10766,8 @@ func TestIncrementalSync_CodexIndexRenameBelowStoredMtimeRefreshesName(t *testin
 	if assert.NotNil(t, sess.SessionName, "expected renamed session_name") {
 		assert.Equal(t, "Renamed title", *sess.SessionName)
 	}
+	assert.False(t, sess.LastWriteIncremental,
+		"a changed title must force an authoritative full replacement")
 	// The incremental append must still have landed.
 	msgs := fetchMessages(t, env.db, "codex:"+uuid)
 	require.Len(t, msgs, 2)

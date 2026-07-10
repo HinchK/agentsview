@@ -36,11 +36,12 @@ var (
 )
 
 const (
-	periodicSyncInterval  = 15 * time.Minute
-	telemetryPingInterval = 24 * time.Hour
-	unwatchedPollInterval = 2 * time.Minute
-	watcherDebounce       = 500 * time.Millisecond
-	recursiveWatchBudget  = 8192
+	periodicSyncInterval   = 15 * time.Minute
+	telemetryPingInterval  = 24 * time.Hour
+	unwatchedPollInterval  = 2 * time.Minute
+	watcherBatchDelay      = 500 * time.Millisecond
+	watcherSyncMinInterval = 5 * time.Second
+	recursiveWatchBudget   = 8192
 )
 
 func main() {
@@ -365,14 +366,14 @@ func runServe(cfg config.Config, opts serveOptions) {
 		// debounced signal recomputes.
 		defer engine.Close()
 		stopWatcher, unwatchedDirs := startFileWatcher(
-			cfg, engine, func(paths []string) {
+			cfg, engine, func(batch sync.WatchBatch) {
 				idleTracker.Do(func() {
 					// The serve ctx must reach watcher-driven syncs:
 					// stopWatcher waits for the in-flight callback, so
 					// a sync that ignored SIGTERM would hold shutdown
 					// open until the service manager escalates to
 					// SIGKILL.
-					engine.SyncPathsContext(ctx, paths)
+					syncWatchBatch(ctx, engine, batch)
 				})
 			},
 		)
@@ -1021,10 +1022,15 @@ func formatByteProgress(p sync.Progress) string {
 }
 
 func startFileWatcher(
-	cfg config.Config, engine *sync.Engine, onChange func(paths []string),
+	cfg config.Config, engine *sync.Engine, onChange func(batch sync.WatchBatch),
 ) (stopWatcher func(), unwatchedDirs []string) {
 	t := time.Now()
-	watcher, err := sync.NewWatcher(watcherDebounce, onChange, cfg.WatchExcludePatterns)
+	watcher, err := sync.NewWatcherWithInterval(
+		watcherBatchDelay,
+		watcherSyncMinInterval,
+		onChange,
+		cfg.WatchExcludePatterns,
+	)
 	if err != nil {
 		log.Printf(
 			"warning: file watcher unavailable: %v"+
@@ -1084,6 +1090,19 @@ func startFileWatcher(
 	}
 	watcher.Start()
 	return watcher.Stop, unwatchedDirs
+}
+
+type watchSyncer interface {
+	SyncPathsContext(context.Context, []string)
+	SyncAllAfterWatcherOverflow(context.Context, sync.ProgressFunc) sync.SyncStats
+}
+
+func syncWatchBatch(ctx context.Context, engine watchSyncer, batch sync.WatchBatch) {
+	if batch.FullSync {
+		engine.SyncAllAfterWatcherOverflow(ctx, nil)
+		return
+	}
+	engine.SyncPathsContext(ctx, batch.Paths)
 }
 
 type watchRoot struct {

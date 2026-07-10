@@ -1369,7 +1369,7 @@ func (e *Engine) resyncAllLocked(
 		"",
 	)
 	stats = e.syncAllLocked(
-		ctx, reportResyncProgress, time.Time{}, nil, syncWriteBulk, true,
+		ctx, reportResyncProgress, time.Time{}, nil, syncWriteBulk, true, false,
 	)
 	e.db = origDB // restore immediately
 	e.openCodeArchiveStore = nil
@@ -1779,13 +1779,13 @@ func (e *Engine) SyncThenRun(
 		if stats.Aborted && ctx.Err() == nil {
 			stats = e.syncAllLocked(
 				ctx, onProgress, time.Time{}, nil,
-				syncWriteDefault, true,
+				syncWriteDefault, true, false,
 			)
 		}
 	} else {
 		stats = e.syncAllLocked(
 			ctx, onProgress, time.Time{}, nil,
-			syncWriteDefault, true,
+			syncWriteDefault, true, false,
 		)
 	}
 	if ctx.Err() != nil {
@@ -1834,7 +1834,34 @@ func (e *Engine) SyncAll(
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
 	stats = e.syncAllLocked(
-		ctx, onProgress, time.Time{}, nil, syncWriteDefault, true,
+		ctx, onProgress, time.Time{}, nil, syncWriteDefault, true, false,
+	)
+	return
+}
+
+// SyncAllAfterWatcherOverflow performs a full discovery pass after the watcher
+// coalesced too many distinct paths to retain them individually. A routine
+// SyncAll is insufficient here: the discarded paths may be the only signal for
+// same-stat rewrites. Clear event-sensitive trust and force every discovered
+// file through its authoritative parse path before rebuilding those caches.
+func (e *Engine) SyncAllAfterWatcherOverflow(
+	ctx context.Context, onProgress ProgressFunc,
+) (stats SyncStats) {
+	if e.refuseWriteInForceParse("SyncAllAfterWatcherOverflow") {
+		return SyncStats{}
+	}
+	e.syncMu.Lock()
+	defer func() {
+		if stats.Synced > 0 {
+			e.emit("sessions")
+		}
+	}()
+	defer e.syncMu.Unlock()
+	defer e.clearCurrentProgress()
+
+	e.clearWatcherOverflowCaches()
+	stats = e.syncAllLocked(
+		ctx, onProgress, time.Time{}, nil, syncWriteDefault, true, true,
 	)
 	return
 }
@@ -1861,7 +1888,7 @@ func (e *Engine) SyncAllSince(
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
 	stats = e.syncAllLocked(
-		ctx, onProgress, since, nil, syncWriteDefault, true,
+		ctx, onProgress, since, nil, syncWriteDefault, true, false,
 	)
 	return
 }
@@ -1886,7 +1913,7 @@ func (e *Engine) SyncRootsSince(
 	defer e.clearCurrentProgress()
 	scope := newRootSyncScope(roots)
 	stats = e.syncAllLocked(
-		ctx, onProgress, since, scope, syncWriteDefault, scope == nil,
+		ctx, onProgress, since, scope, syncWriteDefault, scope == nil, false,
 	)
 	return
 }
@@ -1959,6 +1986,7 @@ func samePathOrDescendant(path, root string) bool {
 func (e *Engine) syncAllLocked(
 	ctx context.Context, onProgress ProgressFunc, since time.Time,
 	scope *rootSyncScope, writeMode syncWriteMode, recordSyncState bool,
+	forceDiscoveredFiles bool,
 ) (stats SyncStats) {
 	if ctx.Err() != nil {
 		return SyncStats{Aborted: true}
@@ -2028,6 +2056,11 @@ func (e *Engine) syncAllLocked(
 	}
 	all = e.dedupeClaudeDiscoveredFiles(all)
 	all = e.filterShadowedLegacyKiroFiles(all)
+	if forceDiscoveredFiles {
+		for i := range all {
+			all[i].ForceParse = true
+		}
+	}
 
 	verbose := onProgress == nil
 
@@ -3635,6 +3668,7 @@ type incrementalUpdate struct {
 	cwd                  string
 	msgs                 []parser.ParsedMessage
 	endedAt              time.Time
+	terminationStatus    *string
 	msgCount             int // total (old + new)
 	userMsgCount         int // total (old + new)
 	fileSize             int64
@@ -3675,11 +3709,10 @@ type processResult struct {
 	// skip-cache writes so same-mtime object rewrites do not stay
 	// hidden behind a cached parse failure or non-interactive result.
 	sourceFingerprint string
-	// noCacheSkip suppresses skip-cache recording for an errored
-	// result even when cacheSkip is set for the agent. Read/scan
-	// failures are transient: a permission or readability fix may
-	// not change the file mtime, so caching the failure by mtime
-	// would silently skip the file on later syncs instead of
+	// noCacheSkip suppresses skip-cache recording even when cacheSkip is set
+	// for the agent. Read/scan failures and incomplete append boundaries are
+	// transient: a readability fix or completed record may retain the same file
+	// mtime, so caching either result would silently skip later work instead of
 	// retrying it.
 	noCacheSkip bool
 	needsRetry  bool
@@ -3993,6 +4026,13 @@ func (e *Engine) processProviderFile(
 				e.clearSkip(cacheKey)
 			} else if e.pathNeedsCachedSkipBypass(file.Path) {
 				e.clearSkip(cacheKey)
+			} else if file.Agent == parser.AgentCodex &&
+				e.codexCachedIndexSessionNameChanged(file.Path) {
+				// The transcript fingerprint can remain byte-for-byte identical
+				// while session_index.jsonl changes this session's title. Do not
+				// let a pre-existing transcript skip entry hide that metadata
+				// refresh; non-Codex providers avoid the index lookup entirely.
+				e.clearSkip(cacheKey)
 			} else {
 				return processResult{
 					skip:      true,
@@ -4128,7 +4168,7 @@ func (e *Engine) processProviderFile(
 		forceReplace:          outcome.ForceReplace || incForceReplace,
 		suppressPresenceSweep: !outcome.ResultSetComplete,
 	}
-	// Incremental-append providers (Claude) need the stored file
+	// Incremental-append providers (Claude and Codex) need the stored file
 	// identity so a later sync can detect an atomic file replacement
 	// (new inode/device) and fall back to a full parse instead of
 	// appending on top of stale state. Match the legacy process arm,
@@ -4455,15 +4495,28 @@ func providerProcessCacheKeyWithHash(
 	if key == "" {
 		return ""
 	}
-	if fingerprint.Hash == "" || !providerFingerprintHashRequiredForFreshness(agent) {
+	if fingerprint.Hash == "" || !providerFingerprintHashInCacheKey(agent) {
 		return key
 	}
 	return key + "?source_hash=" + fingerprint.Hash
 }
 
-func providerFingerprintHashRequiredForFreshness(agent parser.AgentType) bool {
+func providerFingerprintHashInCacheKey(agent parser.AgentType) bool {
 	switch agent {
 	case parser.AgentDevin, parser.AgentQoder, parser.AgentWindsurf:
+		return true
+	default:
+		return false
+	}
+}
+
+// providerFingerprintHashRequiredForFreshness is deliberately broader than
+// providerFingerprintHashInCacheKey. Codex hashes every transcript to verify a
+// same-stat rewrite against the persisted row, but retaining one skip-cache key
+// per content version would make the cache grow with a hot append-only file.
+func providerFingerprintHashRequiredForFreshness(agent parser.AgentType) bool {
+	switch agent {
+	case parser.AgentCodex, parser.AgentDevin, parser.AgentQoder, parser.AgentWindsurf:
 		return true
 	default:
 		return false
@@ -4485,6 +4538,17 @@ func (e *Engine) providerSkipCacheEntryFreshInDB(
 	lookupPath := providerSkipLookupPath(file, source, fingerprint)
 	if e.pathRewriter != nil {
 		lookupPath = e.pathRewriter(lookupPath)
+	}
+	if agent == parser.AgentCodex {
+		storedIDs, err := e.db.ListSessionIDsByFilePath(
+			lookupPath, string(parser.AgentCodex),
+		)
+		if err == nil && len(storedIDs) == 0 {
+			// A cached parse failure has no persisted source row or hash to
+			// compare. Retain its retry suppression until a source signal changes;
+			// hash validation applies once a session has actually been stored.
+			return true
+		}
 	}
 	return e.providerFingerprintHashMatchesDB(agent, lookupPath, fingerprint)
 }
@@ -4675,6 +4739,24 @@ func (e *Engine) clearSkip(path string) {
 	_ = e.db.DeleteSkippedFile(path)
 }
 
+// clearWatcherOverflowCaches invalidates every freshness shortcut whose
+// correctness can depend on receiving a concrete changed path. The following
+// forced discovery pass rebuilds these caches from parsed source state.
+func (e *Engine) clearWatcherOverflowCaches() {
+	e.skipMu.Lock()
+	e.skipCache = make(map[string]int64)
+	e.skipFingerprints = make(map[string]string)
+	e.skipMu.Unlock()
+	if !e.ephemeral {
+		if err := e.db.ReplaceSkippedFiles(map[string]int64{}); err != nil {
+			log.Printf("clearing skipped files after watcher overflow: %v", err)
+		}
+	}
+	e.clearTrustedOpenCodeStorageSessions()
+	e.clearTrustedSQLiteContainers()
+	parser.EvictAllCodexSessionIndexes()
+}
+
 // InjectSkipCache merges entries into the in-memory skip
 // cache. Used by remote sync to pre-populate with
 // translated paths.
@@ -4854,6 +4936,9 @@ func (e *Engine) providerSingleSessionFresh(
 	// append-only incremental path. Its source stem is the session ID,
 	// so DB freshness can be checked by that ID even though a DAG fork
 	// can later split the file into several sessions.
+	if provider.Definition().Type != parser.AgentClaude {
+		return 0, false, false
+	}
 	if provider.Capabilities().Source.IncrementalAppend !=
 		parser.CapabilitySupported {
 		return 0, false, false
@@ -5000,12 +5085,13 @@ func (e *Engine) providerSourceFreshBeforeFingerprint(
 	return 0, false
 }
 
-// stampProviderFileIdentity copies the source file's inode and device onto
-// every parsed result for an incremental-append provider (Claude). The
-// legacy process arm stamped this identity from the source stat so the
-// incremental path can later detect an atomic file replacement and fall
-// back to a full parse. Providers whose source is not a single physical
-// file, or that do not support incremental append, are left untouched.
+// stampProviderFileIdentity fills a missing source inode/device on parsed
+// results for an incremental-append provider. A provider may have captured an
+// authoritative identity from the same descriptor it parsed, so a later path
+// stat must not overwrite that snapshot after an atomic replacement. The
+// legacy Claude process arm relies on this fallback because Claude does not
+// supply descriptor identity itself. Providers whose source is not a single
+// physical file, or that do not support incremental append, are left untouched.
 func (e *Engine) stampProviderFileIdentity(
 	provider parser.Provider,
 	source parser.SourceRef,
@@ -5025,6 +5111,10 @@ func (e *Engine) stampProviderFileIdentity(
 	}
 	inode, device := getFileIdentity(info)
 	for i := range results {
+		if results[i].Session.File.Inode != 0 ||
+			results[i].Session.File.Device != 0 {
+			continue
+		}
 		results[i].Session.File.Inode = inode
 		results[i].Session.File.Device = device
 	}
@@ -5032,7 +5122,7 @@ func (e *Engine) stampProviderFileIdentity(
 
 // tryProviderIncrementalAppend reproduces the legacy incremental-append
 // sync path for a provider-authoritative agent that supports append-only
-// incremental parsing (Claude). The provider owns the byte-offset parse
+// incremental parsing (Claude or Codex). The provider owns the byte-offset parse
 // via ParseIncremental, but the engine still owns the DB-aware
 // bookkeeping (session lookup, data-version and identity guards, ordinal
 // resume, cross-sync split detection, and cumulative counters), so this
@@ -5049,7 +5139,9 @@ func (e *Engine) tryProviderIncrementalAppend(
 ) (processResult, bool) {
 	// Match the legacy tryIncrementalJSONL gate, which suppressed append
 	// deltas only under the engine-wide forceParse (parse-diff) flag. A
-	// per-file ForceParse does not disable incremental append.
+	// per-file ForceParse keeps Claude on its incremental path; Codex is the
+	// explicit exception below because a single-session refresh must rebuild
+	// head-derived metadata.
 	if e.forceParse {
 		return processResult{}, false
 	}
@@ -5061,20 +5153,31 @@ func (e *Engine) tryProviderIncrementalAppend(
 	if path == "" {
 		return processResult{}, false
 	}
+	if provider.Definition().Type == parser.AgentCodex &&
+		(file.ForceParse ||
+			e.codexIndexSessionNameChanged(path) ||
+			e.pathNeedsProjectReparse(path)) {
+		// Codex incremental parsing intentionally preserves head-derived
+		// metadata. A manual refresh, title change, or stale project needs the
+		// authoritative full parse, and forceReplace prevents the later DB skip
+		// gates from swallowing that refresh.
+		return processResult{forceReplace: true}, false
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return processResult{}, false
 	}
 
 	parseFn := func(
-		_ string, offset int64, startOrdinal int, lastEntryUUID string,
-	) ([]parser.ParsedMessage, time.Time, int64, error) {
+		_ string, sessionID string, offset int64,
+		startOrdinal int, lastEntryUUID string,
+	) ([]parser.ParsedMessage, time.Time, int64, *string, error) {
 		outcome, status, perr := provider.ParseIncremental(
 			ctx,
 			parser.IncrementalRequest{
 				Source:        source,
 				Fingerprint:   fingerprint,
-				SessionID:     e.idPrefix + claudeSessionIDFromPath(path),
+				SessionID:     sessionID,
 				Offset:        offset,
 				StartOrdinal:  startOrdinal,
 				Machine:       e.machine,
@@ -5082,25 +5185,30 @@ func (e *Engine) tryProviderIncrementalAppend(
 			},
 		)
 		if perr != nil {
-			return nil, time.Time{}, 0, perr
+			return nil, time.Time{}, 0, nil, perr
 		}
 		switch status {
 		case parser.IncrementalNeedsFullParse:
 			if outcome.ForceReplace {
 				// Signal the shared helper to fall back to a
 				// full parse that replaces stored messages.
-				return nil, time.Time{}, 0,
+				return nil, time.Time{}, 0, nil,
 					parser.ErrClaudeIncrementalNeedsFullParse
 			}
 			// A plain full-parse fallback (e.g. DAG detected):
 			// return a non-fallback error so the helper runs a
 			// normal full parse without forceReplace.
-			return nil, time.Time{}, 0, parser.ErrDAGDetected
+			return nil, time.Time{}, 0, nil, parser.ErrDAGDetected
 		case parser.IncrementalNoNewData:
-			return nil, time.Time{}, 0, nil
+			return nil, time.Time{}, 0, nil, nil
 		default:
+			var terminationStatus *string
+			if outcome.TerminationStatus != nil {
+				status := string(*outcome.TerminationStatus)
+				terminationStatus = &status
+			}
 			return outcome.Messages, outcome.EndedAt,
-				outcome.ConsumedBytes, nil
+				outcome.ConsumedBytes, terminationStatus, nil
 		}
 	}
 
@@ -5109,13 +5217,14 @@ func (e *Engine) tryProviderIncrementalAppend(
 
 // incrementalParseFunc reads new JSONL lines from a file
 // starting at the given byte offset with the given starting
-// ordinal. Returns parsed messages, the latest timestamp
-// (endedAt), bytes consumed (relative to offset), and any
-// error. The consumed count covers only complete, valid JSON
-// lines so it can be used as a safe resume offset.
+// ordinal and persisted session ID. Returns parsed messages, the latest
+// timestamp (endedAt), bytes consumed (relative to offset), an optional
+// authoritative termination status, and any error. The consumed count covers
+// only complete, valid JSON lines so it can be used as a safe resume offset.
 type incrementalParseFunc func(
-	path string, offset int64, startOrdinal int, lastEntryUUID string,
-) ([]parser.ParsedMessage, time.Time, int64, error)
+	path string, sessionID string, offset int64,
+	startOrdinal int, lastEntryUUID string,
+) ([]parser.ParsedMessage, time.Time, int64, *string, error)
 
 // tryIncrementalJSONL attempts an incremental parse of an
 // append-only JSONL file by reading only bytes appended since
@@ -5211,6 +5320,12 @@ func (e *Engine) tryIncrementalJSONL(
 		return processResult{forceReplace: true}, false
 	}
 	if currentSize == inc.FileSize {
+		if agent == parser.AgentCodex {
+			// Codex's composite mtime can change when session_index.jsonl does,
+			// even though the transcript has no new bytes. Let the later Codex
+			// fingerprint/title check decide whether to skip or full-parse.
+			return processResult{}, false
+		}
 		log.Printf(
 			"incremental %s %s: file size unchanged at %d but changed since last sync, full parse",
 			agent, file.Path, currentSize,
@@ -5232,8 +5347,8 @@ func (e *Engine) tryIncrementalJSONL(
 		incMtime = parser.CodexEffectiveMtime(file.Path, incMtime)
 	}
 
-	newMsgs, endedAt, consumed, err := parseFn(
-		file.Path, inc.FileSize, inc.NextOrdinal, inc.LastEntryUUID,
+	newMsgs, endedAt, consumed, terminationStatus, err := parseFn(
+		file.Path, inc.ID, inc.FileSize, inc.NextOrdinal, inc.LastEntryUUID,
 	)
 	if err != nil {
 		if parser.IsIncrementalFullParseFallback(err) {
@@ -5287,6 +5402,7 @@ func (e *Engine) tryIncrementalJSONL(
 					machine:              inc.Machine,
 					cwd:                  inc.Cwd,
 					endedAt:              endedAt,
+					terminationStatus:    terminationStatus,
 					msgCount:             inc.MsgCount,
 					userMsgCount:         inc.UserMsgCount,
 					fileSize:             newOffset,
@@ -5301,7 +5417,12 @@ func (e *Engine) tryIncrementalJSONL(
 				},
 			}, true
 		}
-		return processResult{skip: true}, true
+		// A larger source with no complete record consumed is an unfinished
+		// append, not evidence that this fingerprint is fully processed. Keep
+		// the persisted cursor unchanged and suppress the mtime skip entry so a
+		// completed record is retried even when the writer restores the same
+		// filesystem timestamp.
+		return processResult{skip: true, noCacheSkip: true}, true
 	}
 
 	// Claude cross-sync split detection: when the first appended
@@ -5370,6 +5491,7 @@ func (e *Engine) tryIncrementalJSONL(
 			cwd:                  inc.Cwd,
 			msgs:                 newMsgs,
 			endedAt:              endedAt,
+			terminationStatus:    terminationStatus,
 			msgCount:             inc.MsgCount + len(newMsgs),
 			userMsgCount:         inc.UserMsgCount + newUserCount,
 			fileSize:             newOffset,
@@ -5406,7 +5528,7 @@ func (e *Engine) shouldSkipProviderSourceByDB(
 // shouldSkipCodexFingerprint reproduces the legacy shouldSkipCodex decision in
 // terms of a provider SourceFingerprint. The fingerprint MTimeNS already folds
 // in session_index.jsonl via CodexEffectiveMtime, so:
-//   - a stored size mismatch or stale data version forces a reparse;
+//   - a stored size/hash mismatch or stale data version forces a reparse;
 //   - an exact effective-mtime match skips;
 //   - an effective mtime ahead of the stored mtime driven only by the index
 //     (the raw transcript mtime is still at or below the stored mtime) skips
@@ -5420,6 +5542,11 @@ func (e *Engine) shouldSkipCodexFingerprint(
 	}
 	storedSize, storedMtime, ok := e.db.GetFileInfoByPath(lookupPath)
 	if !ok || storedSize != fingerprint.Size {
+		return false
+	}
+	if !e.providerFingerprintHashMatchesDB(
+		parser.AgentCodex, lookupPath, fingerprint,
+	) {
 		return false
 	}
 	if project, ok := e.db.GetProjectByPath(lookupPath); ok &&
@@ -5484,6 +5611,20 @@ func (e *Engine) codexIndexSessionNameChanged(path string) bool {
 	)
 }
 
+// codexCachedIndexSessionNameChanged limits title-based cache invalidation to
+// sources that already have stored session state. A cached parse failure has no
+// title to refresh and must retain its retry-suppression semantics.
+func (e *Engine) codexCachedIndexSessionNameChanged(path string) bool {
+	lookupPath := path
+	if e.pathRewriter != nil {
+		lookupPath = e.pathRewriter(path)
+	}
+	if _, _, ok := e.db.GetFileInfoByPath(lookupPath); !ok {
+		return false
+	}
+	return e.codexIndexSessionNameChanged(path)
+}
+
 // classifyCodexIndexPath maps a Codex session_index.jsonl change to the
 // session files whose stored title no longer matches the index. The live
 // watcher sees this file only because its parent directory is watched
@@ -5506,6 +5647,7 @@ func (e *Engine) classifyCodexIndexPath(
 	if len(sessionRoots) == 0 {
 		return nil
 	}
+	parser.EvictCodexSessionIndex(path)
 	titles := parser.CodexSessionIndexTitles(path)
 	if len(titles) == 0 {
 		return nil
@@ -7333,6 +7475,7 @@ func (e *Engine) writeIncremental(
 		dbMsgs,
 		db.IncrementalSessionUpdate{
 			EndedAt:              endedAt,
+			TerminationStatus:    inc.terminationStatus,
 			MsgCount:             msgCount,
 			UserMsgCount:         userMsgCount,
 			FileSize:             inc.fileSize,
