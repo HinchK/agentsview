@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Card, Checkbox, SegmentedControl, TextInput } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import SettingsSection from "./SettingsSection.svelte";
   import {
@@ -22,6 +23,17 @@
 
   const explicitLayout = "explicit";
   const repoDotWorktreesLayout = "repo_dot_worktrees";
+
+  const layoutOptions = $derived([
+    { value: explicitLayout, label: m.worktree_layout_explicit({}) },
+    {
+      value: repoDotWorktreesLayout,
+      label: m.worktree_layout_repo_dot_worktrees({
+        repo: "repo",
+        branch: "branch",
+      }),
+    },
+  ]);
 
   let { readOnly = false }: Props = $props();
 
@@ -195,7 +207,11 @@
           <div class="empty">{m.worktree_no_mappings()}</div>
         {:else}
           {#each mappings as mapping (mapping.id)}
-            <div class="mapping-row" class:disabled={!mapping.enabled}>
+            <Card
+              level="inset"
+              padding="none"
+              class={!mapping.enabled ? "mapping-row disabled" : "mapping-row"}
+            >
               <div class="mapping-main">
                 <div class="mapping-project">
                   {mapping.project || (mapping.layout === repoDotWorktreesLayout ? m.worktree_layout_repo_dot_worktrees({ repo: "repo", branch: "branch" }) : m.worktree_layout_explicit({}))}
@@ -211,38 +227,28 @@
                 {m.worktree_delete()}
               </button>
             </div>
-          </div>
+          </Card>
         {/each}
       {/if}
     </div>
 
     <div class="form-grid">
-      <label class="field">
+      <div class="field">
         <span>{m.worktree_layout()}</span>
-        <div class="layout-options" role="group" aria-label={m.worktree_layout()}>
-          <button
-            type="button"
-            class:active={layout === explicitLayout}
-            onclick={() => (layout = explicitLayout)}
-          >
-            {m.worktree_layout_explicit({})}
-          </button>
-          <button
-            type="button"
-            class:active={layout === repoDotWorktreesLayout}
-            onclick={() => (layout = repoDotWorktreesLayout)}
-          >
-            {m.worktree_layout_repo_dot_worktrees({
-              repo: "repo",
-              branch: "branch",
-            })}
-          </button>
-        </div>
-      </label>
+        <SegmentedControl
+          options={layoutOptions}
+          value={layout}
+          block
+          ariaLabel={m.worktree_layout()}
+          onchange={(value) => (layout = value)}
+        />
+      </div>
       <label class="field">
         <span>{isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}</span>
-        <input
+        <TextInput
           type="text"
+          size="md"
+          block
           bind:value={pathPrefix}
           placeholder={isRepoDotWorktrees ? "/Users/me" : "/Users/me/project.worktrees"}
         />
@@ -252,8 +258,10 @@
       </label>
       <label class="field">
         <span>{m.worktree_project()}</span>
-        <input
+        <TextInput
           type="text"
+          size="md"
+          block
           bind:value={project}
           placeholder="project-name"
           disabled={isRepoDotWorktrees}
@@ -262,10 +270,7 @@
           {isRepoDotWorktrees ? m.worktree_project_derived() : m.worktree_project_required()}
         </div>
       </label>
-      <label class="enabled-toggle">
-        <input type="checkbox" bind:checked={enabled} />
-        {m.worktree_enabled()}
-      </label>
+      <Checkbox bind:checked={enabled} label={m.worktree_enabled()} />
     </div>
 
     {#if error}
@@ -330,19 +335,20 @@
     gap: 6px;
   }
 
-  .mapping-row {
+  .mapping-list :global(.mapping-row) {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
     min-height: 48px;
     padding: 8px 10px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
   }
 
-  .mapping-row.disabled {
+  .mapping-list :global(.mapping-row > .kit-card__body) {
+    display: contents;
+  }
+
+  .mapping-list :global(.mapping-row.disabled) {
     opacity: 0.65;
   }
 
@@ -383,56 +389,14 @@
     min-width: 0;
   }
 
-  .field input {
-    height: 30px;
+  .field :global(.kit-text-input) {
     min-width: 0;
-    padding: 0 10px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
-    color: var(--text-primary);
-    font-size: 12px;
-  }
-
-  .layout-options {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 4px;
-  }
-
-  .layout-options button {
-    min-height: 30px;
-    padding: 4px 8px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
-    color: var(--text-secondary);
-    font-size: 12px;
-    cursor: pointer;
-  }
-
-  .layout-options button.active {
-    border-color: var(--accent-blue);
-    color: var(--text-primary);
-  }
-
-  .field input:focus {
-    outline: none;
-    border-color: var(--accent-blue);
   }
 
   .hint {
     color: var(--text-muted);
     font-size: 11px;
     line-height: 1.3;
-  }
-
-  .enabled-toggle {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    color: var(--text-secondary);
-    font-size: 12px;
   }
 
   .small-btn,
@@ -490,7 +454,7 @@
   }
 
   @media (max-width: 640px) {
-    .mapping-row,
+    .mapping-list :global(.mapping-row),
     .button-row {
       align-items: stretch;
       flex-direction: column;
