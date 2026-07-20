@@ -29,6 +29,283 @@ func newGrokTestProvider(t *testing.T, root string) Provider {
 	return provider
 }
 
+func parseGrokGolden(t *testing.T, generation string) ParseResult {
+	t.Helper()
+	root := t.TempDir()
+	fixtureRoot := filepath.Join("testdata", "grok-build", generation)
+	require.NoError(t, os.CopyFS(root, os.DirFS(fixtureRoot)))
+	provider := newGrokTestProvider(t, root)
+	sources, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	outcome, err := provider.Parse(context.Background(), ParseRequest{
+		Source: sources[0],
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	return outcome.Results[0].Result
+}
+
+func TestGrokProviderGoldenCurrentPrefersGeneratedTitle(t *testing.T) {
+	result := parseGrokGolden(t, "current")
+	assert.Equal(t, "Audit Grok compatibility", result.Session.SessionName)
+}
+
+func TestGrokProviderGoldenCurrentTranscriptSemantics(t *testing.T) {
+	result := parseGrokGolden(t, "current")
+	assert.Equal(t, "Review parser compatibility", result.Session.FirstMessage)
+	assert.Equal(t, 2, result.Session.UserMessageCount)
+	require.Len(t, result.Messages, 6)
+	assert.Equal(t, RoleUser, result.Messages[0].Role)
+	assert.Equal(t, "Review parser compatibility", result.Messages[0].Content)
+	assert.Equal(t, RoleAssistant, result.Messages[1].Role)
+	assert.Contains(t, result.Messages[1].Content, "Grok Build persistence")
+	require.Len(t, result.Messages[1].ToolCalls, 1)
+	assert.Equal(t, "ws_1", result.Messages[1].ToolCalls[0].ToolUseID)
+	assert.Equal(t, "web_search", result.Messages[1].ToolCalls[0].ToolName)
+	assert.Equal(t, "Inspect both formats", result.Messages[2].ThinkingText)
+	assert.Equal(t, RoleUser, result.Messages[4].Role)
+	assert.Equal(t, "also keep interjections", result.Messages[4].Content)
+}
+
+func TestGrokProviderGoldenCurrentMetadata(t *testing.T) {
+	result := parseGrokGolden(t, "current")
+	session := result.Session
+	assert.Equal(t, "/workspace/grok-worktrees/parser-audit", session.Cwd)
+	assert.Equal(t, "agentsview", session.Project)
+	assert.Equal(
+		t,
+		"grok:019f5000-0000-7000-8000-000000000000",
+		session.ParentSessionID,
+	)
+	assert.Equal(t, RelFork, session.RelationshipType)
+	assert.False(t, session.HasPeakContextTokens)
+	assert.Zero(t, session.PeakContextTokens)
+}
+
+func TestGrokProviderGoldenLegacyTranscript(t *testing.T) {
+	result := parseGrokGolden(t, "legacy")
+	assert.Equal(t, TranscriptFidelityFull, result.Session.TranscriptFidelity)
+	assert.Equal(t, "Review parser compatibility", result.Session.FirstMessage)
+	require.Len(t, result.Messages, 4)
+	assert.Equal(t, RoleUser, result.Messages[0].Role)
+	assert.Equal(t, "Review parser compatibility", result.Messages[0].Content)
+	require.Len(t, result.Messages[1].ToolCalls, 1)
+	assert.Equal(t, "call_1", result.Messages[1].ToolCalls[0].ToolUseID)
+	assert.Equal(t, "grok-4.5", result.Messages[1].Model)
+	assert.Equal(t, "Check the old format", result.Messages[1].ThinkingText)
+	require.Len(t, result.Messages[2].ToolResults, 1)
+	assert.Equal(t, "call_1", result.Messages[2].ToolResults[0].ToolUseID)
+}
+
+func TestGrokProviderParsesMixedTranscriptFormats(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "mixed-formats"
+	writeGrokFixtureFile(t, grokSummaryPath(root, "cwd-key", sessionID), `{
+		"info":{"id":"mixed-formats","cwd":"/workspace/agentsview"},
+		"session_summary":"mixed",
+		"created_at":"2026-07-18T10:00:00Z",
+		"updated_at":"2026-07-18T10:01:00Z"
+	}`)
+	writeGrokFixtureFile(
+		t,
+		filepath.Join(root, "cwd-key", sessionID, "chat_history.jsonl"),
+		"{\"role\":\"user\",\"content\":\"legacy question\"}\n"+
+			"{\"type\":\"assistant\",\"content\":\"current answer\"}\n",
+	)
+	provider := newGrokTestProvider(t, root)
+	sources, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	outcome, err := provider.Parse(
+		context.Background(),
+		ParseRequest{Source: sources[0]},
+	)
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	messages := outcome.Results[0].Result.Messages
+	require.Len(t, messages, 2)
+	assert.Equal(t, "legacy question", messages[0].Content)
+	assert.Equal(t, "current answer", messages[1].Content)
+}
+
+func TestParseGrokChatHistoryUnknownTypeFallsBackToLegacyRole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat_history.jsonl")
+	writeGrokFixtureFile(
+		t,
+		path,
+		`{"type":"future_metadata","role":"user","content":"legacy question"}`+"\n",
+	)
+
+	messages, malformed, err := parseGrokChatHistory(path)
+	require.NoError(t, err)
+	assert.Zero(t, malformed)
+	require.Len(t, messages, 1)
+	assert.Equal(t, RoleUser, messages[0].Role)
+	assert.Equal(t, "legacy question", messages[0].Content)
+}
+
+func TestParseGrokChatHistoryReasoningShapes(t *testing.T) {
+	tests := []struct {
+		name      string
+		history   []string
+		wantThink string
+		wantCount int
+	}{
+		{
+			name: "standalone content array",
+			history: []string{
+				`{"type":"reasoning","id":"r1","content":[{"type":"reasoning_text","text":"content thought"}]}`,
+				`{"type":"assistant","content":"answer"}`,
+			},
+			wantThink: "content thought",
+			wantCount: 1,
+		},
+		{
+			name: "legacy inline reasoning",
+			history: []string{
+				`{"type":"assistant","content":"answer","reasoning":{"text":"inline thought"}}`,
+			},
+			wantThink: "inline thought",
+			wantCount: 1,
+		},
+		{
+			name: "legacy raw output reasoning",
+			history: []string{
+				`{"type":"assistant","content":"answer","raw_output":[{"type":"reasoning","id":"r1","summary":[{"type":"summary_text","text":"raw thought"}]},{"type":"web_search_call","id":"ws_raw","status":"completed","action":{"type":"search","query":"raw query","sources":[]}}]}`,
+			},
+			wantThink: "raw thought",
+			wantCount: 2,
+		},
+		{
+			name: "format zero reasoning content",
+			history: []string{
+				`{"role":"assistant","content":"answer","reasoning_content":"v0 thought"}`,
+			},
+			wantThink: "v0 thought",
+			wantCount: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "chat_history.jsonl")
+			writeGrokFixtureFile(t, path, strings.Join(tt.history, "\n")+"\n")
+			messages, malformed, err := parseGrokChatHistory(path)
+			require.NoError(t, err)
+			assert.Zero(t, malformed)
+			require.Len(t, messages, tt.wantCount)
+			assistant := messages[len(messages)-1]
+			assert.Equal(t, RoleAssistant, assistant.Role)
+			assert.Equal(t, tt.wantThink, assistant.ThinkingText)
+			assert.True(t, assistant.HasThinking)
+			if tt.name == "legacy raw output reasoning" {
+				require.Len(t, messages[0].ToolCalls, 1)
+				assert.Equal(t, "ws_raw", messages[0].ToolCalls[0].ToolUseID)
+				assert.Contains(t, messages[0].Content, "raw query")
+			}
+		})
+	}
+}
+
+func TestParseGrokChatHistoryInlineReasoningOverridesPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat_history.jsonl")
+	writeGrokFixtureFile(t, path, strings.Join([]string{
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"pending"}]}`,
+		`{"type":"assistant","content":"answer","reasoning":{"text":"inline"}}`,
+	}, "\n")+"\n")
+	messages, malformed, err := parseGrokChatHistory(path)
+	require.NoError(t, err)
+	assert.Zero(t, malformed)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "inline", messages[0].ThinkingText)
+}
+
+func TestParseGrokChatHistoryDeduplicatesRawBackendToolCalls(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat_history.jsonl")
+	writeGrokFixtureFile(t, path, strings.Join([]string{
+		`{"type":"backend_tool_call","kind":{"tool_type":"web_search","id":"ws_same","status":"completed","action":{"type":"search","query":"same query","sources":[]}}}`,
+		`{"type":"assistant","content":"answer","raw_output":[{"type":"web_search_call","id":"ws_same","status":"completed","action":{"type":"search","query":"same query","sources":[]}}]}`,
+	}, "\n")+"\n")
+	messages, malformed, err := parseGrokChatHistory(path)
+	require.NoError(t, err)
+	assert.Zero(t, malformed)
+	require.Len(t, messages, 2)
+	require.Len(t, messages[0].ToolCalls, 1)
+	assert.Equal(t, "ws_same", messages[0].ToolCalls[0].ToolUseID)
+	assert.Equal(t, "answer", messages[1].Content)
+}
+
+func TestParseGrokChatHistoryPreservesCodeInterpreterInput(t *testing.T) {
+	code := strings.Repeat("print('counterfactual')\n", 20)
+	codeJSON, err := json.Marshal(code)
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "chat_history.jsonl")
+	writeGrokFixtureFile(
+		t,
+		path,
+		`{"type":"backend_tool_call","kind":{"tool_type":"code_interpreter","code":`+
+			string(codeJSON)+
+			`,"container_id":"container_counterfactual","id":"ci_counterfactual","outputs":[{"type":"logs","logs":"finished"}],"status":"completed"}}`+"\n",
+	)
+
+	messages, malformed, err := parseGrokChatHistory(path)
+	require.NoError(t, err)
+	assert.Zero(t, malformed)
+	require.Len(t, messages, 1)
+	require.Len(t, messages[0].ToolCalls, 1)
+	var input struct {
+		Code string `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal(
+		[]byte(messages[0].ToolCalls[0].InputJSON),
+		&input,
+	))
+	assert.Equal(t, code, input.Code)
+}
+
+func TestParseGrokChatHistoryDropsOrphanReasoning(t *testing.T) {
+	tests := []struct {
+		name      string
+		trailing  []string
+		wantCount int
+	}{
+		{name: "at eof", wantCount: 0},
+		{
+			name: "before user",
+			trailing: []string{
+				`{"type":"user","content":"new question"}`,
+				`{"type":"assistant","content":"answer"}`,
+			},
+			wantCount: 2,
+		},
+		{
+			name: "before tool result",
+			trailing: []string{
+				`{"type":"tool_result","tool_call_id":"call_1","content":"result"}`,
+				`{"type":"assistant","content":"answer"}`,
+			},
+			wantCount: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows := append([]string{
+				`{"type":"reasoning","summary":[{"type":"summary_text","text":"orphan"}]}`,
+			}, tt.trailing...)
+			path := filepath.Join(t.TempDir(), "chat_history.jsonl")
+			writeGrokFixtureFile(t, path, strings.Join(rows, "\n")+"\n")
+			messages, malformed, err := parseGrokChatHistory(path)
+			require.NoError(t, err)
+			assert.Zero(t, malformed)
+			require.Len(t, messages, tt.wantCount)
+			for _, message := range messages {
+				assert.False(t, message.HasThinking)
+				assert.NotContains(t, message.Content, "orphan")
+			}
+		})
+	}
+}
+
 func TestGrokProviderSummarySource(t *testing.T) {
 	root := t.TempDir()
 	writeGrokFixtureFile(t, grokSummaryPath(root, "cwd-key", "sess-1"), `{
@@ -136,8 +413,8 @@ func TestGrokProviderCurrentBuildSummarySchema(t *testing.T) {
 	assert.Equal(t, "grok-summary-v1", session.SourceVersion)
 	assert.Equal(t, 104, session.MessageCount)
 	assert.Equal(t, 7, session.UserMessageCount)
-	assert.Equal(t, 106663, session.PeakContextTokens)
-	assert.True(t, session.HasPeakContextTokens)
+	assert.Zero(t, session.PeakContextTokens)
+	assert.False(t, session.HasPeakContextTokens)
 	assert.False(t, session.HasTotalOutputTokens)
 	require.Len(t, outcome.Results[0].Result.Messages, 1)
 	assert.Equal(t, RoleUser, outcome.Results[0].Result.Messages[0].Role)
