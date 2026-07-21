@@ -158,6 +158,7 @@ type sessionExportUsageAccum struct {
 	cacheReadInputTokens     int
 	reasoningTokens          int
 	costUSD                  float64
+	authoritativeCost        *float64
 	contributing             bool
 	allPriced                bool
 	seen                     map[usageDedupToken]struct{}
@@ -770,7 +771,16 @@ func (db *DB) attachSessionExportUsage(
 		}
 		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok :=
 			sessionExportUsageTokens(r)
-		cost, priced, contributes := sessionRowCost(r, resolver)
+		costRow := r
+		authoritative := r.costSource == CopilotReportedCostSource &&
+			r.costUSD.Valid
+		if authoritative {
+			v := r.costUSD.Float64
+			a.authoritativeCost = &v
+			costRow.costUSD = sql.NullFloat64{}
+			resolver.RecordUnattributedReported()
+		}
+		cost, priced, contributes := sessionRowCost(costRow, resolver)
 		if !contributes {
 			continue
 		}
@@ -797,7 +807,9 @@ func (db *DB) attachSessionExportUsage(
 		ma.cacheCreationInputTokens += cacheCrTok
 		ma.cacheReadInputTokens += cacheRdTok
 		ma.reasoningTokens += reasoningTok
-		if r.costUSD.Valid {
+		if authoritative {
+			ma.computed = true
+		} else if r.costUSD.Valid {
 			ma.reported = true
 		} else {
 			ma.computed = true
@@ -810,6 +822,34 @@ func (db *DB) attachSessionExportUsage(
 	}
 	if err := sqlRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating session export usage: %w", err)
+	}
+	for _, a := range accum {
+		if a == nil || a.authoritativeCost == nil {
+			continue
+		}
+		type modelAllocation struct {
+			model string
+			usage *sessionExportModelUsageAccum
+		}
+		models := make([]modelAllocation, 0, len(a.byModel))
+		for model, usage := range a.byModel {
+			if usage != nil {
+				models = append(models, modelAllocation{model: model, usage: usage})
+			}
+		}
+		sort.Slice(models, func(i, j int) bool {
+			return models[i].model < models[j].model
+		})
+		weights := make([]float64, len(models))
+		for i, model := range models {
+			weights[i] = model.usage.costUSD
+		}
+		costs := export.AllocateCostByWeight(*a.authoritativeCost, weights)
+		for i, model := range models {
+			model.usage.costUSD = costs[i]
+			model.usage.allPriced = true
+		}
+		a.costUSD = *a.authoritativeCost
 	}
 
 	for i := range rows {
@@ -825,8 +865,12 @@ func (db *DB) attachSessionExportUsage(
 			CacheReadInputTokens:     a.cacheReadInputTokens,
 			ReasoningTokens:          a.reasoningTokens,
 			CostUSD:                  a.costUSD,
-			HasCost:                  a.contributing && a.allPriced,
-			ByModel:                  sessionExportModelUsageBreakdowns(a.byModel),
+			HasCost: a.authoritativeCost != nil ||
+				(a.contributing && a.allPriced),
+			ByModel: sessionExportModelUsageBreakdowns(a.byModel),
+		}
+		if a.authoritativeCost != nil {
+			rows[i].ModelUsage.CostUSD = *a.authoritativeCost
 		}
 	}
 	block, err := resolver.BuildBlock()

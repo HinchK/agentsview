@@ -58,6 +58,8 @@ type UsageRow struct {
 	Timestamp       string // ts, RFC3339 or ""
 	OutputTokens    int
 	Cost            float64
+	CostSource      export.CostSource
+	SessionCost     *float64
 	Priced          bool
 	Contributes     bool
 	Agent           string
@@ -65,6 +67,66 @@ type UsageRow struct {
 	ClaudeRequestID string
 	SourceUUID      string
 	UsageDedupKey   string
+}
+
+type UsageCostAllocation struct {
+	Cost        float64
+	CostSource  export.CostSource
+	Priced      bool
+	Contributes bool
+}
+
+// AllocateUsageCosts selects aggregate row costs. A session may carry one
+// session total; when it does, that settlement replaces the session's row
+// estimates and is distributed by their catalog-cost weights.
+func AllocateUsageCosts(usage []UsageRow) []UsageCostAllocation {
+	type sessionCost struct {
+		carrier int
+		cost    float64
+		indices []int
+	}
+	allocated := make([]UsageCostAllocation, len(usage))
+	sessionCosts := make(map[string]*sessionCost)
+	for i, row := range usage {
+		allocated[i] = UsageCostAllocation{
+			Cost: row.Cost, CostSource: row.CostSource,
+			Priced: row.Priced, Contributes: row.Contributes,
+		}
+		if row.SessionCost != nil {
+			sessionCosts[row.SessionID] = &sessionCost{
+				carrier: i,
+				cost:    *row.SessionCost,
+			}
+		}
+	}
+	for i, row := range usage {
+		selected := sessionCosts[row.SessionID]
+		if selected == nil || !allocated[i].Contributes {
+			continue
+		}
+		selected.indices = append(selected.indices, i)
+	}
+	for _, selected := range sessionCosts {
+		if len(selected.indices) == 0 {
+			allocated[selected.carrier] = UsageCostAllocation{
+				Cost: selected.cost, CostSource: export.CostSourceReported,
+				Priced: true, Contributes: true,
+			}
+			continue
+		}
+		weights := make([]float64, len(selected.indices))
+		for i, index := range selected.indices {
+			weights[i] = usage[index].Cost
+		}
+		costs := export.AllocateCostByWeight(selected.cost, weights)
+		for i, index := range selected.indices {
+			allocated[index] = UsageCostAllocation{
+				Cost: costs[i], CostSource: export.CostSourceReported,
+				Priced: true, Contributes: true,
+			}
+		}
+	}
+	return allocated
 }
 
 // Report is the API payload.
@@ -633,18 +695,21 @@ func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
 // timestamp.
 func applyUsage(r *Report, p Params, windows []BucketWindow, start, end time.Time,
 	usage []UsageRow, automatedBy map[string]bool) {
-	for _, u := range dedupUsage(start, end, p.EffectiveEnd, usage) {
+	usage = dedupUsage(start, end, p.EffectiveEnd, usage)
+	allocated := AllocateUsageCosts(usage)
+	for i, u := range usage {
+		cost := allocated[i].Cost
 		r.Totals.OutputTokens += u.OutputTokens
-		r.Totals.Cost += u.Cost
+		r.Totals.Cost += cost
 		if automatedBy[u.SessionID] {
-			r.Totals.AutomatedCost += u.Cost
+			r.Totals.AutomatedCost += cost
 		} else {
-			r.Totals.InteractiveCost += u.Cost
+			r.Totals.InteractiveCost += cost
 		}
 		t, _ := parseTS(u.Timestamp)
 		if b := windowIndex(windows, t); b >= 0 && b < len(r.Buckets) {
 			r.Buckets[b].OutputTokens += u.OutputTokens
-			r.Buckets[b].Cost += u.Cost
+			r.Buckets[b].Cost += cost
 		}
 	}
 }
@@ -713,16 +778,18 @@ func buildSessionsTable(r *Report, start, end, effEnd time.Time,
 	}
 	// Per-session cost/tokens/models from deduped usage.
 	cost := map[string]*usageAgg{}
-	for _, u := range dedupUsage(start, end, effEnd, usage) {
+	usage = dedupUsage(start, end, effEnd, usage)
+	allocated := AllocateUsageCosts(usage)
+	for i, u := range usage {
 		c := cost[u.SessionID]
 		if c == nil {
 			c = &usageAgg{models: map[string]float64{}}
 			cost[u.SessionID] = c
 		}
-		c.cost += u.Cost
+		c.cost += allocated[i].Cost
 		c.outputTokens += u.OutputTokens
 		if u.Model != "" {
-			c.models[u.Model] += u.Cost
+			c.models[u.Model] += allocated[i].Cost
 		}
 	}
 	projSet := map[string]struct{}{}

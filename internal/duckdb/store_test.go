@@ -2617,6 +2617,207 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	assert.InDelta(t, wantCost, entry.CostUSD, 0.000001)
 }
 
+func TestCopilotReportedCostSurvivesDuckDBPush(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "claude-opus-4-6", InputPerMTok: 10, OutputPerMTok: 15,
+	}}))
+	reportedCost := 0.035
+	sess := syncSession(
+		"copilot:duck-reported", "alpha", "reported cost",
+		"2026-01-18T00:00:00.000Z", 0)
+	sess.Agent = "copilot"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{
+			{
+				Source: "shutdown", Model: "claude-opus-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				OccurredAt: "2026-01-18T00:01:00.000Z",
+				DedupKey:   "shutdown-1",
+			},
+			{
+				Source: "shutdown", Model: "claude-opus-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				CostUSD: &reportedCost, CostStatus: "exact",
+				CostSource: db.CopilotReportedCostSource,
+				OccurredAt: "2026-01-19T00:01:00.000Z",
+				DedupKey:   "shutdown-2",
+			},
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	usage, err := store.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	assert.InDelta(t, reportedCost, usage.CostUSD, 1e-12)
+	assert.InDelta(t, reportedCost/0.01, usage.AICredits, 1e-9)
+	require.Len(t, usage.Breakdown, 2)
+	assert.InDelta(t, 0.0175, usage.Breakdown[0].CostUSD, 1e-12)
+	assert.InDelta(t, 0.0175, usage.Breakdown[1].CostUSD, 1e-12)
+	assert.Equal(t, usage.CostUSD,
+		usage.Breakdown[0].CostUSD+usage.Breakdown[1].CostUSD)
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From: "2026-01-18", To: "2026-01-19", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	require.Len(t, daily.Daily, 2)
+	assert.InDelta(t, 0.0175, daily.Daily[0].TotalCost, 1e-12)
+	assert.InDelta(t, 0.0175, daily.Daily[1].TotalCost, 1e-12)
+	for _, day := range daily.Daily {
+		require.Len(t, day.ModelBreakdowns, 1)
+		assert.Equal(t, day.TotalCost, day.ModelBreakdowns[0].Cost)
+	}
+	assert.InDelta(t, reportedCost, daily.Totals.TotalCost, 1e-12)
+	require.NotNil(t, daily.Pricing)
+	assert.Equal(t, export.CostSourceMixed, daily.Pricing.CostSource,
+		"authoritative reported cost must surface in pricing provenance")
+	assert.Equal(t, export.CostSourceComputed,
+		daily.Pricing.Models["claude-opus-4-6"].CostSource)
+}
+
+func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:  "claude-sonnet-4-6",
+		InputPerMTok:  10,
+		OutputPerMTok: 20,
+	}}))
+	reportedCost := 0.035
+	authoritative := syncSession(
+		"copilot:authoritative", "alpha", "reported",
+		"2026-01-18T00:00:00.000Z", 1,
+	)
+	authoritative.Agent = "copilot"
+	estimated := syncSession(
+		"copilot:estimated", "alpha", "estimated",
+		"2026-01-18T01:00:00.000Z", 1,
+	)
+	estimated.Agent = "copilot"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{
+			Session: authoritative,
+			UsageEvents: []db.UsageEvent{{
+				Source: "shutdown", Model: "claude-sonnet-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				CostUSD: &reportedCost, CostStatus: "exact",
+				CostSource: db.CopilotReportedCostSource,
+				OccurredAt: "2026-01-18T00:01:00.000Z",
+				DedupKey:   "authoritative",
+			}},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+		{
+			Session: estimated,
+			UsageEvents: []db.UsageEvent{{
+				Source: "shutdown", Model: "claude-sonnet-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				OccurredAt: "2026-01-18T01:01:00.000Z",
+				DedupKey:   "estimated",
+			}},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+	})
+	require.NoError(t, err)
+
+	filter := db.UsageFilter{
+		From: "2026-01-18", To: "2026-01-18", Timezone: "UTC",
+	}
+	want, err := local.GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	got, err := NewStoreFromDB(syncer.DB()).GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+
+	assert.InDelta(t, 0.055, want.Totals.TotalCost, 1e-12)
+	assert.InDelta(t, want.Totals.TotalCost, got.Totals.TotalCost, 1e-12)
+	assert.InDelta(t, 5.5, want.Totals.CopilotAICredits, 1e-9,
+		"credits derive from the authoritative-substituted totals")
+	assert.InDelta(t, want.Totals.CopilotAICredits,
+		got.Totals.CopilotAICredits, 1e-9)
+	require.Len(t, got.Daily, 1)
+	require.Len(t, want.Daily, 1)
+	assert.Equal(t, want.Daily[0].Date, got.Daily[0].Date)
+	assert.Equal(t, want.Daily[0].InputTokens, got.Daily[0].InputTokens)
+	assert.Equal(t, want.Daily[0].OutputTokens, got.Daily[0].OutputTokens)
+	assert.Equal(t, want.Daily[0].ModelsUsed, got.Daily[0].ModelsUsed)
+	assert.InDelta(t, want.Daily[0].TotalCost, got.Daily[0].TotalCost, 1e-12)
+	require.Len(t, got.Daily[0].ModelBreakdowns, 1)
+	require.Len(t, want.Daily[0].ModelBreakdowns, 1)
+	assert.Equal(t, want.Daily[0].ModelBreakdowns[0].ModelName,
+		got.Daily[0].ModelBreakdowns[0].ModelName)
+	assert.InDelta(t, want.Daily[0].ModelBreakdowns[0].Cost,
+		got.Daily[0].ModelBreakdowns[0].Cost, 1e-12)
+}
+
+func TestDuckDBCostOnlyReportedSessionMatchesSQLite(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	reportedCost := 0.0175
+	sess := syncSession(
+		"copilot:cost-only", "alpha", "cost only",
+		"2026-01-18T00:00:00.000Z", 0)
+	sess.Agent = "copilot"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{{
+			Source: "shutdown", Model: "copilot",
+			CostUSD: &reportedCost, CostStatus: "exact",
+			CostSource: db.CopilotReportedCostSource,
+			OccurredAt: "2026-01-18T00:01:00.000Z",
+			DedupKey:   "cost-only",
+		}},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	want, err := local.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, want)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	got, err := store.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, got.HasCost)
+	assert.InDelta(t, reportedCost, got.CostUSD, 1e-12)
+	assert.False(t, got.HasTokenData,
+		"a cost-only reported row is not token data")
+	assert.Empty(t, got.Models,
+		"a cost-only carrier row must not surface a model")
+	assert.Zero(t, got.BreakdownCount)
+	assert.Empty(t, got.Breakdown)
+	assert.Equal(t, want.HasTokenData, got.HasTokenData)
+	assert.Equal(t, want.Models, got.Models)
+	assert.Equal(t, want.BreakdownCount, got.BreakdownCount)
+	assert.InDelta(t, want.CostUSD, got.CostUSD, 1e-12)
+
+	gotNoBreakdown, err := store.GetSessionUsage(ctx, sess.ID, false)
+	require.NoError(t, err)
+	require.NotNil(t, gotNoBreakdown)
+	assert.Zero(t, gotNoBreakdown.BreakdownCount,
+		"the row-count path must exclude cost-only reported rows")
+}
+
 func TestDailyUsageCostsReasoningOnlyRows(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
@@ -3115,6 +3316,68 @@ func TestStoreSessionUsageRollupParity(t *testing.T) {
 	require.Equal(t, 1, rollup.SubagentCount)
 	require.True(t, rollup.HasCost)
 	assert.InDelta(t, 0.000066, rollup.CostUSD, 1e-12)
+}
+
+func TestStoreSessionUsageRollupUsesCopilotReportedSessionCost(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "gpt-5.1", InputPerMTok: 3, OutputPerMTok: 15,
+	}}))
+	root := syncSession(
+		"duck-copilot-rollup-root", "alpha", "root",
+		"2026-01-10T00:00:00.000Z", 1)
+	root.Agent = "copilot"
+	child := syncSession(
+		"duck-copilot-rollup-child", "alpha", "child",
+		"2026-01-10T01:00:00.000Z", 1)
+	child.Agent = "copilot"
+	parentID := root.ID
+	child.ParentSessionID = &parentID
+	child.RelationshipType = "subagent"
+	reportedRootCost := 0.03
+	reportedChildCost := 0.02
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{
+			Session: root,
+			UsageEvents: []db.UsageEvent{
+				{
+					Source: "shutdown", Model: "gpt-5.1",
+					InputTokens: 1000, OutputTokens: 500,
+					OccurredAt: "2026-01-10T00:01:00.000Z", DedupKey: "first",
+				},
+				{
+					Source: "shutdown", Model: "gpt-5.1",
+					InputTokens: 1000, OutputTokens: 500,
+					CostUSD: &reportedRootCost, CostStatus: "exact",
+					CostSource: db.CopilotReportedCostSource,
+					OccurredAt: "2026-01-10T00:02:00.000Z", DedupKey: "final",
+				},
+			},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+		{
+			Session: child,
+			UsageEvents: []db.UsageEvent{{
+				Source: "provider", Model: "gpt-5.1",
+				CostUSD: &reportedChildCost, CostStatus: "exact", CostSource: "provider",
+				OccurredAt: "2026-01-10T01:01:00.000Z", DedupKey: "child",
+			}},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+	})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(
+		ctx, NewStoreFromDB(syncer.DB()), root.ID, false)
+	require.NoError(t, err)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, reportedRootCost+reportedChildCost,
+		rollup.CostUSD, 1e-12)
 }
 
 func TestStoreSessionUsageRollupIncludesUntimedRows(t *testing.T) {

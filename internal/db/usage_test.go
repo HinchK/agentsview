@@ -192,7 +192,7 @@ func TestUsageRowQueryPushesDateBoundsIntoUnion(t *testing.T) {
 	assert.NotContains(t, normalized, "display_name")
 	assert.NotContains(t, normalized, "first_message")
 	assert.NotContains(t, normalized, "cost_status")
-	assert.NotContains(t, normalized, "cost_source")
+	assert.Contains(t, normalized, "u.cost_source")
 	assert.NotContains(t, normalized, "user_message_count")
 	assert.NotContains(t, normalized, "session_activity_at")
 	assert.NotContains(t, normalized, " as started_at")
@@ -233,7 +233,7 @@ func TestTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
 	assert.NotContains(t, normalized, "display_name")
 	assert.NotContains(t, normalized, "first_message")
 	assert.NotContains(t, normalized, "cost_status")
-	assert.NotContains(t, normalized, "cost_source")
+	assert.Contains(t, normalized, "u.cost_source")
 	assert.NotContains(t, normalized, "user_message_count")
 	assert.NotContains(t, normalized, "session_activity_at")
 	assert.NotContains(t, normalized, " as started_at")
@@ -3611,6 +3611,125 @@ func TestGetSessionUsage_AICreditsCapability(t *testing.T) {
 	assert.True(t, u.HasCost, "HasCost = false, want true")
 	assert.InDelta(t, 0.0175, u.CostUSD, 1e-9, "CostUSD")
 	assert.InDelta(t, 1.75, u.AICredits, 1e-9, "AICredits")
+}
+
+func TestCopilotReportedCostSuppressesSessionEstimates(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	seedOpusPricing(t, d)
+
+	for _, id := range []string{"copilot:reported", "copilot:fallback"} {
+		insertSession(t, d, id, "proj", func(s *Session) {
+			s.Agent = "copilot"
+			s.StartedAt = new("2026-05-20T10:00:00Z")
+		})
+	}
+	reportedCost := 0.0275
+	require.NoError(t, d.ReplaceSessionUsageEvents("copilot:reported", []UsageEvent{
+		{
+			Source: "shutdown", Model: "claude-opus-4-6",
+			InputTokens: 1000, OutputTokens: 500,
+			OccurredAt: "2026-05-20T10:10:00Z", DedupKey: "segment-1",
+		},
+		{
+			Source: "shutdown", Model: "claude-opus-4-6",
+			InputTokens: 1000, OutputTokens: 500,
+			CostUSD: &reportedCost, CostStatus: "exact",
+			CostSource: CopilotReportedCostSource,
+			OccurredAt: "2026-05-21T10:20:00Z", DedupKey: "segment-2",
+		},
+	}))
+	require.NoError(t, d.ReplaceSessionUsageEvents("copilot:fallback", []UsageEvent{{
+		Source: "shutdown", Model: "claude-opus-4-6",
+		InputTokens: 1000, OutputTokens: 500,
+		OccurredAt: "2026-05-20T10:30:00Z", DedupKey: "fallback",
+	}}))
+
+	session, err := d.GetSessionUsage(ctx, "copilot:reported", true)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.True(t, session.HasCost)
+	assert.InDelta(t, reportedCost, session.CostUSD, 1e-12)
+	assert.InDelta(t, reportedCost/0.01, session.AICredits, 1e-9)
+	require.Len(t, session.Breakdown, 2)
+	assert.InDelta(t, 0.01375, session.Breakdown[0].CostUSD, 1e-12)
+	assert.InDelta(t, 0.01375, session.Breakdown[1].CostUSD, 1e-12)
+	assert.Equal(t, session.CostUSD,
+		session.Breakdown[0].CostUSD+session.Breakdown[1].CostUSD)
+
+	daily, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2026-05-20", To: "2026-05-21", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	require.Len(t, daily.Daily, 2)
+	assert.InDelta(t, 0.03125, daily.Daily[0].TotalCost, 1e-12)
+	assert.InDelta(t, 0.01375, daily.Daily[1].TotalCost, 1e-12)
+	for _, day := range daily.Daily {
+		require.Len(t, day.ModelBreakdowns, 1)
+		assert.Equal(t, day.TotalCost, day.ModelBreakdowns[0].Cost)
+	}
+	assert.InDelta(t, 0.045, daily.Totals.TotalCost, 1e-12)
+	assert.InDelta(t, 4.5, daily.Totals.CopilotAICredits, 1e-9,
+		"credits derive from the authoritative reported cost")
+	require.NotNil(t, daily.Pricing)
+	assert.Equal(t, export.CostSourceMixed, daily.Pricing.CostSource,
+		"authoritative reported cost must surface in pricing provenance")
+	assert.Equal(t, export.CostSourceComputed,
+		daily.Pricing.Models["claude-opus-4-6"].CostSource)
+
+	earlyDay, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2026-05-20", To: "2026-05-20", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	assert.InDelta(t, 0.035, earlyDay.Totals.TotalCost, 1e-12)
+
+	modelFiltered, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2026-05-20", To: "2026-05-21", Timezone: "UTC",
+		Model: "claude-opus-4-6",
+	})
+	require.NoError(t, err)
+	assert.InDelta(t, 0.0525, modelFiltered.Totals.TotalCost, 1e-12)
+	assert.InDelta(t, 5.25, modelFiltered.Totals.CopilotAICredits, 1e-9,
+		"model-filtered credits track the estimated totals")
+	require.NotNil(t, modelFiltered.Pricing)
+	assert.Equal(t, export.CostSourceComputed, modelFiltered.Pricing.CostSource,
+		"model-filtered totals stay estimated, so provenance stays computed")
+}
+
+func TestCopilotReportedZeroCostSuppressesEstimate(t *testing.T) {
+	d := testDB(t)
+	seedOpusPricing(t, d)
+	insertSession(t, d, "copilot:reported-zero", "proj", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-05-21T10:00:00Z")
+	})
+	zeroCost := 0.0
+	require.NoError(t, d.ReplaceSessionUsageEvents(
+		"copilot:reported-zero",
+		[]UsageEvent{{
+			Source: "shutdown", Model: "claude-opus-4-6",
+			InputTokens: 1000, OutputTokens: 500,
+			CostUSD: &zeroCost, CostStatus: "exact",
+			CostSource: CopilotReportedCostSource,
+			OccurredAt: "2026-05-21T10:10:00Z", DedupKey: "final",
+		}},
+	))
+
+	session, err := d.GetSessionUsage(
+		context.Background(), "copilot:reported-zero", false)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.True(t, session.HasCost)
+	assert.Zero(t, session.CostUSD)
+
+	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+		From: "2026-05-21", To: "2026-05-21", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	assert.Zero(t, daily.Totals.TotalCost)
+	require.Len(t, daily.Daily, 1)
+	require.Len(t, daily.Daily[0].ModelBreakdowns, 1)
+	assert.Zero(t, daily.Daily[0].ModelBreakdowns[0].Cost)
 }
 
 // TestGetDailyUsage_CopilotAICredits verifies AI credits are computed from

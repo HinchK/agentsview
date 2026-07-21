@@ -1063,6 +1063,60 @@ func TestSessionExportUsageUsesPageReadSnapshot(t *testing.T) {
 	assert.Equal(t, 10, rows[0].ModelUsage.OutputTokens)
 }
 
+func TestSessionExportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "copilot-model-a", InputPerMTok: 10},
+		{ModelPattern: "copilot-model-b", InputPerMTok: 20},
+	}))
+	insertExportSession(t, d, Session{
+		ID: "copilot:export-authoritative", Project: "alpha", Machine: "local",
+		Agent: "copilot", StartedAt: Ptr("2026-06-16T10:00:00Z"),
+		EndedAt: Ptr("2026-06-16T10:10:00Z"), UserMessageCount: 1,
+	})
+	reportedCost := 0.03
+	require.NoError(t, d.ReplaceSessionUsageEvents(
+		"copilot:export-authoritative",
+		[]UsageEvent{
+			{
+				Source: "shutdown", Model: "copilot-model-a",
+				InputTokens: 1_000_000,
+				OccurredAt:  "2026-06-16T10:05:00Z", DedupKey: "first",
+			},
+			{
+				Source: "shutdown", Model: "copilot-model-b",
+				InputTokens: 1_000_000,
+				CostUSD:     &reportedCost, CostStatus: "exact",
+				CostSource: CopilotReportedCostSource,
+				OccurredAt: "2026-06-16T10:10:00Z", DedupKey: "final",
+			},
+		},
+	))
+
+	result, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{IncludeChildren: true}, Limit: 10, Format: "json",
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	require.NotNil(t, result.Rows[0].ModelUsage)
+	assert.True(t, result.Rows[0].ModelUsage.HasCost)
+	assert.InDelta(t, reportedCost, result.Rows[0].ModelUsage.CostUSD, 1e-12)
+	assert.InDelta(t, 0.01,
+		result.Rows[0].ModelUsage.ByModel["copilot-model-a"].CostUSD, 1e-12)
+	assert.InDelta(t, 0.02,
+		result.Rows[0].ModelUsage.ByModel["copilot-model-b"].CostUSD, 1e-12)
+	assert.Equal(t, result.Rows[0].ModelUsage.CostUSD,
+		result.Rows[0].ModelUsage.ByModel["copilot-model-a"].CostUSD+
+			result.Rows[0].ModelUsage.ByModel["copilot-model-b"].CostUSD)
+	assert.Equal(t, export.CostSourceComputed,
+		result.Rows[0].ModelUsage.ByModel["copilot-model-a"].CostSource)
+	assert.Equal(t, export.CostSourceComputed,
+		result.Rows[0].ModelUsage.ByModel["copilot-model-b"].CostSource)
+	require.NotNil(t, result.Pricing)
+	assert.Equal(t, export.CostSourceMixed, result.Pricing.CostSource)
+}
+
 func TestAllSessionExportKeepsOnePricingSnapshotAcrossPages(t *testing.T) {
 	d := testSessionExportDB(t)
 	ctx := context.Background()

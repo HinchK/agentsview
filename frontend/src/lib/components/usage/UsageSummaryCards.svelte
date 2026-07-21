@@ -82,7 +82,7 @@
     return String(v.toFixed(0));
   }
 
-  interface SummaryCard {
+  interface Card {
     label: () => string;
     value: () => string;
     sub?: () => string;
@@ -90,7 +90,7 @@
   }
 
   const cards = $derived.by(() => {
-    const baseCards: SummaryCard[] = [
+    const baseCards: Card[] = [
       {
         label: () => m.usage_summary_total_cost(),
         value: () => fmtCost(usage.summary?.totals.totalCost ?? 0),

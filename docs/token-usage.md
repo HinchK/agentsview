@@ -393,14 +393,47 @@ model attributes. AgentsView deduplicates repeated trace flushes for the same
 chat turn and keeps the copy with the most complete token usage before pricing
 it.
 
+### Copilot Reported Billing
+
+Copilot CLI `session.shutdown` events can include a `totalNanoAiu` billing
+total. Copilot sessions starting on or after June 1,
+2026 can report an authoritative `totalNanoAiu` billing total. Older sessions
+remain catalog-priced because they were created under the premium-request
+pricing model. AgentsView converts that cumulative amount
+exactly (`totalNanoAiu / 1e11` USD) and stores the session-level value
+through the normal reported-cost fields, on one stable usage-event row.
+Later shutdowns supersede earlier totals, including an authoritative final
+zero.
+
+When the selected data contains this reported session cost, AgentsView
+suppresses every catalog-priced estimate for that session. This prevents
+double counting across models, days, and resumed segments. Historical Copilot
+sessions without `totalNanoAiu` and other Copilot-family agents retain
+catalog pricing.
+
+For unfiltered reports, AgentsView allocates the session total across the
+selected usage rows in proportion to their catalog-price estimates. This keeps
+per-day and per-model breakdowns additive: their costs sum to the displayed
+session or report total. In a multi-model session those model costs are
+estimated attributions; Copilot reports only the session total, not a charge per
+model.
+
+A date window containing only rows before the reported settlement can still
+show catalog estimates because the later session total is outside the selected
+data. Model-filtered reports also remain catalog estimates because applying the
+whole session total to one selected model would overstate that model.
+
 ### Copilot AI Credits
 
 Usage reports compute **Copilot AI Credits** for Copilot-family agents
 (`copilot`, `vscode-copilot`, and `visualstudio-copilot`) when their usage rows
-have a complete cost estimate. The conversion is cost divided by `$0.01`,
-matching the unit AgentsView uses for Copilot credit reporting. The Usage
-dashboard shows this as an optional summary card, and `agentsview session usage`
-prints an `AI Credits` line for priced Copilot-family sessions.
+have a complete cost. The conversion is cost divided by `$0.01`, matching the
+unit AgentsView uses for Copilot credit reporting. When a session carries an
+authoritative Copilot-reported cost, the credits derive from that reported
+total; otherwise they derive from the catalog estimate. The Usage dashboard
+shows this as an optional summary card, and `agentsview session usage` prints
+an `AI Credits` line for priced Copilot-family sessions. Usage report totals
+continue to expose the same `copilotAICredits` field.
 
 ### Claude Streaming & Codex Token Events
 
@@ -594,9 +627,8 @@ session-summary v1 contract shipped in 0.37.1. Releases 0.38.0 and 0.38.1
 emitted the substantially revised project-evidence shape while still reporting
 version 1. Current builds correct all three markers to version 2; those two
 transitional releases must not be treated as v1-compatible. The commands do
-not provide a v1 output mode.
-Consumers should require the expected `schema_version` and ignore unknown
-additive fields.
+not provide a v1 output mode. Consumers should require the expected
+`schema_version` and ignore unknown additive fields.
 
 | Change                                                                                | Requires `schema_version` bump? |
 | ------------------------------------------------------------------------------------- | ------------------------------- |
@@ -625,11 +657,18 @@ and `cost_source`.
 
 `cost_source` is a closed v2 enum everywhere it appears: `computed`, `reported`,
 or `mixed`. `computed` means AgentsView derived cost from token counts and the
-effective pricing resolver. `reported` means at least one source row supplied
-explicit cost, such as Cursor Admin API billing data; those rows may not be
-derivable from tokens times rates. `mixed` means both computed and reported
-costs contributed. For computed costs, reasoning tokens are priced at the
+effective pricing resolver. `reported` means a source supplied explicit cost,
+such as Cursor Admin API billing data; those amounts may not be derivable from
+tokens times rates. `mixed` means the enclosing report or rollup contains both
+provenance kinds. For computed costs, reasoning tokens are priced at the
 output-token rate.
+
+An authoritative session total is never added to that session's computed
+estimate. It replaces the estimate completely. A report-level pricing block can
+still be `mixed` when it records that authoritative settlement alongside
+computed per-model attribution. Those model allocations are estimates derived
+from catalog-cost weights and sum to the reported total. A multi-session rollup
+can also be `mixed` when different sessions use different sources.
 
 If a source reports an amount for a model with no matching effective pricing
 row, the model entry has `cost_source: "reported"`, `matched_pattern: null`, and
