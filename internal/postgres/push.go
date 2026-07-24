@@ -96,6 +96,27 @@ type PushProgress struct {
 	VectorChunksPushed  int
 }
 
+// PushOptions controls a single push. The zero value matches Push's
+// historical behavior.
+type PushOptions struct {
+	// Full bypasses unchanged-fingerprint and unchanged-hash skips so
+	// every session is resent.
+	Full bool
+	// ScopeVectorsToChangedSessions limits the vector phase's local
+	// hash read and PG state read to this push's changed relational
+	// sessions, instead of reconciling the whole generation. Ignored
+	// when the push runs (or is internally promoted to run) full, so
+	// reset recovery and backfills keep generation-wide reconciliation.
+	ScopeVectorsToChangedSessions bool
+	// LastReconciledVectorGeneration is the PG generation id the caller
+	// last reconciled generation-wide. When a scoped push resolves a
+	// different active generation id, the vector phase promotes itself to a
+	// generation-wide read so a newly active or recreated generation is
+	// never left partially populated (see pushVectors). Zero on the first
+	// push, which the reconcile bit already forces generation-wide.
+	LastReconciledVectorGeneration int64
+}
+
 // Push syncs local sessions and messages to PostgreSQL.
 // The onProgress callback, if non-nil, is called after each
 // batch with current totals.
@@ -103,6 +124,15 @@ func (s *Sync) Push(
 	ctx context.Context, full bool,
 	onProgress func(PushProgress),
 ) (PushResult, error) {
+	return s.PushWithOptions(ctx, PushOptions{Full: full}, onProgress)
+}
+
+// PushWithOptions is Push with per-push options; see PushOptions.
+func (s *Sync) PushWithOptions(
+	ctx context.Context, opts PushOptions,
+	onProgress func(PushProgress),
+) (PushResult, error) {
+	full := opts.Full
 	start := time.Now()
 	var result PushResult
 	state := s.effectiveSyncState()
@@ -388,6 +418,15 @@ func (s *Sync) Push(
 		return sessions[i].ID < sessions[j].ID
 	})
 
+	// Non-nil only for change-scoped pushes: sessionByID now holds
+	// exactly this push's changed relational sessions, and the vector
+	// phase reads state only for them. full is the effective value —
+	// a promoted full push keeps generation-wide reconciliation.
+	var vectorScope []string
+	if opts.ScopeVectorsToChangedSessions && !full {
+		vectorScope = mapKeys(sessionByID)
+	}
+
 	if len(sessions) == 0 {
 		if s.isFiltered() {
 			// Filtered pushes use filter-scoped sync state, so
@@ -432,7 +471,10 @@ func (s *Sync) Push(
 		if err := s.syncProjectIdentityObservations(ctx, full); err != nil {
 			return result, err
 		}
-		result.Vectors, err = s.runVectorPushPhase(ctx, full, nil, onProgress)
+		result.Vectors, err = s.runVectorPushPhase(
+			ctx, full, vectorScope,
+			opts.LastReconciledVectorGeneration, nil, onProgress,
+		)
 		if err != nil {
 			return result, err
 		}
@@ -552,7 +594,10 @@ func (s *Sync) Push(
 			result.Errors,
 		)
 	}
-	result.Vectors, err = s.runVectorPushPhase(ctx, full, failedSessions, onProgress)
+	result.Vectors, err = s.runVectorPushPhase(
+		ctx, full, vectorScope,
+		opts.LastReconciledVectorGeneration, failedSessions, onProgress,
+	)
 	if err != nil {
 		return result, err
 	}
@@ -568,16 +613,23 @@ func (s *Sync) Push(
 // failedSessions names sessions whose session-phase push failed; their vectors
 // are deferred so pgvector data never runs ahead of the sessions/messages rows.
 // full bypasses the unchanged-hash skip so a --full push also repairs vector
-// rows whose push state wrongly reports them current. onProgress, when
-// non-nil, receives Phase "vectors" reports as the delta scan advances.
+// rows whose push state wrongly reports them current. scope, when non-nil,
+// limits reconciliation to those session IDs (empty means no vector work);
+// nil keeps the generation-wide read. onProgress, when non-nil, receives
+// Phase "vectors" reports as the delta scan advances.
 func (s *Sync) runVectorPushPhase(
-	ctx context.Context, full bool, failedSessions map[string]struct{},
+	ctx context.Context, full bool, scope []string,
+	lastReconciledGeneration int64,
+	failedSessions map[string]struct{},
 	onProgress func(PushProgress),
 ) (VectorPushResult, error) {
 	if s.vectorSource == nil {
 		return VectorPushResult{Skipped: true}, nil
 	}
-	res, err := s.pushVectors(ctx, full, failedSessions, onProgress)
+	res, err := s.pushVectors(
+		ctx, full, scope, lastReconciledGeneration,
+		failedSessions, onProgress,
+	)
 	if err != nil {
 		return res, fmt.Errorf("vector push: %w", err)
 	}
