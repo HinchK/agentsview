@@ -807,7 +807,7 @@ var Registry = []AgentDef{
 			// macOS
 			"Library/Application Support/poolside",
 			// Linux
-			".local/share/poolside",
+			".local/state/poolside",
 			// Windows
 			"AppData/Roaming/poolside",
 		},

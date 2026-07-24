@@ -713,7 +713,7 @@ func TestResolveScriptKiloLegacyRejectsSymlinkedTaskDir(t *testing.T) {
 // remotesync.resolvePoolsideTarget.
 func TestResolveScriptPoolsideTargetsOnlyTrajectories(t *testing.T) {
 	home := t.TempDir()
-	poolsideRoot := filepath.Join(home, ".local", "share", "poolside")
+	poolsideRoot := filepath.Join(home, ".local", "state", "poolside")
 	trajectoriesDir := filepath.Join(poolsideRoot, "trajectories")
 	settingsDir := filepath.Join(poolsideRoot, "settings")
 	require.NoError(t, os.MkdirAll(trajectoriesDir, 0o755))
@@ -729,7 +729,7 @@ func TestResolveScriptPoolsideTargetsOnlyTrajectories(t *testing.T) {
 
 	records := resolveOutputRecords(string(out))
 	trajectoriesSuffix := filepath.ToSlash(filepath.Join(
-		".local", "share", "poolside", "trajectories"))
+		".local", "state", "poolside", "trajectories"))
 	assert.True(t, hasRecordWithPathSuffix(records,
 		string(parser.AgentPoolside), trajectoriesSuffix),
 		"only the trajectories/ subdirectory must be emitted as the target")
@@ -746,7 +746,7 @@ func TestResolveScriptPoolsideTargetsOnlyTrajectories(t *testing.T) {
 // not exist.
 func TestResolveScriptPoolsideSkipsRootWithoutTrajectories(t *testing.T) {
 	home := t.TempDir()
-	poolsideRoot := filepath.Join(home, ".local", "share", "poolside")
+	poolsideRoot := filepath.Join(home, ".local", "state", "poolside")
 	require.NoError(t, os.MkdirAll(poolsideRoot, 0o755))
 
 	out := runResolveScriptForTest(t, "HOME="+home)

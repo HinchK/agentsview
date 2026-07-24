@@ -341,7 +341,7 @@ func TestResolveTargetsMatchesSSHResolverForRepresentativeHome(t *testing.T) {
 	windsurfWorkspaceDir := filepath.Join(windsurfWorkspaceRoot, "workspace-a")
 	windsurfStateDB := filepath.Join(windsurfWorkspaceDir, parser.WindsurfStateDBName)
 	windsurfWorkspaceJSON := filepath.Join(windsurfWorkspaceDir, "workspace.json")
-	poolsideRoot := filepath.Join(home, ".local", "share", "poolside")
+	poolsideRoot := filepath.Join(home, ".local", "state", "poolside")
 	poolsideTrajectories := filepath.Join(poolsideRoot, "trajectories")
 	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
 	require.NoError(t, os.MkdirAll(codexDir, 0o755))
