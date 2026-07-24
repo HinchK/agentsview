@@ -209,6 +209,7 @@ func filterToQuery(f ListFilter) url.Values {
 	setIfNotEmpty("date", f.Date)
 	setIfNotEmpty("date_from", f.DateFrom)
 	setIfNotEmpty("date_to", f.DateTo)
+	setIfNotEmpty("timezone", f.Timezone)
 	setIfNotEmpty("active_since", f.ActiveSince)
 	if f.MinMessages > 0 {
 		q.Set("min_messages", strconv.Itoa(f.MinMessages))
@@ -505,6 +506,7 @@ func (b *httpBackend) SearchContent(
 		"date":            req.Date,
 		"date_from":       req.DateFrom,
 		"date_to":         req.DateTo,
+		"timezone":        req.Timezone,
 		"active_since":    req.ActiveSince,
 		"scope":           req.Scope,
 	} {

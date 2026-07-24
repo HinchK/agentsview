@@ -166,7 +166,7 @@ type ContentSearchRequest struct {
 	Context int `json:"context,omitempty"`
 
 	Project, ExcludeProject, Machine, Agent           string
-	Date, DateFrom, DateTo, ActiveSince               string
+	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch string
@@ -379,6 +379,7 @@ type ListFilter struct {
 	Date             string `json:"date,omitempty"`
 	DateFrom         string `json:"date_from,omitempty"`
 	DateTo           string `json:"date_to,omitempty"`
+	Timezone         string `json:"timezone,omitempty"`
 	ActiveSince      string `json:"active_since,omitempty"`
 	MinMessages      int    `json:"min_messages,omitempty"`
 	MaxMessages      int    `json:"max_messages,omitempty"`

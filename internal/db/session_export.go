@@ -131,6 +131,7 @@ type sessionExportCursorFilters struct {
 	Date                 string   `json:"date,omitempty"`
 	DateFrom             string   `json:"date_from,omitempty"`
 	DateTo               string   `json:"date_to,omitempty"`
+	Timezone             string   `json:"timezone,omitempty"`
 	ActiveSince          string   `json:"active_since,omitempty"`
 	MinMessages          int      `json:"min_messages,omitempty"`
 	MaxMessages          int      `json:"max_messages,omitempty"`
@@ -999,6 +1000,7 @@ func sessionExportFilters(f SessionFilter) sessionExportCursorFilters {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -1028,6 +1030,7 @@ func sessionExportFilterFromCursor(f sessionExportCursorFilters) SessionFilter {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -1055,6 +1058,17 @@ func canonicalSessionExportFilter(f SessionFilter) SessionFilter {
 	f.Date = strings.TrimSpace(f.Date)
 	f.DateFrom = strings.TrimSpace(f.DateFrom)
 	f.DateTo = strings.TrimSpace(f.DateTo)
+	if timezone, err := NormalizeSessionTimezone(f.Timezone); err == nil {
+		if timezone == "UTC" {
+			// Preserve the existing cursor wire form while treating an
+			// explicit UTC filter as equivalent to the omitted UTC default.
+			f.Timezone = ""
+		} else {
+			f.Timezone = timezone
+		}
+	} else {
+		f.Timezone = strings.TrimSpace(f.Timezone)
+	}
 	f.ActiveSince = strings.TrimSpace(f.ActiveSince)
 	f.AutomatedScope = normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
 	f.ExcludeAutomated = false
@@ -1108,12 +1122,6 @@ func sessionExportFiltersEqual(
 
 func buildSessionExportFilter(f SessionFilter) (string, []any) {
 	dialect := SQLiteQueryDialect()
-	if f.IncludeChildren {
-		dialect.activityExpr = sessionExportLastActivitySortExprFor("root_session")
-	} else {
-		dialect.activityExpr = sessionExportLastActivitySortExpr()
-	}
-	dialect.activityParam = func(ph string) string { return "julianday(" + ph + ")" }
 	return BuildSessionFilterSQL(f, dialect)
 }
 
