@@ -2,9 +2,9 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type ServiceSyncInput = {
-  id?: string;
-  path?: string;
-  subagents?: boolean;
+export type SyncWatchRename = {
+  agent?: string;
+  item_type?: number;
+  path: string;
+  root?: string;
 };
-

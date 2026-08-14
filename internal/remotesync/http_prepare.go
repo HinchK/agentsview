@@ -245,7 +245,6 @@ func (hs HTTPSync) prepare(
 	if err := validateTargetSetPaths(targets); err != nil {
 		return nil, err
 	}
-
 	prepared := &PreparedHTTP{
 		sync:        hs,
 		targets:     targets,

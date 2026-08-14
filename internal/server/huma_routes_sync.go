@@ -175,6 +175,7 @@ func (s *Server) syncEngineForLocal(local *db.DB) *syncpkg.Engine {
 	if s.engine != nil {
 		return s.engine
 	}
+	cfg := s.ingestionConfig()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.onDemandEngine != nil {
@@ -185,12 +186,13 @@ func (s *Server) syncEngineForLocal(local *db.DB) *syncpkg.Engine {
 		emitter = s.broadcaster
 	}
 	s.onDemandEngine = syncpkg.NewEngine(local, syncpkg.EngineConfig{
-		AgentDirs:               s.cfg.AgentDirs,
-		SourceMachines:          s.cfg.SourceMachines,
-		IncludeCwdPrefixes:      s.cfg.SyncIncludeCwdPrefixes,
-		ScanProtectedPaths:      s.cfg.ScanProtectedPaths,
-		Machine:                 s.cfg.LocalMachineName,
-		BlockedResultCategories: s.cfg.ResultContentBlockedCategories,
+		AgentDirs:               cfg.AgentDirs,
+		SourceMachines:          cfg.SourceMachines,
+		DisabledAgents:          cfg.DisabledAgents,
+		IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths:      cfg.ScanProtectedPaths,
+		Machine:                 cfg.LocalMachineName,
+		BlockedResultCategories: cfg.ResultContentBlockedCategories,
 		Emitter:                 emitter,
 	})
 	return s.onDemandEngine
@@ -438,6 +440,7 @@ func (s *Server) runRemoteSyncRequest(
 	req remoteSyncRequest,
 	progress func(syncpkg.Progress),
 ) (response remoteSyncResponse) {
+	ingestionCfg := s.ingestionConfig()
 	started := time.Now()
 	var remoteStats remotesync.SyncStats
 	log.Printf(
@@ -508,7 +511,7 @@ func (s *Server) runRemoteSyncRequest(
 						len(httpHosts),
 					)
 					prepared, err := prepareHTTPHosts(
-						ctx, s.cfg, local, httpHosts, progress,
+						ctx, ingestionCfg, local, httpHosts, progress,
 					)
 					if err != nil {
 						return syncpkg.RebuildOptions{}, prepared, err
@@ -876,6 +879,7 @@ func (s *Server) runRemoteSyncHostsOwned(
 	progress func(syncpkg.Progress),
 	acquireHTTPRegistry bool,
 ) ([]remoteSyncFailure, remotesync.SyncStats, error) {
+	ingestionCfg := s.ingestionConfig()
 	failures := make([]remoteSyncFailure, 0)
 	var totals remotesync.SyncStats
 	for _, rh := range hosts {
@@ -895,14 +899,14 @@ func (s *Server) runRemoteSyncHostsOwned(
 				Port:                    rh.Port,
 				Full:                    full,
 				DB:                      local,
-				BlockedResultCategories: s.cfg.ResultContentBlockedCategories,
+				BlockedResultCategories: ingestionCfg.ResultContentBlockedCategories,
 				Progress:                progress,
 			}
 			stats, err = runRemoteSync(ctx, rs)
 		case config.RemoteTransportHTTP:
 			runHTTP := func() (remotesync.SyncStats, error) {
 				return runHTTPRemoteSync(
-					ctx, s.cfg, local, rh, full, progress,
+					ctx, ingestionCfg, local, rh, full, progress,
 				)
 			}
 			if acquireHTTPRegistry {

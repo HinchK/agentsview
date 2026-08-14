@@ -89,7 +89,7 @@ func newImportLayout(targets TargetSet, root string) (importLayout, error) {
 	// paths like /__drive_C/... instead of the original remote path on
 	// Windows/UNC remotes. Registering each extra file as its own
 	// remote->local pair fixes both the skip cache and the rewriter.
-	for _, remoteFile := range targets.ExtraFiles {
+	for _, remoteFile := range targets.AllExtraFiles() {
 		local, err := safeRemappedRemotePath(root, remoteFile)
 		if err != nil {
 			return importLayout{}, err
@@ -111,9 +111,7 @@ func newImportInputs(
 		return importLayout{}, syncpkg.EngineConfig{}, err
 	}
 	layout.paths.host = host
-	return layout, importEngineConfig(
-		host, blockedResultCategories, layout,
-	), nil
+	return layout, importEngineConfig(host, blockedResultCategories, layout), nil
 }
 
 func (p remotePathMap) pathRewriter() func(string) string {

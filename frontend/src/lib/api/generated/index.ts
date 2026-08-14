@@ -196,6 +196,7 @@ export type { ServiceUsagePairwiseComparisonDelta } from './models/ServiceUsageP
 export type { ServiceUsagePairwiseComparisonResponse } from './models/ServiceUsagePairwiseComparisonResponse';
 export type { ServiceUsagePairwiseComparisonSide } from './models/ServiceUsagePairwiseComparisonSide';
 export type { SessionDirectoryResponse } from './models/SessionDirectoryResponse';
+export type { SessionProviderResponse } from './models/SessionProviderResponse';
 export type { SessionUsageBreakdownResponse } from './models/SessionUsageBreakdownResponse';
 export type { SessionUsageResponse } from './models/SessionUsageResponse';
 export type { SetGithubConfigInputBody } from './models/SetGithubConfigInputBody';
@@ -209,6 +210,9 @@ export type { SyncRebuildPhaseStats } from './models/SyncRebuildPhaseStats';
 export type { SyncSanitizeStats } from './models/SyncSanitizeStats';
 export type { SyncStatusResponse } from './models/SyncStatusResponse';
 export type { SyncSyncStats } from './models/SyncSyncStats';
+export type { SyncWatchBatch } from './models/SyncWatchBatch';
+export type { SyncWatchRecoveryScope } from './models/SyncWatchRecoveryScope';
+export type { SyncWatchRename } from './models/SyncWatchRename';
 export { TerminalConfigBody } from './models/TerminalConfigBody';
 export type { TerminalResponse } from './models/TerminalResponse';
 export type { TrashResponse } from './models/TrashResponse';

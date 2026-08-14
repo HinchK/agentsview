@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,7 +71,7 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	require.NoError(t, err)
 	manifestJSON, err := json.Marshal(manifest)
 	require.NoError(t, err)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newCurrentProtocolServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")
@@ -210,6 +209,72 @@ func TestImporterImportsExtractedRemoteFiles(t *testing.T) {
 	require.NotNil(t, full)
 	require.NotNil(t, full.FilePath)
 	assert.Contains(t, *full.FilePath, "devbox:/home/wes/.claude/projects/test-project/session.jsonl")
+}
+
+func TestImporterImportsEveryRemoteProviderTarget(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	claudeRoot := "/remote/claude"
+	claudeDir := filepath.Join(
+		remappedRemotePath(extracted, claudeRoot), "project",
+	)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(claudeDir, "enabled.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUserWithSessionID(
+				"2026-08-09T10:00:00Z", "enabled remote", "enabled-remote",
+			).
+			String()),
+		0o644,
+	))
+
+	geminiRoot := "/remote/gemini"
+	geminiDir := filepath.Join(
+		remappedRemotePath(extracted, geminiRoot),
+		"tmp", "project", "chats",
+	)
+	require.NoError(t, os.MkdirAll(geminiDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(geminiDir,
+			"session-2026-08-09T10-00-disabled-remote.json"),
+		[]byte(testjsonl.GeminiSessionJSON(
+			"disabled-remote",
+			"project",
+			"2026-08-09T10:00:00Z",
+			"2026-08-09T10:01:00Z",
+			[]map[string]any{
+				testjsonl.GeminiUserMsg(
+					"user", "2026-08-09T10:00:00Z", "disabled remote",
+				),
+			},
+		)),
+		0o644,
+	))
+
+	stats, err := Importer{
+		Host: "devbox",
+		DB:   database,
+	}.ImportExtracted(t.Context(), TargetSet{
+		Dirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+			parser.AgentGemini: {geminiRoot},
+		},
+	}, extracted)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, stats.SessionsSynced)
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Sessions, 2)
+	ids := []string{page.Sessions[0].ID, page.Sessions[1].ID}
+	assert.ElementsMatch(t, []string{
+		"devbox~enabled",
+		"devbox~gemini:disabled-remote",
+	}, ids)
 }
 
 func TestImporterImportsHermesDatabaseOnlySession(t *testing.T) {

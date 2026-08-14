@@ -2,9 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type ServiceSyncInput = {
-  id?: string;
-  path?: string;
-  subagents?: boolean;
+export type SyncWatchRecoveryScope = {
+  available_roots?: Array<string> | null;
+  deferred_roots?: Array<string> | null;
 };
-
