@@ -4802,7 +4802,8 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 
 	occupied := ln.Addr().(*net.TCPAddr).Port
 
-	got := server.FindAvailablePort("127.0.0.1", occupied)
+	got, err := server.FindAvailablePort("127.0.0.1", occupied)
+	require.NoError(t, err)
 	if got == occupied {
 		t.Errorf(
 			"FindAvailablePort returned occupied port %d", occupied,
@@ -4810,11 +4811,55 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 	}
 }
 
+func TestFindAvailablePortWildcardSkipsIPv4OccupiedPort(t *testing.T) {
+	// A dual-stack wildcard listen can succeed on IPv6 while an unrelated
+	// process still owns the port on IPv4 (observed on macOS), so wildcard
+	// availability must check the IPv4 wildcard address on its own.
+	ln, err := net.Listen("tcp4", "0.0.0.0:0")
+	require.NoError(t, err, "bind IPv4 wildcard")
+	defer ln.Close()
+
+	occupied := ln.Addr().(*net.TCPAddr).Port
+
+	got, err := server.FindAvailablePort("0.0.0.0", occupied)
+	require.NoError(t, err)
+	assert.NotEqual(t, occupied, got,
+		"wildcard port selection must skip an IPv4-occupied port")
+}
+
+func TestFindAvailablePortWildcardSkipsIPv6OccupiedPort(t *testing.T) {
+	ln, err := net.Listen("tcp6", "[::]:0")
+	if err != nil {
+		t.Skipf("IPv6 unavailable: %v", err)
+	}
+	defer ln.Close()
+
+	occupied := ln.Addr().(*net.TCPAddr).Port
+
+	got, err := server.FindAvailablePort("0.0.0.0", occupied)
+	require.NoError(t, err)
+	assert.NotEqual(t, occupied, got,
+		"wildcard port selection must skip an IPv6-occupied port")
+}
+
 func TestFindAvailablePortZeroReturnsAssignedPort(t *testing.T) {
-	got := server.FindAvailablePort("127.0.0.1", 0)
+	got, err := server.FindAvailablePort("127.0.0.1", 0)
+	require.NoError(t, err)
 	if got == 0 {
 		t.Fatal("FindAvailablePort returned literal port 0")
 	}
+}
+
+func TestFindAvailablePortDoesNotReturnExhaustedCandidate(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:65535")
+	if err != nil {
+		t.Skipf("reserve final TCP port: %v", err)
+	}
+	defer ln.Close()
+
+	_, err = server.FindAvailablePort("127.0.0.1", 65535)
+	require.Error(t, err,
+		"an exhausted search must report that no candidate is available")
 }
 
 func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {

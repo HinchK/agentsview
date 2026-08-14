@@ -62,18 +62,19 @@ const (
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu             gosync.RWMutex
-	cfg            config.Config
-	db             db.Store
-	engine         *sync.Engine
-	onDemandEngine *sync.Engine
-	sessions       service.SessionService
-	broadcaster    *Broadcaster
-	mux            *http.ServeMux
-	api            huma.API
-	httpSrv        *http.Server
-	version        VersionInfo
-	dataDir        string
+	mu              gosync.RWMutex
+	cfg             config.Config
+	db              db.Store
+	engine          *sync.Engine
+	onDemandEngine  *sync.Engine
+	sessions        service.SessionService
+	broadcaster     *Broadcaster
+	mux             *http.ServeMux
+	api             huma.API
+	httpSrv         *http.Server
+	startupProbeKey []byte
+	version         VersionInfo
+	dataDir         string
 
 	httpRemoteCleanupRegistry *remotesync.CleanupRegistry
 
@@ -496,6 +497,7 @@ func (s *Server) routes() {
 			s.handleArtifactExchange,
 		)
 	}
+	s.registerStartupProbeRoute()
 
 	// SPA fallback: serve embedded frontend
 	// Do not use timeout handler for static assets to avoid buffering.
@@ -1121,30 +1123,110 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// FindAvailablePort finds an available port starting from the
-// given port, binding to the specified host.
-func FindAvailablePort(host string, start int) int {
+// FindAvailablePort finds an available port starting from the given port,
+// binding to the specified host. It returns an error instead of reusing an
+// occupied port when the candidate range is exhausted.
+func FindAvailablePort(host string, start int) (int, error) {
+	return findAvailablePort(host, start, selectEphemeralPort)
+}
+
+func findAvailablePort(
+	host string,
+	start int,
+	selectEphemeral func(string) (int, error),
+) (int, error) {
 	if start == 0 {
-		addr := net.JoinHostPort(host, "0")
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			defer ln.Close()
-			if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
-				return tcpAddr.Port
+		if !isWildcardListenHost(host) {
+			return selectEphemeral(host)
+		}
+		probes := listenProbes(host)
+		for range 100 {
+			port, err := selectEphemeral(host)
+			if err != nil {
+				return 0, err
+			}
+			if listenProbesFree(probes, port) {
+				return port, nil
 			}
 		}
-		return start
+		return 0, fmt.Errorf(
+			"no available ephemeral port on %s after 100 attempts", host,
+		)
 	}
 
-	for port := start; port < start+100; port++ {
-		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			ln.Close()
-			return port
+	probes := listenProbes(host)
+	last := min(start+99, 65535)
+	for port := start; port <= last; port++ {
+		if listenProbesFree(probes, port) {
+			return port, nil
 		}
 	}
-	return start
+	return 0, fmt.Errorf(
+		"no available port on %s in range %d-%d", host, start, last,
+	)
+}
+
+func selectEphemeralPort(host string) (int, error) {
+	addr := net.JoinHostPort(host, "0")
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return 0, fmt.Errorf("select ephemeral port on %s: %w", host, err)
+	}
+	defer ln.Close()
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+		return tcpAddr.Port, nil
+	}
+	return 0, fmt.Errorf("listener on %s did not return a TCP address", host)
+}
+
+type listenProbe struct {
+	network string
+	host    string
+}
+
+func isWildcardListenHost(host string) bool {
+	return host == "" || host == "0.0.0.0" || host == "::"
+}
+
+// listenProbes returns the bind attempts that must all succeed before a
+// port counts as available on host. Wildcard hosts probe the IPv4 and IPv6
+// wildcard addresses separately: a combined dual-stack listen can succeed
+// on one family while an unrelated process still owns the port on the
+// other (observed on macOS), handing out a port the server cannot fully
+// claim. A family that cannot bind at all (for example IPv6-disabled
+// hosts) is excluded from the check rather than treated as occupied.
+func listenProbes(host string) []listenProbe {
+	if !isWildcardListenHost(host) {
+		return []listenProbe{{network: "tcp", host: host}}
+	}
+	var probes []listenProbe
+	for _, probe := range []listenProbe{
+		{network: "tcp4", host: "0.0.0.0"},
+		{network: "tcp6", host: "::"},
+	} {
+		ln, err := net.Listen(probe.network, net.JoinHostPort(probe.host, "0"))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		probes = append(probes, probe)
+	}
+	if len(probes) == 0 {
+		return []listenProbe{{network: "tcp", host: host}}
+	}
+	return probes
+}
+
+func listenProbesFree(probes []listenProbe, port int) bool {
+	for _, probe := range probes {
+		addr := net.JoinHostPort(probe.host, strconv.Itoa(port))
+		ln, err := net.Listen(probe.network, addr)
+		if err != nil {
+			return false
+		}
+		ln.Close()
+	}
+	return true
 }
 
 // isMutating returns true for HTTP methods that change state.
