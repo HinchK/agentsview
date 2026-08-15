@@ -308,6 +308,10 @@ type EngineConfig struct {
 	// startup discovery completed authoritatively. Failed, cancelled, and
 	// aborted attempts leave it eligible for a later successful owner.
 	OnStartupReconciled func(SyncStats, error)
+	// ProgressStallAfter controls when CurrentProgress marks an active pass as
+	// stalled. Zero uses the production default. Tests and embedders may use a
+	// shorter interval without changing the daemon-wide policy.
+	ProgressStallAfter time.Duration
 	// ProviderFactories and ProviderMigrationModes select which concrete
 	// providers own discovery and parsing for their agents. Nil uses the
 	// parser package registry/manifest.
@@ -343,6 +347,7 @@ type Engine struct {
 	lastSync           time.Time
 	lastSyncStats      SyncStats
 	currentProgress    *Progress
+	progressStallAfter time.Duration
 	// skipCache tracks paths that should be skipped on
 	// subsequent syncs, keyed by path with the file mtime
 	// at time of caching. Covers parse errors and
@@ -648,6 +653,10 @@ func NewEngine(
 		// choice.
 		parser.SetAllowProtectedPathProbes(true)
 	}
+	progressStallAfter := cfg.ProgressStallAfter
+	if progressStallAfter <= 0 {
+		progressStallAfter = defaultProgressStallAfter
+	}
 	e := &Engine{
 		db:                      database,
 		stat:                    os.Stat,
@@ -680,6 +689,7 @@ func NewEngine(
 		startupReconciledReady:  make(chan struct{}),
 		startupAttemptReady:     make(chan struct{}),
 		onStartupReconciled:     cfg.OnStartupReconciled,
+		progressStallAfter:      progressStallAfter,
 		reconciliationSpoolFactory: func(path string) (reconciliationSpoolStore, error) {
 			return newReconciliationSpool(path)
 		},
@@ -1210,14 +1220,41 @@ func (e *Engine) CurrentProgress() (Progress, bool) {
 	if e.currentProgress == nil {
 		return Progress{}, false
 	}
-	return *e.currentProgress, true
+	p := *e.currentProgress
+	if !p.UpdatedAt.IsZero() && e.progressStallAfter > 0 &&
+		time.Since(p.UpdatedAt) >= e.progressStallAfter {
+		p.Stalled = true
+	}
+	return p, true
+}
+
+// UpdateProgress records progress produced by work running outside the engine,
+// such as the isolated sync worker process.
+func (e *Engine) UpdateProgress(p Progress) {
+	e.reportProgress(nil, p)
+}
+
+// FinishProgress clears progress produced by work running outside the engine.
+func (e *Engine) FinishProgress() {
+	e.clearCurrentProgress()
 }
 
 func (e *Engine) reportProgress(
 	onProgress ProgressFunc, p Progress,
 ) {
+	now := time.Now()
 	e.mu.Lock()
-	e.currentProgress = &p
+	tracked := p
+	if tracked.StartedAt.IsZero() {
+		if e.currentProgress != nil && !e.currentProgress.StartedAt.IsZero() {
+			tracked.StartedAt = e.currentProgress.StartedAt
+		} else {
+			tracked.StartedAt = now
+		}
+	}
+	tracked.UpdatedAt = now
+	tracked.Stalled = false
+	e.currentProgress = &tracked
 	e.mu.Unlock()
 	if onProgress != nil {
 		onProgress(p)
@@ -1310,6 +1347,21 @@ func (e *Engine) prepareChangedPathSync(
 	return prepared
 }
 
+// syncChangedPathsLocked tracks changed-path preparation and application as
+// one owned pass. The caller holds syncMu, so this progress cannot overwrite a
+// different pass while waiting to enter the serialized sync path.
+func (e *Engine) syncChangedPathsLocked(
+	ctx context.Context, paths []string,
+) (SyncStats, int, error) {
+	e.reportProgress(nil, Progress{
+		Phase:  PhaseDiscovering,
+		Detail: "Preparing changed session paths",
+	})
+	return e.applyChangedPathSyncLocked(
+		ctx, e.prepareChangedPathSync(ctx, paths),
+	)
+}
+
 func (e *Engine) applyChangedPathSyncLocked(
 	ctx context.Context, prepared preparedChangedPathSync,
 ) (SyncStats, int, error) {
@@ -1321,6 +1373,11 @@ func (e *Engine) applyChangedPathSyncLocked(
 	// Begin a container pass so an already-trusted, unchanged container
 	// still gates its fan-out, but never promote from a changed-path subset.
 	e.beginSQLiteContainerPass(prepared.files, prepared.preContainerStates)
+	e.reportProgress(nil, Progress{
+		Phase:         PhaseSyncing,
+		Detail:        "Syncing changed session paths",
+		SessionsTotal: len(prepared.files),
+	})
 	results := e.startWorkers(ctx, prepared.files)
 	stats := e.collectAndBatch(
 		ctx, results, len(prepared.files), len(prepared.files), nil,
@@ -1366,14 +1423,12 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 	if e.refuseWriteInForceParse("SyncPaths") {
 		return nil
 	}
-	prepared := e.prepareChangedPathSync(ctx, paths)
-	if prepared.empty() {
-		return prepared.classificationErr
-	}
-	e.syncMu.Lock()
-	stats, tombstoned, err := e.applyChangedPathSyncLocked(ctx, prepared)
-	e.clearCurrentProgress()
-	e.syncMu.Unlock()
+	stats, tombstoned, err := func() (SyncStats, int, error) {
+		e.syncMu.Lock()
+		defer e.syncMu.Unlock()
+		defer e.clearCurrentProgress()
+		return e.syncChangedPathsLocked(ctx, paths)
+	}()
 	if stats.Synced > 0 || tombstoned > 0 ||
 		stats.sourceMissingTombstoned > 0 {
 		e.emit("sessions")
@@ -3456,6 +3511,7 @@ func (e *Engine) syncThenRunLocked(
 	// deferred signal recomputes first (inline: syncMu is held) or
 	// pushed sessions could carry stale signal/secret fields.
 	e.signalSched.flushAllInline()
+	e.clearCurrentProgress()
 	if err := work(full || didResync); err != nil {
 		return stats, err
 	}
@@ -3556,6 +3612,7 @@ func (e *Engine) SyncThenRunWithRebuild(
 		return stats, err
 	}
 	e.signalSched.flushAllInline()
+	e.clearCurrentProgress()
 	if err := work(full || didResync, didResync); err != nil {
 		return stats, err
 	}
@@ -3765,6 +3822,27 @@ func (e *Engine) RunExclusive(work func() error) error {
 	return work()
 }
 
+// ErrSyncInProgress reports that non-blocking foreground sync coordination
+// found another sync or maintenance pass holding the exclusive engine lock.
+var ErrSyncInProgress = errors.New("sync already in progress")
+
+// TryRunExclusive is the non-blocking foreground counterpart to RunExclusive.
+// Background work keeps using RunExclusive so scheduled obligations are not
+// lost; user-triggered sync requests use this method to fail promptly instead
+// of waiting behind a filesystem operation that may be stalled.
+func (e *Engine) TryRunExclusive(work func() error) error {
+	if e.refuseWriteInForceParse("TryRunExclusive") {
+		return errors.New(
+			"TryRunExclusive refused on report-only parse-diff engine",
+		)
+	}
+	if !e.syncMu.TryLock() {
+		return ErrSyncInProgress
+	}
+	defer e.syncMu.Unlock()
+	return work()
+}
+
 // RunExclusiveFlushed runs work while holding the exclusive sync lock, after
 // flushing deferred signal recomputes inline. It is the push half of
 // SyncThenRun for daemon push routes whose sync or resync already ran through
@@ -3874,19 +3952,23 @@ func (e *Engine) ReconcileWatchRoots(
 	return e.reconcileWatchRoots(ctx, roots, full, false)
 }
 
-// ReconcileWatchRootsWithStats is ReconcileWatchRoots plus the pass outcome:
-// the archive-audit worker uses it so synced and tombstoned counts reach the
-// daemon through the worker protocol.
+// ReconcileWatchRootsWithStats is ReconcileWatchRoots plus the pass outcome and
+// progress callback: the archive-audit worker uses it so progress and synced or
+// tombstoned counts reach the daemon through the worker protocol.
 func (e *Engine) ReconcileWatchRootsWithStats(
-	ctx context.Context, roots []string, full bool,
+	ctx context.Context, roots []string, full bool, onProgress ProgressFunc,
 ) (SyncStats, int, error) {
-	return e.reconcileScopedWatchRoots(ctx, "", roots, full, false)
+	return e.reconcileScopedWatchRoots(
+		ctx, "", roots, full, false, onProgress,
+	)
 }
 
 func (e *Engine) reconcileWatchRoots(
 	ctx context.Context, roots []string, full, force bool,
 ) error {
-	_, _, err := e.reconcileScopedWatchRoots(ctx, "", roots, full, force)
+	_, _, err := e.reconcileScopedWatchRoots(
+		ctx, "", roots, full, force, nil,
+	)
 	return err
 }
 
@@ -3901,7 +3983,9 @@ func (e *Engine) ReconcileProviderRoots(
 	if agent == "" {
 		return e.reconcileWatchRoots(ctx, roots, false, false)
 	}
-	_, _, err := e.reconcileScopedWatchRoots(ctx, agent, roots, false, false)
+	_, _, err := e.reconcileScopedWatchRoots(
+		ctx, agent, roots, false, false, nil,
+	)
 	return err
 }
 
@@ -3939,6 +4023,7 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 	func() {
 		e.syncMu.Lock()
 		defer e.syncMu.Unlock()
+		defer e.clearCurrentProgress()
 		linkEligible := false
 		persistEligible := false
 		for _, group := range groups {
@@ -3946,7 +4031,7 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 				break
 			}
 			stats, tombstoned, eligibility, err := e.reconcileScopedWatchRootsLocked(
-				deferredCtx, group.Agent, group.Roots, false, false,
+				deferredCtx, group.Agent, group.Roots, false, false, nil,
 			)
 			changed = changed || stats.Synced > 0 || tombstoned > 0
 			linkEligible = linkEligible || eligibility.link
@@ -3990,11 +4075,15 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 
 func (e *Engine) reconcileScopedWatchRoots(
 	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
+	onProgress ProgressFunc,
 ) (SyncStats, int, error) {
 	stats, tombstoned, _, err := func() (SyncStats, int, passEpilogueEligibility, error) {
 		e.syncMu.Lock()
 		defer e.syncMu.Unlock()
-		return e.reconcileScopedWatchRootsLocked(ctx, agent, roots, full, force)
+		defer e.clearCurrentProgress()
+		return e.reconcileScopedWatchRootsLocked(
+			ctx, agent, roots, full, force, onProgress,
+		)
 	}()
 	// Emit outside syncMu so an Emitter implementation cannot widen the
 	// critical section or deadlock by re-entering sync code (see SyncAll).
@@ -4011,7 +4100,12 @@ func (e *Engine) reconcileScopedWatchRoots(
 // exactly when the pass itself would have.
 func (e *Engine) reconcileScopedWatchRootsLocked(
 	ctx context.Context, agent parser.AgentType, roots []string, full, force bool,
+	onProgress ProgressFunc,
 ) (SyncStats, int, passEpilogueEligibility, error) {
+	e.reportProgress(onProgress, Progress{
+		Phase:  PhaseDiscovering,
+		Detail: "Reconciling watched session roots",
+	})
 	fullCoverage := full || (agent == "" && len(roots) == 0)
 	plans, excludedRemoteRoots := e.resolveReconciliationPlans(
 		ctx, agent, roots, full, fullCoverage,
@@ -4028,7 +4122,7 @@ func (e *Engine) reconcileScopedWatchRootsLocked(
 		return SyncStats{}, 0, passEpilogueEligibility{}, nil
 	}
 	stats, metrics, tombstoned, eligibility, err := e.reconcileWatchRootsStreamedLocked(
-		ctx, plans, fullCoverage, force,
+		ctx, plans, fullCoverage, force, onProgress,
 	)
 	metrics.ExcludedRemoteRoots = excludedRemoteRoots
 	complete := err == nil && ctx.Err() == nil && !stats.Aborted &&
@@ -4191,7 +4285,7 @@ func reconciliationPlansNeedPass(plans []providerReconciliationPlan) bool {
 // provider scope resolution with a string slice.
 func (e *Engine) reconcileWatchRootsStreamedLocked(
 	ctx context.Context, plans []providerReconciliationPlan,
-	fullCoverage, force bool,
+	fullCoverage, force bool, onProgress ProgressFunc,
 ) (
 	stats SyncStats, metrics ReconciliationMetrics, tombstoned int,
 	eligibility passEpilogueEligibility, retErr error,
@@ -4328,7 +4422,7 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 			ctx, reconciliationBaselineContextKey{}, baselineTracker,
 		)
 		pageStats := e.collectAndBatch(
-			pageCtx, e.startWorkers(pageCtx, files), len(files), len(files), nil,
+			pageCtx, e.startWorkers(pageCtx, files), len(files), len(files), onProgress,
 			syncWriteDefault,
 		)
 		mergeReconciliationSyncStats(&stats, pageStats)
