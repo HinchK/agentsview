@@ -707,8 +707,9 @@ func TestResyncLocalCancellationPreventsContributors(t *testing.T) {
 
 type staticUsageRebuildProvider struct {
 	parser.ProviderBase
-	source parser.SourceRef
-	result parser.ParseResult
+	source             parser.SourceRef
+	result             parser.ParseResult
+	forceParseRequests []bool
 }
 
 func (p *staticUsageRebuildProvider) Discover(context.Context) ([]parser.SourceRef, error) {
@@ -722,12 +723,47 @@ func (p *staticUsageRebuildProvider) Fingerprint(
 }
 
 func (p *staticUsageRebuildProvider) Parse(
-	context.Context, parser.ParseRequest,
+	_ context.Context, request parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
+	p.forceParseRequests = append(p.forceParseRequests, request.ForceParse)
 	return parser.ParseOutcome{
 		Results:           []parser.ParseResultOutcome{{Result: p.result}},
 		ResultSetComplete: true,
 	}, nil
+}
+
+func TestResyncContributorForceParseReachesProvider(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	engine := NewEngine(database, EngineConfig{})
+	t.Cleanup(engine.Close)
+	provider := newStaticUsageRebuildProvider(
+		"forced-contributor", "forced-contributor.jsonl", 1, 1,
+	)
+
+	stats, err := engine.ResyncAllWithOptions(
+		context.Background(), nil, RebuildOptions{Contributors: []RebuildContributor{{
+			Name:       "forced",
+			ForceParse: true,
+			Config: EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{
+					parser.AgentCowork: {"forced-root"},
+				},
+				Machine: "forced", Ephemeral: true,
+				ProviderFactories: []parser.ProviderFactory{
+					staticUsageRebuildFactory{provider: provider},
+				},
+				ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+					parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+				},
+			},
+		}}},
+	)
+
+	require.NoError(t, err)
+	require.False(t, stats.Aborted, "rebuild aborted: %+v", stats)
+	assert.Equal(t, []bool{true}, provider.forceParseRequests)
 }
 
 type staticUsageRebuildFactory struct{ provider *staticUsageRebuildProvider }

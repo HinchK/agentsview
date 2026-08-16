@@ -397,7 +397,7 @@ func (e *Engine) processS3Session(
 			}
 		}
 		res.sourceMissingMembers = missing
-		if !e.forceParse && !file.ForceParse &&
+		if !e.forceParseRequested(file) &&
 			!res.suppressPresenceSweep && res.providerFailureCount == 0 &&
 			len(res.retrySessionIDs) == 0 && !res.noCacheSkip {
 			res.claudeRowlessFreshnessKey =

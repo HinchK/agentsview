@@ -274,13 +274,21 @@ desktop-linux-appimage:
 # Backward-compatible alias (macOS .app)
 desktop-app: desktop-macos-app
 
-# Run tests
+# Keep local package/test-process fan-out bounded. A plain `go test ./...`
+# otherwise defaults to GOMAXPROCS, which can launch a large number of fresh
+# test binaries at once on a developer machine. Override with `GO_TEST_P=`
+# when an operator intentionally wants the Go default.
+GO_TEST_P ?= 4
+GO_TEST_P_FLAG := $(if $(GO_TEST_P),-p $(GO_TEST_P),)
+
+# Run the cacheable unit/integration suite. The external-service lanes below
+# intentionally retain `-count=1` because they require fresh state.
 test: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -v -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -v
 
 # Run fast tests only
 test-short: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -short -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -short
 
 # Run the quarantined eval-ingest endpoint tests under their build tag.
 # Only internal/server contains evalingest-gated code; every other package is

@@ -32,6 +32,7 @@ type HTTPSync struct {
 	URL                     string
 	Token                   string
 	Full                    bool
+	FullReason              FullImportReason
 	DataDir                 string
 	DB                      *db.DB
 	BlockedResultCategories []string
@@ -40,6 +41,17 @@ type HTTPSync struct {
 	Lifecycle               *HTTPSyncLifecycle
 	runPrepare              func(context.Context) (*PreparedHTTP, error)
 	removeArchiveSpool      func(string) error
+}
+
+// forceParseRequested distinguishes an operator-requested full sync from a
+// complete source scan required by an automatic data rebuild. A blank reason
+// retains the historical meaning of Full for direct callers.
+func (hs HTTPSync) forceParseRequested() bool {
+	return hs.Full && (hs.FullReason == "" || hs.FullReason == FullImportExplicit)
+}
+
+func (hs HTTPSync) forceFullParseAfterCacheRequested() bool {
+	return hs.Full && !hs.forceParseRequested()
 }
 
 // PreparedCleanupError reports an operation failure while retaining a prepared
@@ -107,12 +119,17 @@ func (hs HTTPSync) importRoot(
 	stats, err := Importer{
 		Host:                    hs.Host,
 		Full:                    hs.Full,
+		RequireComplete:         true,
 		DB:                      hs.DB,
 		BlockedResultCategories: hs.BlockedResultCategories,
 		Progress:                hs.Progress,
 	}.ImportExtracted(ctx, targets, root)
+	stats.FullReason = hs.FullReason
+	if stats.FullReason == "" {
+		stats.FullReason = FullImportLegacy
+	}
 	if err != nil {
-		return SyncStats{}, err
+		return stats, err
 	}
 	hs.report(syncpkg.Progress{
 		Detail: fmt.Sprintf(
@@ -236,8 +253,24 @@ func (hs HTTPSync) downloadIntoMirror(
 	if err := RemoveMirrorFetchFiles(mirrorRoot, fetch); err != nil {
 		return err
 	}
-	if err := archive.extract(ctx, mirrorRoot, hs.Progress, extractLabel); err != nil {
-		return fmt.Errorf("extract archive into mirror: %w", err)
+	var extractErr error
+	if full && fetch != nil {
+		selected := make(map[string]struct{}, len(fetch))
+		for _, remotePath := range fetch {
+			name, nameErr := safeRemotePathArchiveName(remotePath)
+			if nameErr != nil {
+				return nameErr
+			}
+			selected[filepath.ToSlash(filepath.Clean(name))] = struct{}{}
+		}
+		extractErr = archive.extractSelected(
+			ctx, mirrorRoot, selected, hs.Progress, extractLabel,
+		)
+	} else {
+		extractErr = archive.extract(ctx, mirrorRoot, hs.Progress, extractLabel)
+	}
+	if extractErr != nil {
+		return fmt.Errorf("extract archive into mirror: %w", extractErr)
 	}
 	return nil
 }

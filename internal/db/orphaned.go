@@ -1409,7 +1409,9 @@ func (d *DB) CopySessionMetadataFrom(
 	// makes journal continuity across the swap worthless, which is why the
 	// publication-revision counters are not copied either — the fresh
 	// database's own trigger-maintained counters stand, and the fresh
-	// journal rows they stamp are only ever consumed relative to them.
+	// journal rows they stamp are only ever consumed relative to them. Remote
+	// import data versions also identify the physical database generation; a
+	// remote contributor must establish them again in the replacement.
 	if oldDBHasTable(ctx, tx, "archive_metadata") {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO main.archive_metadata (key, value, created_at, updated_at)
@@ -1421,6 +1423,7 @@ func (d *DB) CopySessionMetadataFrom(
 				'session_deletion_publication_revision',
 				'worktree_mapping_publication_revision'
 			)
+			AND key NOT GLOB 'remote_import_data_version:*'
 			ON CONFLICT(key) DO UPDATE SET
 				value = excluded.value,
 				created_at = excluded.created_at,

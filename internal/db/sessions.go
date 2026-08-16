@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -4278,6 +4279,13 @@ func storedSourcePathHintQuery(
 }
 
 func cleanStoredSourcePathHint(path string) string {
+	// Remote source paths are stored with forward slashes even when the
+	// collector runs on Windows. Keep those paths in their stored syntax so a
+	// collector never rewrites a remote host's separators before the indexed
+	// lookup. Native Windows paths contain backslashes and still use filepath.
+	if strings.Contains(path, "/") {
+		return pathpkg.Clean(path)
+	}
 	return filepath.Clean(path)
 }
 

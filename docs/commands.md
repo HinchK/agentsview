@@ -279,12 +279,21 @@ the list, since remote sessions are namespaced by host.
 
 During HTTP remote sync, the collector prints durable phase lines for resolving
 remote roots, fetching and comparing the manifest, transferring and extracting
-changed files, processing each contributor, rebuilding FTS, and swapping the
-database. Archive downloads also show live compressed-byte progress when the
-remote daemon provides a `Content-Length` header. The new phases and bulk-ingest
-path come from the collector; a spoke upgrade is needed only for manifest-delta
-transfer. If an upgraded binary does not show those phases, restart the local
-collector daemon.
+changed files, planning pending paths, processing affected sources, rebuilding
+FTS, and swapping the database. Pending paths can outnumber processed sources:
+deletions participate in recovery and cache invalidation but usually do not
+produce an import source. Provider fallback is identified explicitly, and its
+discovered sources determine the processing denominator.
+
+The final per-host line reports changed sessions, ordinary unchanged skips, and
+error-suppressed pending entries. A retained-journal line means recovery work
+will be replayed; cancellation, processing failure, cache-persistence failure,
+retirement failure, and a rebuild awaiting its database swap remain distinct.
+Individual source paths are omitted from normal output. Archive downloads also
+show live compressed-byte progress when the remote daemon provides a
+`Content-Length` header. These phases come from the collector; a spoke upgrade
+is needed only for manifest-delta transfer. If an upgraded binary does not show
+them, restart the local collector daemon.
 
 ______________________________________________________________________
 

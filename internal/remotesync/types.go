@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
@@ -12,10 +13,34 @@ import (
 )
 
 type SyncStats struct {
-	SessionsSynced int `json:"sessions_synced"`
-	SessionsTotal  int `json:"sessions_total"`
-	Skipped        int `json:"skipped"`
-	Failed         int `json:"failed"`
+	SessionsSynced       int              `json:"sessions_synced"`
+	SessionsTotal        int              `json:"sessions_total"`
+	Skipped              int              `json:"skipped"`
+	Failed               int              `json:"failed"`
+	PendingNew           int              `json:"pending_new,omitempty"`
+	PendingRearmed       int              `json:"pending_rearmed,omitempty"`
+	PendingReplayed      int              `json:"pending_replayed,omitempty"`
+	PendingPaths         int              `json:"pending_paths,omitempty"`
+	ArmedPaths           int              `json:"armed_paths,omitempty"`
+	ExactSources         int              `json:"exact_sources,omitempty"`
+	FallbackProviders    int              `json:"fallback_providers,omitempty"`
+	FallbackSources      int              `json:"fallback_sources,omitempty"`
+	FilesDiscovered      int              `json:"files_discovered,omitempty"`
+	FilesProcessed       int              `json:"files_processed,omitempty"`
+	PruneExactScopes     int              `json:"prune_exact_scopes,omitempty"`
+	PruneProviderScopes  int              `json:"prune_provider_scopes,omitempty"`
+	PruneHostWideScope   bool             `json:"prune_host_wide_scope,omitempty"`
+	PrunedExact          int              `json:"pruned_exact,omitempty"`
+	PrunedProvider       int              `json:"pruned_provider,omitempty"`
+	PrunedHostWide       int              `json:"pruned_host_wide,omitempty"`
+	ErrorSuppressed      int              `json:"error_suppressed,omitempty"`
+	FullReason           FullImportReason `json:"full_reason,omitempty"`
+	JournalOutcome       JournalOutcome   `json:"journal_outcome,omitempty"`
+	PlanningDuration     time.Duration    `json:"planning_duration,omitempty"`
+	PruningDuration      time.Duration    `json:"pruning_duration,omitempty"`
+	ProcessingDuration   time.Duration    `json:"processing_duration,omitempty"`
+	CachePersistDuration time.Duration    `json:"cache_persist_duration,omitempty"`
+	RetirementDuration   time.Duration    `json:"retirement_duration,omitempty"`
 }
 
 type TargetSet struct {
@@ -252,9 +277,16 @@ func (r *ArchiveRequest) UnmarshalJSON(data []byte) error {
 }
 
 type Importer struct {
-	Host                    string
-	Full                    bool
-	DB                      *db.DB
-	BlockedResultCategories []string
-	Progress                syncpkg.ProgressFunc
+	Host                      string
+	Full                      bool
+	ForceFullParseAfterCache  bool
+	RequireComplete           bool
+	DB                        *db.DB
+	BlockedResultCategories   []string
+	Progress                  syncpkg.ProgressFunc
+	Targets                   TargetSet
+	Root                      string
+	replaceRemoteSkippedFiles func(string, map[string]int64) error
+	applyRemoteSkippedChanges func(string, []string, map[string]int64) error
+	saveSkipCache             func(*db.DB, *syncpkg.Engine, remotePathMap) error
 }

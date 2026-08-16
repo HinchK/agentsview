@@ -175,16 +175,24 @@ and continues to copy a full session tree on each run.
    size, and modification time.
 1. The collector walks the mirror and compares file size and modification time
    at microsecond precision. It schedules missing or changed files for fetch and
-   removes mirror files that disappeared from the manifest.
+   removes mirror files that disappeared from the manifest. Before changing the
+   mirror, it durably merges those paths into a bounded recovery journal next to
+   the mirror.
 1. When fewer than half of the manifest's files need fetching, the collector
    requests only that delta. At half or more, it requests a full archive instead
    of sending a large file list. The current collector advertises gzip support
    for both archive modes.
 1. The archive is extracted into the mirror with remote modification times
-   preserved. AgentsView then imports from the complete mirror, so parsers that
-   read sibling files behave the same way they do against a full source tree.
-   The separate database skip cache avoids unnecessary parsing of unchanged
-   sessions during normal syncs.
+   preserved. AgentsView classifies the pending journal paths and imports only
+   their affected sources. A provider whose exact scope cannot be proven falls
+   back to discovery under that provider's roots; it does not widen other
+   providers. The journal is retired only after session writes and the remote
+   skip cache are durable.
+
+Transfer breadth and import breadth are independent. The half-manifest
+heuristic can download a full archive while the collector still processes only
+the changed-source plan. Conversely, an explicit full import reparses the
+complete mirror without forcing unchanged bytes across the network.
 
 For a configured full sync that includes local sources, mirror preparation
 finishes before database work begins. The collector then ingests local sources
@@ -198,9 +206,17 @@ Remote-only syncs, including
 the active archive and do not use the combined rebuild path.
 
 If no directory-scoped files changed, the collector skips the archive request
-and imports directly from the existing mirror. Files that disappear remotely are
-deleted from the mirror, but remote import is intentionally non-destructive:
-sessions already stored in the AgentsView database remain available.
+and, when no recovery work is pending, performs no import. Files that disappear
+remotely are deleted from the mirror, but remote import is intentionally
+non-destructive: sessions already stored in the AgentsView database remain
+available.
+
+If a process stops after mirror mutation, the next sync replays the pending
+journal. Cache invalidation is armed once per observed remote version so a
+same-mtime extraction cannot be hidden by stale cache state. A deterministic
+parse failure is then retained in the existing error-skip cache, retried on
+replay as a skip, and re-armed only when the remote path changes again. Recovery
+work is bounded; overflow collapses to one conservative full import.
 
 Windsurf is a special case. Its state database is sanitized into a curated
 export for every transfer, so the raw tree cannot safely participate in the

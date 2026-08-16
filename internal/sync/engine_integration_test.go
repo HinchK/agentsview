@@ -3323,7 +3323,10 @@ func TestResyncContributorFailureLeavesArchiveUnchanged(t *testing.T) {
 	dbtest.WriteTestFile(t, remotePath, []byte(testjsonl.NewSessionBuilder().
 		AddClaudeUser(tsEarlyS5, "partial remote message").String()))
 
-	sentinel := errors.New("after sync failed")
+	afterSyncErr := errors.New("after sync failed")
+	afterFailureErr := errors.New("after failure failed")
+	var failureDB *db.DB
+	var failureWriterClosed bool
 	stats, err := env.engine.ResyncAllWithOptions(context.Background(), nil,
 		sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
 			Name: "broken-remote",
@@ -3333,16 +3336,33 @@ func TestResyncContributorFailureLeavesArchiveUnchanged(t *testing.T) {
 				IDPrefix:  "broken~",
 				Ephemeral: true,
 			},
-			AfterSync: func(*sync.Engine, *db.DB) error { return sentinel },
+			AfterSync: func(*sync.Engine, *db.DB) error { return afterSyncErr },
+			AfterFailure: func(_ *sync.Engine, activeDB *db.DB) error {
+				failureDB = activeDB
+				failureWriterClosed = activeDB.WriterClosed()
+				if persistErr := activeDB.ReplaceRemoteSkippedFiles(
+					"broken-remote", map[string]int64{"retry.jsonl": 42},
+				); persistErr != nil {
+					return errors.Join(afterFailureErr, persistErr)
+				}
+				return afterFailureErr
+			},
 		}}})
 	require.Error(t, err)
 	assert.True(t, stats.Aborted)
 	var contributorErr *sync.RebuildContributorError
 	require.True(t, errors.As(err, &contributorErr))
 	assert.Equal(t, "broken-remote", contributorErr.Contributor)
-	assert.ErrorIs(t, err, sentinel)
+	assert.ErrorIs(t, err, afterSyncErr)
+	assert.ErrorIs(t, err, afterFailureErr)
 	assert.Contains(t, stats.Warnings,
 		`resync contributor "broken-remote" failed: after sync failed`)
+	assert.Same(t, env.db, failureDB)
+	assert.False(t, failureWriterClosed,
+		"AfterFailure must receive a writable active archive")
+	retryState, loadErr := env.db.LoadRemoteSkippedFiles("broken-remote")
+	require.NoError(t, loadErr)
+	assert.Equal(t, map[string]int64{"retry.jsonl": 42}, retryState)
 
 	oldSession, getErr := env.db.GetSession(context.Background(), "old-session")
 	require.NoError(t, getErr)
@@ -4360,6 +4380,37 @@ func TestSyncAllDedupesClaudeSourcesBySessionID(t *testing.T) {
 		Synced:        0,
 		Skipped:       1,
 	})
+}
+
+func TestSyncChangedPathFallbackDedupesClaudeSourcesBySessionID(t *testing.T) {
+	liveDir := t.TempDir()
+	archiveDir := t.TempDir()
+	env := setupTestEnv(t, WithClaudeDirs([]string{liveDir, archiveDir}))
+
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsZero, "same logical fallback session").
+		String()
+	livePath := env.writeSession(
+		t, liveDir, filepath.Join("proj-live", "fallback-duplicate.jsonl"), content,
+	)
+	archivePath := env.writeSession(
+		t, archiveDir, filepath.Join("proj-archive", "fallback-duplicate.jsonl"), content,
+	)
+	older := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Second)
+	require.NoError(t, os.Chtimes(archivePath, older, older))
+	require.NoError(t, os.Chtimes(livePath, newer, newer))
+
+	result, err := env.engine.SyncChangedPathPlanContext(
+		t.Context(), sync.ChangedPathPlan{
+			FallbackProviders: []parser.AgentType{parser.AgentClaude},
+		}, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.FilesDiscovered)
+	assert.Equal(t, 1, result.FilesProcessed)
+	assert.Equal(t, 1, result.Stats.Synced)
+	assert.Equal(t, livePath, env.db.GetSessionFilePath("fallback-duplicate"))
 }
 
 func TestSyncAllClaudeDuplicateLiveGrowthBeatsUnchangedStoredArchive(t *testing.T) {
@@ -14940,6 +14991,151 @@ func TestSyncSingleSessionIncrementalAppendLinksSpawnedChild(t *testing.T) {
 	assert.Equal(t, "agent-orch", parentSessionIDOf(t, env, "agent-kid"),
 		"an incrementally appended spawn edge must re-link the child in "+
 			"the same single-session sync")
+}
+
+func TestSyncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T) {
+	env := setupTestEnv(t)
+	env.writeClaudeSession(
+		t, "changed-path-link", "main-changed-path.jsonl",
+		testjsonl.JoinJSONL(
+			`{"type":"user","timestamp":"2024-01-01T09:00:00Z","uuid":"m1","message":{"content":"root"},"cwd":"/tmp","sessionId":"main-changed-path"}`,
+		),
+	)
+	orchestratorPath := env.writeSession(
+		t, env.claudeDir,
+		filepath.Join(
+			"changed-path-link", "main-changed-path", "subagents",
+			"agent-orchestrator.jsonl",
+		),
+		testjsonl.JoinJSONL(
+			`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"o1","message":{"content":"orchestrate"},"cwd":"/tmp","sessionId":"main-changed-path"}`,
+		),
+	)
+	env.writeSession(
+		t, env.claudeDir,
+		filepath.Join(
+			"changed-path-link", "main-changed-path", "subagents",
+			"agent-child.jsonl",
+		),
+		testjsonl.JoinJSONL(
+			`{"type":"user","timestamp":"2024-01-01T10:30:00Z","uuid":"c1","message":{"content":"child work"},"cwd":"/tmp","sessionId":"main-changed-path"}`,
+		),
+	)
+	require.Equal(t, 3, env.engine.SyncAll(t.Context(), nil).Synced)
+	require.Equal(t, "main-changed-path",
+		parentSessionIDOf(t, env, "agent-child"))
+
+	var firstMessageID int64
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT id FROM messages
+		WHERE session_id = ? AND ordinal = 0`,
+		"agent-orchestrator",
+	).Scan(&firstMessageID))
+
+	file, err := os.OpenFile(orchestratorPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, writeErr := file.WriteString(testjsonl.JoinJSONL(
+		`{"type":"assistant","timestamp":"2024-01-01T10:31:00Z","uuid":"o2","parentUuid":"o1","message":{"id":"msg_orchestrator","content":[{"type":"tool_use","id":"toolu_changed_path","name":"Agent","input":{"description":"d","subagent_type":"Explore","prompt":"p"}}],"usage":{"input_tokens":1,"output_tokens":1},"stop_reason":"tool_use"}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:32:00Z","uuid":"o3","parentUuid":"o2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_changed_path","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"child"}}`,
+	) + "\n")
+	require.NoError(t, file.Close())
+	require.NoError(t, writeErr)
+
+	plan, err := env.engine.PlanChangedPathsContext(
+		t.Context(), []string{orchestratorPath},
+	)
+	require.NoError(t, err)
+	result, err := env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Stats.Synced)
+
+	var gotFirstMessageID int64
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT id FROM messages
+		WHERE session_id = ? AND ordinal = 0`,
+		"agent-orchestrator",
+	).Scan(&gotFirstMessageID))
+	assert.Equal(t, firstMessageID, gotFirstMessageID,
+		"the changed-path update must stay on the incremental append path")
+	assert.Equal(t, "agent-orchestrator",
+		parentSessionIDOf(t, env, "agent-child"),
+		"bounded changed-path sync must link children spawned by an append")
+}
+
+func TestSyncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T) {
+	env := setupTestEnv(t)
+	env.writeClaudeSession(
+		t, "changed-path-link-retry", "main-changed-path-retry.jsonl",
+		testjsonl.JoinJSONL(
+			`{"type":"user","timestamp":"2024-01-01T09:00:00Z","uuid":"m1","message":{"content":"root"},"cwd":"/tmp","sessionId":"main-changed-path-retry"}`,
+		),
+	)
+	orchestratorPath := env.writeSession(
+		t, env.claudeDir,
+		filepath.Join(
+			"changed-path-link-retry", "main-changed-path-retry", "subagents",
+			"agent-orchestrator-retry.jsonl",
+		),
+		testjsonl.JoinJSONL(
+			`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"o1","message":{"content":"orchestrate"},"cwd":"/tmp","sessionId":"main-changed-path-retry"}`,
+		),
+	)
+	env.writeSession(
+		t, env.claudeDir,
+		filepath.Join(
+			"changed-path-link-retry", "main-changed-path-retry", "subagents",
+			"agent-child-retry.jsonl",
+		),
+		testjsonl.JoinJSONL(
+			`{"type":"user","timestamp":"2024-01-01T10:30:00Z","uuid":"c1","message":{"content":"child work"},"cwd":"/tmp","sessionId":"main-changed-path-retry"}`,
+		),
+	)
+	require.Equal(t, 3, env.engine.SyncAll(t.Context(), nil).Synced)
+	require.Equal(t, "main-changed-path-retry",
+		parentSessionIDOf(t, env, "agent-child-retry"))
+
+	file, err := os.OpenFile(orchestratorPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, writeErr := file.WriteString(testjsonl.JoinJSONL(
+		`{"type":"assistant","timestamp":"2024-01-01T10:31:00Z","uuid":"o2","parentUuid":"o1","message":{"id":"msg_orchestrator","content":[{"type":"tool_use","id":"toolu_changed_path_retry","name":"Agent","input":{"description":"d","subagent_type":"Explore","prompt":"p"}}],"usage":{"input_tokens":1,"output_tokens":1},"stop_reason":"tool_use"}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:32:00Z","uuid":"o3","parentUuid":"o2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_changed_path_retry","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"child-retry"}}`,
+	) + "\n")
+	require.NoError(t, file.Close())
+	require.NoError(t, writeErr)
+
+	raw, err := sql.Open("sqlite3", env.db.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec(`
+		CREATE TRIGGER fail_changed_path_child_link
+		BEFORE UPDATE OF parent_session_id ON sessions
+		WHEN NEW.id = 'agent-child-retry'
+		  AND NEW.parent_session_id = 'agent-orchestrator-retry'
+		BEGIN
+			SELECT RAISE(FAIL, 'injected changed-path link failure');
+		END`)
+	require.NoError(t, err)
+
+	plan, err := env.engine.PlanChangedPathsContext(
+		t.Context(), []string{orchestratorPath},
+	)
+	require.NoError(t, err)
+	_, err = env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+	require.ErrorContains(t, err, "injected changed-path link failure")
+
+	var queued int
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT count(*) FROM subagent_parent_repair_queue
+		WHERE session_id = 'agent-orchestrator-retry'`,
+	).Scan(&queued))
+	require.Equal(t, 1, queued,
+		"the changed spawner must remain queued after scoped linking fails")
+
+	_, err = raw.Exec("DROP TRIGGER fail_changed_path_child_link")
+	require.NoError(t, err)
+	require.NoError(t, env.db.RepairQueuedSubagentParents())
+	assert.Equal(t, "agent-orchestrator-retry",
+		parentSessionIDOf(t, env, "agent-child-retry"))
 }
 
 // TestSyncSingleSessionNewEdgeLinkFailureRetriesFromDurableQueue covers the

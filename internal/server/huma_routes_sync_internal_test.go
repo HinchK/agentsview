@@ -320,6 +320,7 @@ func stubRunHTTPRemoteSync(
 type fakePreparedHTTPRebuild struct {
 	contributors []syncpkg.RebuildContributor
 	closed       int
+	committed    int
 	closeErrors  []error
 }
 
@@ -335,6 +336,20 @@ func (p *fakePreparedHTTPRebuild) Close() error {
 		return p.closeErrors[p.closed-1]
 	}
 	return nil
+}
+
+func (p *fakePreparedHTTPRebuild) Commit() error {
+	p.committed++
+	return nil
+}
+
+func TestPreparedHTTPRebuildLeaseForwardsCommitOnce(t *testing.T) {
+	prepared := &fakePreparedHTTPRebuild{}
+	lease := &preparedHTTPRebuildLease{prepared: prepared, release: func() {}}
+	require.NoError(t, lease.Commit())
+	require.NoError(t, lease.Commit())
+	assert.Equal(t, 1, prepared.committed)
+	assert.Zero(t, prepared.closed, "commit must not infer cleanup")
 }
 
 func TestHTTPCoordinatorFailurePrefersContributorOverCleanupHost(t *testing.T) {
@@ -521,6 +536,7 @@ func TestRunRemoteSyncRequestUnifiedHTTPContributorFailureSkipsSSH(t *testing.T)
 	) (preparedHTTPRebuild, error) {
 		require.Len(t, syncs, 1)
 		assert.Equal(t, "alpha", syncs[0].Host)
+		assert.Equal(t, remotesync.FullImportExplicit, syncs[0].FullReason)
 		return prepared, nil
 	})
 	sshCalls := 0
@@ -1163,8 +1179,10 @@ func TestRunRemoteSyncRequestRemoteOnlyKeepsActiveHTTPPath(t *testing.T) {
 	f := newSyncRouteFixture(t)
 	prepareCalls := 0
 	stubPrepareHTTPRebuild(t, func(
-		context.Context, []remotesync.HTTPSync,
+		_ context.Context, syncs []remotesync.HTTPSync,
 	) (preparedHTTPRebuild, error) {
+		require.Len(t, syncs, 1)
+		assert.Equal(t, remotesync.FullImportDataRebuild, syncs[0].FullReason)
 		prepareCalls++
 		return &fakePreparedHTTPRebuild{}, nil
 	})

@@ -1761,12 +1761,17 @@ type processFixtureProvider struct {
 	parser.ProviderBase
 
 	source        parser.SourceRef
+	discovered    []parser.SourceRef
 	findFound     bool
 	fingerprint   parser.SourceFingerprint
 	outcome       parser.ParseOutcome
 	calls         []string
 	findRequests  []parser.FindSourceRequest
 	parseRequests []parser.ParseRequest
+}
+
+func (p *processFixtureProvider) Discover(context.Context) ([]parser.SourceRef, error) {
+	return append([]parser.SourceRef(nil), p.discovered...), nil
 }
 
 func (p *processFixtureProvider) FindSource(

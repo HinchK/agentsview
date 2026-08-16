@@ -84,11 +84,16 @@ var runHTTPRemoteSync = func(
 			rh.Host,
 		)
 	}
+	fullReason := remotesync.FullImportReason("")
+	if full {
+		fullReason = remotesync.FullImportExplicit
+	}
 	return remotesync.HTTPSync{
 		Host:                    rh.Host,
 		URL:                     rh.URL,
 		Token:                   token,
 		Full:                    full,
+		FullReason:              fullReason,
 		DataDir:                 cfg.DataDir,
 		DB:                      local,
 		BlockedResultCategories: cfg.ResultContentBlockedCategories,
@@ -109,8 +114,9 @@ var prepareHTTPRebuild = func(
 }
 
 type preparedHTTPRebuildLease struct {
-	prepared preparedHTTPRebuild
-	release  func()
+	prepared  preparedHTTPRebuild
+	release   func()
+	committed bool
 }
 
 func (l *preparedHTTPRebuildLease) Close() error {
@@ -122,6 +128,21 @@ func (l *preparedHTTPRebuildLease) Close() error {
 		l.release = nil
 	}
 	return l.prepared.Close()
+}
+
+func (l *preparedHTTPRebuildLease) Commit() error {
+	if l == nil || l.prepared == nil || l.committed {
+		return nil
+	}
+	committer, ok := l.prepared.(syncpkg.RebuildCommitter)
+	if !ok {
+		return nil
+	}
+	if err := committer.Commit(); err != nil {
+		return err
+	}
+	l.committed = true
+	return nil
 }
 
 func (s *Server) humaSyncStatus(
@@ -482,6 +503,10 @@ func (s *Server) runRemoteSyncRequest(
 	failures := make([]remoteSyncFailure, 0)
 	var blocked error
 	if req.IncludeLocal {
+		fullReason := remotesync.FullImportDataRebuild
+		if req.Full {
+			fullReason = remotesync.FullImportExplicit
+		}
 		httpHosts, sshHosts := partitionRemoteHosts(req.Hosts)
 		outerOwnsHTTP := len(httpHosts) > 0
 		var httpContributorsStarted time.Time
@@ -511,7 +536,7 @@ func (s *Server) runRemoteSyncRequest(
 						len(httpHosts),
 					)
 					prepared, err := prepareHTTPHosts(
-						ctx, ingestionCfg, local, httpHosts, progress,
+						ctx, ingestionCfg, local, httpHosts, fullReason, progress,
 					)
 					if err != nil {
 						return syncpkg.RebuildOptions{}, prepared, err
@@ -744,6 +769,7 @@ func prepareHTTPHosts(
 	cfg config.Config,
 	local *db.DB,
 	hosts []config.RemoteHost,
+	fullReason remotesync.FullImportReason,
 	progress func(syncpkg.Progress),
 ) (preparedHTTPRebuild, error) {
 	if len(hosts) == 0 {
@@ -763,6 +789,7 @@ func prepareHTTPHosts(
 			URL:                     host.URL,
 			Token:                   host.Token,
 			Full:                    true,
+			FullReason:              fullReason,
 			DataDir:                 cfg.DataDir,
 			DB:                      local,
 			BlockedResultCategories: cfg.ResultContentBlockedCategories,
