@@ -236,6 +236,14 @@ support is deprecated because current Amp releases may keep full threads
 server-side and leave only local stubs; historical local Amp thread JSON files
 can still be parsed.
 
+The matching environment variable and `*_dirs` configuration key override an
+agent's default directories. Environment variables take precedence when both
+are set. An explicit empty `*_dirs` array, such as `grok_dirs = []`, clears that
+agent's default local directories, so local discovery finds nothing there.
+Matching `session_sources` entries for that agent still apply. Provider-wide
+exclusion is documented under [Disabling Session Providers](#disabling-session-providers).
+Omitting the key keeps its default directories.
+
 | Agent                 | Default Directory                                                                | File Format                                                                                                                     |
 | --------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Aider                 | No default; opt in with `AIDER_DIR` or `aider_dirs`                              | `.aider.chat.history.md` Markdown history files                                                                                 |
@@ -749,8 +757,9 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `shelley_dirs`, `traex_sessions_dirs`, `visualstudio_copilot_dirs`,
 `vscode_copilot_dirs`, `windsurf_dirs`, `warp_dirs`,
 `workbuddy_project_dirs`, `zcode_dirs`, `zed_dirs`, and `zencoder_dirs`. Each
-accepts an array of paths. When set, these take precedence over the
-single-directory environment variable and the default path.
+accepts an array of paths. Environment variables take precedence over these
+arrays when both are set; otherwise, a non-empty array replaces the default
+path and an explicit empty array clears the default local directory.
 
 All listed directories are discovered, watched, and synced independently.
 
