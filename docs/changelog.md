@@ -21,6 +21,10 @@ description: Release history for AgentsView
   Sessions in those folders now keep path-only project identity; set
   `scan_protected_paths` to opt back in to Git remote, worktree, and branch
   detail there.
+- Ignore self-referential subagent spawn edges when linking session
+  hierarchy, and resolve a self-parent claim to the parser-derived parent (or
+  no parent) at ingest and once per archive for rows an earlier build had
+  linked to themselves.
 
 ---
 

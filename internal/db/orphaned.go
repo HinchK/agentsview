@@ -217,6 +217,9 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 		); err != nil {
 			return 0, fmt.Errorf("sanitizing orphaned data: %w", err)
 		}
+		if err := clearCopiedSelfParents(ctx, tx, "_orphaned_ids"); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -491,6 +494,27 @@ func (d *DB) CopySyncStateFrom(sourcePath string) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing sync state copy: %w", err)
+	}
+	return nil
+}
+
+// clearCopiedSelfParents applies the self-parent repair to the sessions just
+// copied from the source archive. The fresh archive's one-time
+// repairLegacySelfParentedSessions pass usually runs before orphans are
+// copied, so a self-parented row from an older source would otherwise
+// survive the rebuild.
+func clearCopiedSelfParents(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE main.sessions
+		SET parent_session_id = NULLIF(parser_parent_session_id, id),
+		local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id IN (SELECT id FROM `+tempIDsTable+`)
+		  AND parent_session_id IS id`); err != nil {
+		return fmt.Errorf("clearing copied self-parented sessions: %w", err)
 	}
 	return nil
 }
