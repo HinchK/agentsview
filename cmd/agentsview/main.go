@@ -540,6 +540,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		idleTracker.Touch()
 		go idleTracker.Run(ctx)
 	}
+	startDaemonUsageCacheBackfill(ctx, database, idleTracker)
 	if engine != nil && opts.SkipInitialSync {
 		go func() {
 			timer := time.NewTimer(deferredStartupSyncGracePeriod)
@@ -603,6 +604,34 @@ func runServe(cfg config.Config, opts serveOptions) {
 
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("%v", err)
+	}
+}
+
+type usageCacheBackfiller interface {
+	StartUsageCacheBackfill(context.Context) error
+	WaitUsageCacheBackfill(context.Context) error
+	SetUsageCacheBackfillStarted(func())
+}
+
+func startDaemonUsageCacheBackfill(
+	ctx context.Context, backfiller usageCacheBackfiller,
+	idleTracker *server.IdleTracker,
+) {
+	backfiller.SetUsageCacheBackfillStarted(func() {
+		done, ok := idleTracker.BeginWork()
+		if !ok {
+			return
+		}
+		go func() {
+			defer done()
+			if err := backfiller.WaitUsageCacheBackfill(ctx); err != nil &&
+				ctx.Err() == nil {
+				log.Printf("usage cache backfill: %v", err)
+			}
+		}()
+	})
+	if err := backfiller.StartUsageCacheBackfill(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("usage cache backfill: %v", err)
 	}
 }
 
