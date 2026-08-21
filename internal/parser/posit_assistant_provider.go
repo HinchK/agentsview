@@ -3,7 +3,7 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,11 +58,9 @@ func (f positAssistantProviderFactory) Capabilities() Capabilities {
 func (f positAssistantProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &positAssistantProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   positAssistantProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    positAssistantProviderCapabilities(),
+		Config:  cfg,
 		sources: newPositAssistantSourceSet(cfg.Roots),
 	}
 }
@@ -1055,7 +1053,7 @@ func positAssistantFillTokenUsage(msg *ParsedMessage, usage gjson.Result) {
 	msg.ContextTokens = input + cacheRead + cacheWrite
 	msg.OutputTokens = output
 
-	tokenUsageJSON, err := json.Marshal(tokenUsage)
+	tokenUsageJSON, err := json.Marshal(tokenUsage, json.Deterministic(true))
 	if err == nil {
 		msg.TokenUsage = tokenUsageJSON
 	}

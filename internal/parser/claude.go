@@ -4,7 +4,8 @@ package parser
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"log"
@@ -1933,28 +1934,36 @@ func claudeBlockExistsIn(
 }
 
 func replaceClaudeMessageContent(line string, blocks []gjson.Result) string {
-	// UseNumber preserves the raw textual form of JSON numbers so
-	// re-marshaling doesn't truncate large integers (e.g. usage
-	// token counts) or change scientific notation.
-	dec := json.NewDecoder(strings.NewReader(line))
-	dec.UseNumber()
-	var top map[string]any
-	if err := dec.Decode(&top); err != nil {
+	var top map[string]jsontext.Value
+	if err := json.Unmarshal([]byte(line), &top); err != nil || top == nil {
 		return line
 	}
-	msg, ok := top["message"].(map[string]any)
+	messageData, ok := top["message"]
 	if !ok {
 		return line
 	}
-	content := make([]json.RawMessage, 0, len(blocks))
+	var msg map[string]jsontext.Value
+	if err := json.Unmarshal(messageData, &msg); err != nil || msg == nil {
+		return line
+	}
+	content := make([]jsontext.Value, 0, len(blocks))
 	for _, block := range blocks {
 		if block.Raw == "" {
 			continue
 		}
-		content = append(content, json.RawMessage(block.Raw))
+		content = append(content, jsontext.Value(block.Raw))
 	}
-	msg["content"] = content
-	encoded, err := json.Marshal(top)
+	contentData, err := json.Marshal(content)
+	if err != nil {
+		return line
+	}
+	msg["content"] = contentData
+	messageData, err = json.Marshal(msg, json.Deterministic(true))
+	if err != nil {
+		return line
+	}
+	top["message"] = messageData
+	encoded, err := json.Marshal(top, json.Deterministic(true))
 	if err != nil {
 		return line
 	}
@@ -2002,38 +2011,40 @@ func resolveClaudePersistedToolResults(sessionPath, line string) string {
 		return line
 	}
 
-	dec := json.NewDecoder(strings.NewReader(line))
-	dec.UseNumber()
-	var top map[string]any
-	if err := dec.Decode(&top); err != nil {
+	var top map[string]jsontext.Value
+	if err := json.Unmarshal([]byte(line), &top); err != nil || top == nil {
 		return line
 	}
 
-	msg, ok := top["message"].(map[string]any)
-	if !ok {
+	var msg map[string]jsontext.Value
+	if err := json.Unmarshal(top["message"], &msg); err != nil || msg == nil {
 		return line
 	}
-	blocks, ok := msg["content"].([]any)
-	if !ok {
+	var blocks []jsontext.Value
+	if err := json.Unmarshal(msg["content"], &blocks); err != nil {
 		return line
 	}
 
 	persistedPath := ""
-	if tur, ok := top["toolUseResult"].(map[string]any); ok {
-		if p, ok := tur["persistedOutputPath"].(string); ok {
-			persistedPath = p
-		}
+	var toolUseResult map[string]jsontext.Value
+	if err := json.Unmarshal(top["toolUseResult"], &toolUseResult); err == nil {
+		_ = json.Unmarshal(toolUseResult["persistedOutputPath"], &persistedPath)
 	}
 	toolResultCount := countClaudeToolResultBlocks(blocks)
 
 	changed := false
-	for _, rawBlock := range blocks {
-		block, ok := rawBlock.(map[string]any)
-		if !ok || block["type"] != "tool_result" {
+	for i, rawBlock := range blocks {
+		var block map[string]jsontext.Value
+		if err := json.Unmarshal(rawBlock, &block); err != nil || block == nil {
 			continue
 		}
-		content, ok := block["content"].(string)
-		if !ok {
+		var blockType string
+		if err := json.Unmarshal(block["type"], &blockType); err != nil ||
+			blockType != "tool_result" {
+			continue
+		}
+		var content string
+		if err := json.Unmarshal(block["content"], &content); err != nil {
 			continue
 		}
 		path := persistedOutputPathFromContent(content)
@@ -2048,25 +2059,45 @@ func resolveClaudePersistedToolResults(sessionPath, line string) string {
 		if !ok {
 			continue
 		}
-		block["content"] = output
+		contentData, err := json.Marshal(output)
+		if err != nil {
+			return line
+		}
+		block["content"] = contentData
+		blocks[i], err = json.Marshal(block, json.Deterministic(true))
+		if err != nil {
+			return line
+		}
 		changed = true
 	}
 	if !changed {
 		return line
 	}
 
-	encoded, err := json.Marshal(top)
+	contentData, err := json.Marshal(blocks)
+	if err != nil {
+		return line
+	}
+	msg["content"] = contentData
+	messageData, err := json.Marshal(msg, json.Deterministic(true))
+	if err != nil {
+		return line
+	}
+	top["message"] = messageData
+	encoded, err := json.Marshal(top, json.Deterministic(true))
 	if err != nil {
 		return line
 	}
 	return string(encoded)
 }
 
-func countClaudeToolResultBlocks(blocks []any) int {
+func countClaudeToolResultBlocks(blocks []jsontext.Value) int {
 	count := 0
 	for _, rawBlock := range blocks {
-		block, ok := rawBlock.(map[string]any)
-		if ok && block["type"] == "tool_result" {
+		var block struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(rawBlock, &block) == nil && block.Type == "tool_result" {
 			count++
 		}
 	}
@@ -2358,7 +2389,7 @@ func extractClaudeTokenFields(msg *ParsedMessage, line string) {
 
 	usageResult := gjson.Get(line, "message.usage")
 	if usageResult.Exists() {
-		msg.TokenUsage = json.RawMessage(usageResult.Raw)
+		msg.TokenUsage = jsontext.Value(usageResult.Raw)
 		msg.HasOutputTokens = usageResult.Get("output_tokens").Exists()
 		msg.HasContextTokens = usageResult.Get("input_tokens").Exists() ||
 			usageResult.Get("cache_creation_input_tokens").Exists() ||

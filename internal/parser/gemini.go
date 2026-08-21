@@ -4,7 +4,8 @@ package parser
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"strings"
@@ -40,13 +41,13 @@ func extractGeminiTokens(msg gjson.Result) geminiTokens {
 // Anthropic-style shape used by usage and cost queries. Thoughts
 // tokens are billed at the output rate, so they fold into
 // output_tokens here.
-func normalizedGeminiTokenUsage(tok geminiTokens) json.RawMessage {
+func normalizedGeminiTokenUsage(tok geminiTokens) jsontext.Value {
 	payload := map[string]int{
 		"input_tokens":            tok.Input,
 		"output_tokens":           tok.Output + tok.Thoughts,
 		"cache_read_input_tokens": tok.Cached,
 	}
-	raw, err := json.Marshal(payload)
+	raw, err := json.Marshal(payload, json.Deterministic(true))
 	if err != nil {
 		return nil
 	}
@@ -251,7 +252,7 @@ func parseGeminiMessage(
 	}
 
 	tok := extractGeminiTokens(msg)
-	var tokenUsage json.RawMessage
+	var tokenUsage jsontext.Value
 	tokResult := msg.Get("tokens")
 	if tokResult.Exists() {
 		tokenUsage = normalizedGeminiTokenUsage(tok)
@@ -311,7 +312,7 @@ func applyGeminiCumulativeDeltas(messages []ParsedMessage) {
 				"output_tokens":           usage.Output,
 				"cache_read_input_tokens": cachedDelta,
 			}
-			if raw, err := json.Marshal(payload); err == nil {
+			if raw, err := json.Marshal(payload, json.Deterministic(true)); err == nil {
 				messages[i].TokenUsage = raw
 			}
 		}

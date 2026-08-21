@@ -5,7 +5,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"mime/multipart"
@@ -605,6 +606,36 @@ func TestOpenAPIEndpointDocumentsExistingAPIRoutes(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/session-stats"], "get")
 }
 
+func TestTypedRoutesRejectDuplicateJSONMembers(t *testing.T) {
+	te := setup(t)
+
+	w := te.post(t, "/api/v1/config/terminal", `{"mode":"auto","mode":"clipboard"}`)
+
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestOpenAPIEndpointDocumentsTokenUsageAsArbitraryJSON(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]jsontext.Value `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	messageSchema, ok := spec.Components.Schemas["DbMessage"]
+	require.True(t, ok, "spec missing DbMessage schema")
+	tokenUsage, ok := messageSchema.Properties["token_usage"]
+	require.True(t, ok, "DbMessage schema missing token_usage")
+	assert.JSONEq(t, `{}`, string(tokenUsage))
+}
+
 func TestOpenAPIEndpointKeepsUsageSummaryContract(t *testing.T) {
 	te := setup(t)
 
@@ -912,7 +943,7 @@ func TestOpenAPIEndpointDocumentsBatchDeleteSessionIDsAsNonNullableArray(t *test
 			Schemas map[string]struct {
 				Required   []string `json:"required"`
 				Properties map[string]struct {
-					Type json.RawMessage `json:"type"`
+					Type jsontext.Value `json:"type"`
 				} `json:"properties"`
 			} `json:"schemas"`
 		} `json:"components"`
@@ -1465,7 +1496,7 @@ func TestListSessions_Empty(t *testing.T) {
 
 	// Verify raw JSON has "sessions":[] not "sessions":null.
 	var raw struct {
-		Sessions json.RawMessage `json:"sessions"`
+		Sessions jsontext.Value `json:"sessions"`
 	}
 	if err := json.Unmarshal(
 		w.Body.Bytes(), &raw,
@@ -3666,7 +3697,7 @@ func TestSettingsDisabledProvidersDefaultToEmptyArray(t *testing.T) {
 	w := te.get(t, "/api/v1/settings")
 	assertStatus(t, w, http.StatusOK)
 	var got struct {
-		DisabledAgents json.RawMessage `json:"disabled_agents"`
+		DisabledAgents jsontext.Value `json:"disabled_agents"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 	assert.JSONEq(t, `[]`, string(got.DisabledAgents))
@@ -5304,7 +5335,7 @@ func TestHandleToolCalls_Basic(t *testing.T) {
 		ToolCalls []service.ToolCall `json:"tool_calls"`
 		Count     int                `json:"count"`
 	}
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.NoError(t, json.UnmarshalRead(w.Body, &body))
 	require.Equal(t, 2, body.Count)
 	require.Len(t, body.ToolCalls, 2)
 	assert.Equal(t, "Read", body.ToolCalls[0].ToolName)
