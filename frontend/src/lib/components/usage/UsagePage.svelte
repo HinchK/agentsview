@@ -57,7 +57,10 @@
   let unsubEvents: (() => void) | undefined;
 
   const chartColorMaps = $derived(
-    usageChartColorMaps(usage.summary, settings.chartPalette),
+    usageChartColorMaps(
+      usage.timeSeriesSummary,
+      settings.chartPalette,
+    ),
   );
 
   // Keep projects already returned by the summary so a project remains
@@ -65,7 +68,9 @@
 
   $effect(() => {
     const fromSummary = usage.summary?.projectTotals ?? [];
-    const counts = usage.summary?.sessionCounts.byProject ?? {};
+    const counts = usage.isTimeRangeSummaryProvisional
+      ? {}
+      : usage.summary?.sessionCounts.byProject ?? {};
     untrack(() => usage.mergeKnownProjects(fromSummary, counts));
   });
 
@@ -159,7 +164,9 @@
       : [],
   );
   const unsupportedUsageMessage = $derived.by(() => {
-    const kind = usage.summary?.unsupportedUsage?.kind;
+    const kind = usage.isTimeRangeSummaryProvisional
+      ? undefined
+      : usage.summary?.unsupportedUsage?.kind;
     if (kind === "copilot-no-token-data") {
       return m.usage_summary_unsupported_copilot_no_token_data();
     }
@@ -525,7 +532,7 @@
       <RefreshControl
         lastUpdatedAt={usage.lastUpdatedAt}
         busy={usage.isQuerying}
-        onRefresh={() => usage.fetchAll()}
+        onRefresh={() => usage.fetchAll({ preserveTimeRange: true })}
         label={m.usage_refresh()}
         title={m.shared_refresh()}
       />
