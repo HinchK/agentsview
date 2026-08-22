@@ -119,6 +119,9 @@ try {
     });
   }
   const specPath = join(tempDir, "openapi.json");
+  run("go", ["run", "./internal/pricing/cmd/litellm-snapshot", "-restore"], {
+    cwd: repoRoot,
+  });
   const spec = run("go", ["run", "./cmd/agentsview", "openapi"], {
     cwd: repoRoot,
     capture: true,
