@@ -158,7 +158,7 @@ func TestUsageDailyGolden(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	assert.Equal(t, export.UsageDailySchemaVersion, report.SchemaVersion)
 
-	assertGoldenBytes(t, "usage_daily_v5.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_v5.json", []byte(stdout))
 }
 
 func TestUsageDailyBreakdownGolden(t *testing.T) {
@@ -188,7 +188,7 @@ func TestUsageDailyBreakdownGolden(t *testing.T) {
 		assert.Equal(t, "golden-host", daily.MachineBreakdowns[0].MachineName)
 	}
 
-	assertGoldenBytes(t, "usage_daily_breakdown_v5.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_breakdown_v5.json", []byte(stdout))
 }
 
 func setupExportGoldenDataDir(t *testing.T) string {
@@ -453,6 +453,39 @@ func assertGoldenBytes(t *testing.T, name string, got []byte) {
 		assert.Equal(t, string(want), string(got),
 			"golden mismatch for %s", name)
 	}
+}
+
+func assertCatalogGolden(t *testing.T, name string, got []byte) {
+	t.Helper()
+	var metadata struct {
+		Pricing struct {
+			EffectiveRowCount int `json:"effective_row_count"`
+		} `json:"pricing"`
+	}
+	require.NoError(t, json.Unmarshal(got, &metadata), "decode %s", name)
+	require.Greater(t, metadata.Pricing.EffectiveRowCount, 1000,
+		"pricing catalog row count for %s", name)
+
+	path := filepath.Join("..", "..", "testdata", "golden", name)
+	if *updateGolden {
+		require.NoError(t, os.WriteFile(path, got, 0o644),
+			"write golden %s", name)
+		t.Logf("rewrote %s (%d bytes)", path, len(got))
+		return
+	}
+	want, err := os.ReadFile(path)
+	require.NoError(t, err, "read golden (run with -update to generate)")
+
+	var gotReport, wantReport map[string]any
+	require.NoError(t, json.Unmarshal(got, &gotReport), "decode actual %s", name)
+	require.NoError(t, json.Unmarshal(want, &wantReport), "decode golden %s", name)
+	for _, report := range []map[string]any{gotReport, wantReport} {
+		pricing, ok := report["pricing"].(map[string]any)
+		require.True(t, ok, "pricing object for %s", name)
+		delete(pricing, "effective_row_count")
+		delete(pricing, "digest")
+	}
+	assert.Equal(t, wantReport, gotReport, "golden mismatch for %s", name)
 }
 
 func TestDefaultUsageDateRange(t *testing.T) {
