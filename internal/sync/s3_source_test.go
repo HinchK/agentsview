@@ -122,7 +122,9 @@ func TestProcessS3ClaudeForceParseBypassesPrimarylessFreshness(t *testing.T) {
 	info, err := s3SourceFileInfo(file)
 	require.NoError(t, err)
 
-	res := engine.processS3Session(t.Context(), file, info)
+	provider, ok := parser.S3ProviderFor(file.Agent)
+	require.True(t, ok)
+	res := engine.processS3Session(t.Context(), file, info, provider)
 	require.NoError(t, res.err)
 	assert.True(t, fetched,
 		"parse-diff must fetch and parse a primary-less S3 Claude source")
@@ -1169,6 +1171,99 @@ func TestSyncS3MachineFromRootUsesRawAgentLayout(t *testing.T) {
 		"laptop",
 		s3MachineFromRoot("s3://bucket/archive/raw/laptop/raw/claude"),
 	)
+	assert.Equal(
+		t,
+		"laptop",
+		s3MachineFromRoot("s3://bucket/archive/raw/laptop/raw/cursor"),
+	)
+	assert.Empty(t, s3MachineFromRoot("s3://bucket/archive/raw/laptop/raw/qwen"))
+}
+
+func TestS3DiscoveredSessionIDUsesProvider(t *testing.T) {
+	tests := []struct {
+		name string
+		file parser.DiscoveredFile
+		want string
+	}{
+		{
+			name: "claude",
+			file: parser.DiscoveredFile{
+				Agent:   parser.AgentClaude,
+				Path:    "s3://bucket/laptop/raw/claude/proj/sess.jsonl",
+				Machine: "laptop",
+			},
+			want: "laptop~sess",
+		},
+		{
+			name: "codex",
+			file: parser.DiscoveredFile{
+				Agent: parser.AgentCodex,
+				Path: "s3://bucket/laptop/raw/codex/2026/06/24/" +
+					"rollout-2026-06-24T00-00-00-11111111-1111-4111-8111-111111111111.jsonl",
+				Machine: "laptop",
+			},
+			want: "laptop~codex:11111111-1111-4111-8111-111111111111",
+		},
+		{
+			name: "cursor",
+			file: parser.DiscoveredFile{
+				Agent:   parser.AgentCursor,
+				Path:    "s3://bucket/laptop/raw/cursor/proj/abc.jsonl",
+				Machine: "laptop",
+			},
+			want: "laptop~cursor:abc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, s3DiscoveredSessionID(tt.file))
+		})
+	}
+}
+
+func TestSafeS3TempRelPathUsesProvider(t *testing.T) {
+	cursorProvider, ok := parser.S3ProviderFor(parser.AgentCursor)
+	require.True(t, ok)
+	got, err := safeS3TempRelPath(parser.DiscoveredFile{
+		Agent: parser.AgentCursor,
+		Path:  "s3://bucket/laptop/raw/cursor/demo-proj/abc.jsonl",
+	}, cursorProvider)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("demo-proj", "abc.jsonl"), got)
+
+	claudeProvider, ok := parser.S3ProviderFor(parser.AgentClaude)
+	require.True(t, ok)
+	got, err = safeS3TempRelPath(parser.DiscoveredFile{
+		Agent: parser.AgentClaude,
+		Path:  "s3://bucket/laptop/raw/claude/demo-proj/sess.jsonl",
+	}, claudeProvider)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("demo-proj", "sess.jsonl"), got)
+}
+
+func TestIsS3AgentRootSegmentUsesCapability(t *testing.T) {
+	assert.True(t, isS3AgentRootSegment("claude"))
+	assert.True(t, isS3AgentRootSegment("codex"))
+	assert.True(t, isS3AgentRootSegment("cursor"))
+	assert.False(t, isS3AgentRootSegment("qwen"))
+	assert.False(t, isS3AgentRootSegment("traex"))
+}
+
+func TestHydrateS3DiscoveredFileDerivesCursorProject(t *testing.T) {
+	e := &Engine{
+		db: openTestDB(t),
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCursor: {"s3://bucket/laptop/raw/cursor"},
+		},
+	}
+	file := parser.DiscoveredFile{
+		Agent:       parser.AgentCursor,
+		Path:        "s3://bucket/laptop/raw/cursor/demo-proj/abc.jsonl",
+		SourceMtime: 1,
+	}
+	e.hydrateS3DiscoveredFile(context.Background(), "laptop~cursor:abc", &file)
+	assert.Equal(t, "laptop", file.Machine)
+	assert.Equal(t, "demo-proj", file.Project)
 }
 
 func TestSyncSingleSessionS3PreservesStoredMachine(t *testing.T) {
