@@ -71,8 +71,8 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 	}
 
 	// Discovery mirrors syncAllLocked's file phase: provider discovery over
-	// the configured dirs per agent, then dedupe and the legacy-Kiro shadow
-	// filter. Provider discovery already enumerates shared-SQLite sources
+	// the configured dirs per agent, then dedupe. Provider discovery already
+	// arbitrates Kiro shared-SQLite sources intrinsically and enumerates
 	// (Kiro's data.sqlite3, db-mode OpenCode's opencode.db) per session, so
 	// no separate db-source synthesis is needed.
 	var files []parser.DiscoveredFile
@@ -84,7 +84,6 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		files = append(files, providerFiles...)
 	}
 	files = dedupeDiscoveredFiles(files)
-	files = e.filterShadowedLegacyKiroFiles(files)
 
 	// Newest first by source mtime (composite stats for virtual
 	// paths), tie-broken by path so the --limit sample is stable.

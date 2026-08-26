@@ -4157,44 +4157,38 @@ func (f fakeFileInfo) ModTime() time.Time {
 func (f fakeFileInfo) IsDir() bool { return false }
 func (f fakeFileInfo) Sys() any    { return nil }
 
-func TestHasLegacyKiroCandidates(t *testing.T) {
-	tests := []struct {
-		name  string
-		files []parser.DiscoveredFile
-		want  bool
-	}{
-		{
-			name: "empty",
-			want: false,
-		},
-		{
-			name: "non-kiro files",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentClaude, Path: "/tmp/claude/session.jsonl"},
-			},
-			want: false,
-		},
-		{
-			name: "kiro sqlite database source",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentKiro, Path: "/tmp/kiro/data.sqlite3"},
-			},
-			want: false,
-		},
-		{
-			name: "legacy kiro jsonl",
-			files: []parser.DiscoveredFile{
-				{Agent: parser.AgentKiro, Path: "/tmp/kiro/session.jsonl"},
-			},
-			want: true,
-		},
-	}
+func TestKiroReconciliationRootPreferenceUsesConfiguredOrder(t *testing.T) {
+	first := filepath.Join(t.TempDir(), "first")
+	second := filepath.Join(t.TempDir(), "second")
+	firstPath := filepath.Join(first, "sess.jsonl")
+	secondPath := filepath.Join(second, "sess.jsonl")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hasLegacyKiroCandidates(tt.files))
-		})
-	}
+	assert.Equal(t, int64(2), configuredRootPreference(
+		firstPath, []string{first, second},
+	))
+	assert.Equal(t, int64(1), configuredRootPreference(
+		secondPath, []string{first, second},
+	))
+	assert.Equal(t, int64(1), configuredRootPreference(
+		firstPath, []string{second, first},
+	))
+	assert.Equal(t, int64(2), configuredRootPreference(
+		secondPath, []string{second, first},
+	))
+}
+
+func TestKiroReconciliationRootPreferenceUsesSourceAttribution(t *testing.T) {
+	ancestor := filepath.Join(t.TempDir(), "ancestor")
+	descendant := filepath.Join(ancestor, "descendant")
+	path := filepath.Join(descendant, "session.jsonl")
+	source := parser.SourceRef{ConfiguredRoot: descendant}
+
+	assert.Equal(t, int64(1), configuredRootPreferenceForSource(
+		source, path, []string{ancestor, descendant},
+	), "the provider root must outrank an overlapping ancestor")
+	assert.Equal(t, int64(2), configuredRootPreferenceForSource(
+		parser.SourceRef{}, path, []string{ancestor, descendant},
+	), "unknown attribution must retain the path fallback")
 }
 
 func TestFilterEmptyMessages(t *testing.T) {

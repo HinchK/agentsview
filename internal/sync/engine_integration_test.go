@@ -1703,6 +1703,82 @@ func TestSyncEngineKiroSQLiteCurrentStoreShadowsLegacy(t *testing.T) {
 	require.Contains(t, *sess.FilePath, "data.sqlite3#overlap-session", "legacy event replaced sqlite-backed session: %+v", sess)
 }
 
+func TestSyncEngineKiroFullParseReplacesMessages(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join([]string{
+		`{"payload":{"type":"user","content":"first"}}`,
+		`{"payload":{"type":"assistant","content":"second"}}`,
+	}, "\n")+"\n"), 0o644))
+	env.engine.SyncPaths([]string{path})
+	assertSessionMessageCount(t, env.db, "kiro:"+rawID, 2)
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"rewritten"}}`+"\n",
+	), 0o644))
+	future := time.Now().Add(time.Minute)
+	require.NoError(t, os.Chtimes(path, future, future))
+	env.engine.SyncPaths([]string{path})
+	assertSessionMessageCount(t, env.db, "kiro:"+rawID, 1)
+}
+
+func TestSyncEngineKiroSameStatMetadataRewriteIsDetected(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	sidecar := filepath.Join(filepath.Dir(path), "session.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"hello"}}`+"\n",
+	), 0o644))
+	require.NoError(t, os.WriteFile(sidecar, []byte(`{"title":"A"}`), 0o644))
+	stamp := time.Unix(1_700_000_000, 0)
+	require.NoError(t, os.Chtimes(path, stamp, stamp))
+	require.NoError(t, os.Chtimes(sidecar, stamp, stamp))
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, initial.Aborted)
+	before, err := env.db.GetSessionFull(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	assert.Equal(t, "A", *before.SessionName)
+
+	require.NoError(t, os.WriteFile(sidecar, []byte(`{"title":"B"}`), 0o644))
+	require.NoError(t, os.Chtimes(sidecar, stamp, stamp))
+	updated := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, updated.Aborted)
+	after, err := env.db.GetSessionFull(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "B", *after.SessionName)
+}
+
+func TestSyncEngineKiroEmptyCurrentRewritePreservesArchive(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"keep this"}}`+"\n",
+	), 0o644))
+	env.engine.SyncPaths([]string{path})
+
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"session_metadata","content":"not a message"}}`+"\n",
+	), 0o644))
+	future := time.Now().Add(time.Minute)
+	require.NoError(t, os.Chtimes(path, future, future))
+	env.engine.SyncPaths([]string{path})
+
+	active, err := env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, active, "an empty current rewrite must preserve the archive")
+	assertMessageContent(t, env.db, "kiro:"+rawID, "keep this")
+}
+
 func TestSyncRootsSinceKiroLegacyShadowedBySQLiteOutsideScope(t *testing.T) {
 	legacyRoot := t.TempDir()
 	sqliteRoot := t.TempDir()
@@ -1725,6 +1801,239 @@ func TestSyncRootsSinceKiroLegacyShadowedBySQLiteOutsideScope(t *testing.T) {
 		context.Background(), []string{legacyRoot}, time.Time{}, nil,
 	)
 	assert.Equal(t, 0, stats.TotalSessions, "total sessions")
+}
+
+func TestSyncEngineKiroPartialSQLitePreservesShadowedAndTombstonesRemoved(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	winner := createKiroSQLiteDB(t, winnerRoot)
+	partial := createKiroSQLiteDB(t, partialRoot)
+	fixture := readKiroSQLiteFixture(t, "overlap_payload.json")
+	winner.addSession(t, "/home/user/code/winner", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "removed", fixture, 1779015600000, 1779015610000)
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.Zero(t, initial.Failed)
+	activeShadowed, err := env.db.GetSession(context.Background(), "kiro:shadowed")
+	require.NoError(t, err)
+	require.NotNil(t, activeShadowed)
+	activeRemoved, err := env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	require.NotNil(t, activeRemoved)
+
+	_, err = partial.db.Exec(
+		`DELETE FROM conversations_v2 WHERE conversation_id = ?`, "removed",
+	)
+	require.NoError(t, err)
+	env.engine.SyncPaths([]string{partial.path})
+
+	activeRemoved, err = env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	assert.Nil(t, activeRemoved)
+	archivedRemoved, err := env.db.GetSessionFull(
+		context.Background(), "kiro:removed",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, archivedRemoved)
+	require.NotNil(t, archivedRemoved.DeletionCause)
+	assert.Equal(t, "source_missing", *archivedRemoved.DeletionCause)
+	activeShadowed, err = env.db.GetSession(context.Background(), "kiro:shadowed")
+	require.NoError(t, err)
+	assert.NotNil(t, activeShadowed)
+}
+
+func TestSyncRootsSinceKiroPreservesOutOfScopeWinnerAfterSQLiteRemoval(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	rawID := "sess_0123456789abcdef"
+	partial := createKiroSQLiteDB(t, partialRoot)
+	partial.addSession(
+		t, "/home/user/code/partial", rawID,
+		readKiroSQLiteFixture(t, "overlap_payload.json"),
+		1779015600000, 1779015610000,
+	)
+	current := filepath.Join(winnerRoot, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(current), 0o755))
+	require.NoError(t, os.WriteFile(
+		current,
+		[]byte(`{"payload":{"type":"user","content":"current"}}`+"\n"),
+		0o644,
+	))
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.Zero(t, initial.Failed)
+	active, err := env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+
+	_, err = partial.db.Exec(
+		`DELETE FROM conversations_v2 WHERE conversation_id = ?`, rawID,
+	)
+	require.NoError(t, err)
+	env.engine.SyncRootsSince(
+		context.Background(), []string{partialRoot}, time.Time{}, nil,
+	)
+
+	active, err = env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"an out-of-scope current winner must preserve a removed DB member")
+}
+
+func TestSyncRootsSinceKiroArbitratesAcrossConfiguredRootsBeforeProcessing(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	rawID := "sess_0123456789abcdef"
+	for root, content := range map[string]string{
+		winnerRoot:  "configured winner",
+		partialRoot: "scoped loser",
+	} {
+		path := filepath.Join(root, "workspace", rawID, "messages.jsonl")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(
+			fmt.Sprintf(`{"payload":{"type":"user","content":%q}}`, content)+"\n",
+		), 0o644))
+	}
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, initial.Aborted)
+	assertMessageContent(t, env.db, "kiro:"+rawID, "configured winner")
+
+	stats := env.engine.SyncRootsSince(
+		context.Background(), []string{partialRoot}, time.Time{}, nil,
+	)
+	require.False(t, stats.Aborted)
+	assertMessageContent(t, env.db, "kiro:"+rawID, "configured winner")
+}
+
+func TestSyncRootsSinceKiroTombstonesRemovedAllShadowedMember(
+	t *testing.T,
+) {
+	winnerRoot := t.TempDir()
+	partialRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{winnerRoot, partialRoot},
+	)
+	winner := createKiroSQLiteDB(t, winnerRoot)
+	partial := createKiroSQLiteDB(t, partialRoot)
+	fixture := readKiroSQLiteFixture(t, "overlap_payload.json")
+	winner.addSession(t, "/home/user/code/winner", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "shadowed", fixture, 1779015600000, 1779015610000)
+	partial.addSession(t, "/home/user/code/partial", "removed", fixture, 1779015600000, 1779015610000)
+
+	initial := env.engine.SyncAll(context.Background(), nil)
+	require.Zero(t, initial.Failed)
+	removed, err := env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	require.NotNil(t, removed)
+
+	_, err = partial.db.Exec(
+		`DELETE FROM conversations_v2 WHERE conversation_id = ?`, "removed",
+	)
+	require.NoError(t, err)
+	stats := env.engine.SyncRootsSince(
+		context.Background(), []string{partialRoot}, time.Time{}, nil,
+	)
+	require.False(t, stats.Aborted)
+
+	active, err := env.db.GetSession(context.Background(), "kiro:removed")
+	require.NoError(t, err)
+	assert.Nil(t, active,
+		"a removed member must be tombstoned even when all remaining DB rows are shadowed")
+	archived, err := env.db.GetSessionFull(
+		context.Background(), "kiro:removed",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, archived)
+	require.NotNil(t, archived.DeletionCause)
+	assert.Equal(t, "source_missing", *archived.DeletionCause)
+}
+
+func TestSyncRootsSinceKiroOverlappingRootsKeepInScopeWinner(t *testing.T) {
+	parent := t.TempDir()
+	child := filepath.Join(parent, "nest")
+	require.NoError(t, os.MkdirAll(child, 0o755))
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentKiro, []string{parent, child},
+	)
+	rawID := "sess_0123456789abcdef"
+	path := filepath.Join(child, rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(
+		`{"payload":{"type":"user","content":"scoped"}}`+"\n",
+	), 0o644))
+
+	stats := env.engine.SyncRootsSince(
+		context.Background(), []string{child}, time.Time{}, nil,
+	)
+	require.False(t, stats.Aborted)
+
+	active, err := env.db.GetSession(context.Background(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"a physically in-scope winner attributed to an overlapping ancestor root must stay admitted")
+}
+
+func TestReconcileWatchRootsKiroDiscoveryFailureDoesNotAbortOtherAgents(
+	t *testing.T,
+) {
+	env := setupFocusedTestEnv(t, parser.AgentKiro, parser.AgentClaude)
+	rawID := "sess_0123456789abcdef"
+	kiroPath := filepath.Join(env.kiroDir, "workspace", rawID, "messages.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(kiroPath), 0o755))
+	require.NoError(t, os.WriteFile(kiroPath, []byte(
+		`{"payload":{"type":"user","content":"keep"}}`+"\n",
+	), 0o644))
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "Hello").
+		String()
+	claudePath := env.writeClaudeSession(
+		t, "claude-project", "claude-session.jsonl", content,
+	)
+	initial := env.engine.SyncAll(t.Context(), nil)
+	require.Zero(t, initial.Failed)
+	kiroBefore, err := env.db.GetSession(t.Context(), "kiro:"+rawID)
+	require.NoError(t, err)
+	require.NotNil(t, kiroBefore)
+	claudeBefore, err := env.db.GetSession(t.Context(), "claude-session")
+	require.NoError(t, err)
+	require.NotNil(t, claudeBefore)
+
+	require.NoError(t, os.Remove(claudePath))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(env.kiroDir, "broken.jsonl"), []byte("{}\n"), 0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(env.kiroDir, "broken.json"), []byte("{"), 0o644,
+	))
+
+	err = env.engine.ReconcileWatchRoots(t.Context(), nil, true)
+	require.Error(t, err, "the failed Kiro scope must stay queued for retry")
+
+	claudeGone, err := env.db.GetSession(t.Context(), "claude-session")
+	require.NoError(t, err)
+	assert.Nil(t, claudeGone,
+		"a Kiro discovery failure must not abort other agents' reconciliation")
+	kiroKept, err := env.db.GetSession(t.Context(), "kiro:"+rawID)
+	require.NoError(t, err)
+	assert.NotNil(t, kiroKept,
+		"Kiro sessions must be preserved when Kiro discovery fails")
 }
 
 func TestSyncEngineKiroLegacyOnlySyncPath(t *testing.T) {

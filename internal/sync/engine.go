@@ -5558,6 +5558,9 @@ func (e *Engine) streamReconciliationCandidates(
 			}
 			planRetryRoots = append(planRetryRoots, scope.RetryRoots...)
 		}
+		if agent == parser.AgentKiro {
+			traversalRoots = append([]string(nil), e.agentDirs[agent]...)
+		}
 		provider := factory.NewProvider(parser.ProviderConfig{
 			Roots: traversalRoots, Machine: e.machine, PathRewriter: e.pathRewriter,
 			SourceMachines:                     e.sourceMachines[agent],
@@ -5584,8 +5587,15 @@ func (e *Engine) streamReconciliationCandidates(
 			for _, scope := range group.scopes {
 				groupRetryRoots = append(groupRetryRoots, scope.RetryRoots...)
 			}
+			discoveryRoots := group.roots
+			if agent == parser.AgentKiro {
+				// Kiro source arbitration spans every configured root even when
+				// the proof scope is partial; only the winning candidate inside
+				// that proof is admitted to processing below.
+				discoveryRoots = e.agentDirs[agent]
+			}
 			scopeProvider := factory.NewProvider(parser.ProviderConfig{
-				Roots: group.roots, Machine: e.machine,
+				Roots: discoveryRoots, Machine: e.machine,
 				SourceMachines:                     e.sourceMachines[agent],
 				PathRewriter:                       e.pathRewriter,
 				SQLiteContainerUnchangedSinceTrust: containerTrusted,
@@ -5600,12 +5610,28 @@ func (e *Engine) streamReconciliationCandidates(
 			for i, scope := range group.scopes {
 				groupProofs[i] = storedSourceDBHintScopes(scope.PhysicalProofScopes)
 			}
+			rankingRoots := traversalRoots
+			if agent == parser.AgentKiro {
+				// Kiro precedence uses configured roots for reordered scoped requests.
+				rankingRoots = e.agentDirs[agent]
+			}
+			var kiroWinners map[string]reconciliationCandidate
+			if agent == parser.AgentKiro {
+				kiroWinners = make(map[string]reconciliationCandidate)
+			}
 			var spoolErr error
 			err = discoverer.DiscoverEach(ctx, func(source parser.SourceRef) error {
 				candidate, ok := e.reconciliationCandidate(
-					provider, source, traversalRoots, watchRoots,
+					provider, source, rankingRoots, watchRoots,
 				)
 				if !ok {
+					return nil
+				}
+				if agent == parser.AgentKiro {
+					current, exists := kiroWinners[candidate.Identity]
+					if !exists || reconciliationCandidatePreferred(candidate, current) {
+						kiroWinners[candidate.Identity] = candidate
+					}
 					return nil
 				}
 				admitted := false
@@ -5637,6 +5663,29 @@ func (e *Engine) streamReconciliationCandidates(
 				spoolErr = spool.Add(ctx, candidate)
 				return spoolErr
 			})
+			if err == nil && agent == parser.AgentKiro {
+				for _, identity := range slices.Sorted(maps.Keys(kiroWinners)) {
+					candidate := kiroWinners[identity]
+					admitted := false
+					for _, proofScopes := range groupProofs {
+						if db.StoredSourcePathHintScopesContain(candidate.Path, proofScopes) {
+							admitted = true
+							break
+						}
+					}
+					if !admitted {
+						continue
+					}
+					spoolErr = spool.Add(ctx, candidate)
+					if spoolErr != nil {
+						break
+					}
+				}
+				if spoolErr != nil {
+					return providers, completedScopes,
+						failedRoots, failures, discoveryErr, spoolErr
+				}
+			}
 			if err != nil {
 				if spoolErr != nil {
 					return providers, completedScopes,
@@ -5858,17 +5907,18 @@ func (e *Engine) reconciliationCandidate(
 			preference1 = 1
 		}
 	} else if !claudeFormat && !isCodexFormatAgent(agent) {
-		for i, configured := range roots {
-			if samePathOrDescendant(statPath, configured) {
-				preference1 = int64(len(roots) - i)
-				break
-			}
-		}
+		preference1 = configuredRootPreference(statPath, roots)
 	}
 	if ranker, ok := provider.(parser.ReconciliationSourceRanker); ok {
 		rank := ranker.ReconciliationSourceRank(source)
-		preference2 = rank.Class
-		preference3 = rank.Recency
+		if agent == parser.AgentKiro {
+			preference1 = rank.Class
+			preference2 = configuredRootPreferenceForSource(source, statPath, roots)
+			preference3 = rank.Recency
+		} else {
+			preference2 = rank.Class
+			preference3 = rank.Recency
+		}
 	}
 	if agent == parser.AgentAntigravityCLI {
 		preference2 = boolPreference(strings.HasSuffix(path, ".db"))
@@ -5882,6 +5932,44 @@ func (e *Engine) reconciliationCandidate(
 		Project: source.ProjectHint, Preference1: preference1,
 		Preference2: preference2, Preference3: preference3,
 	}, true
+}
+
+func reconciliationCandidatePreferred(
+	candidate, current reconciliationCandidate,
+) bool {
+	if candidate.Preference1 != current.Preference1 {
+		return candidate.Preference1 > current.Preference1
+	}
+	if candidate.Preference2 != current.Preference2 {
+		return candidate.Preference2 > current.Preference2
+	}
+	if candidate.Preference3 != current.Preference3 {
+		return candidate.Preference3 > current.Preference3
+	}
+	return candidate.Path < current.Path
+}
+
+func configuredRootPreference(path string, roots []string) int64 {
+	for i, configured := range roots {
+		if samePathOrDescendant(path, configured) {
+			return int64(len(roots) - i)
+		}
+	}
+	return 0
+}
+
+func configuredRootPreferenceForSource(
+	source parser.SourceRef, path string, roots []string,
+) int64 {
+	if source.ConfiguredRoot != "" {
+		for i, configured := range roots {
+			if samePathOrDescendant(configured, source.ConfiguredRoot) &&
+				samePathOrDescendant(source.ConfiguredRoot, configured) {
+				return int64(len(roots) - i)
+			}
+		}
+	}
+	return configuredRootPreference(path, roots)
 }
 
 func boolPreference(value bool) int64 {
@@ -7194,7 +7282,6 @@ func (e *Engine) syncAllLocked(
 		all = dedupeDiscoveredFiles(all)
 	}
 	all = e.dedupeClaudeDiscoveredFiles(all)
-	all = e.filterShadowedLegacyKiroFiles(all)
 	if forceDiscoveredFiles {
 		for i := range all {
 			all[i].ForceParse = true
@@ -7461,8 +7548,14 @@ func (e *Engine) discoverProviderSources(
 		if !ok || factory == nil {
 			continue
 		}
+		providerRoots := filteredRoots
+		if agentType == parser.AgentKiro {
+			// Kiro must arbitrate against out-of-scope roots before scoped
+			// admission, otherwise a lower-ranked in-scope copy is imported.
+			providerRoots = roots
+		}
 		provider := factory.NewProvider(parser.ProviderConfig{
-			Roots:                              filteredRoots,
+			Roots:                              providerRoots,
 			Machine:                            e.machine,
 			SourceMachines:                     e.sourceMachines[agentType],
 			PathRewriter:                       e.pathRewriter,
@@ -7489,6 +7582,9 @@ func (e *Engine) discoverProviderSources(
 			log.Printf("%s provider discovery: %v", agentType, err)
 			failures++
 			continue
+		}
+		if agentType == parser.AgentKiro {
+			sources = filterProviderSourcesToScope(sources, scope)
 		}
 		forceParseSource := func(string) bool { return false }
 		if agentType == parser.AgentVSCopilot {
@@ -7556,6 +7652,24 @@ func (e *Engine) discoverProviderSources(
 		}
 	}
 	return files, failures
+}
+
+func filterProviderSourcesToScope(
+	sources []parser.SourceRef,
+	scope *rootSyncScope,
+) []parser.SourceRef {
+	filtered := sources[:0]
+	for _, source := range sources {
+		// Overlapping roots can attribute a winner to an out-of-scope
+		// ancestor; a physically in-scope source stays admitted.
+		if scope.includes(source.ConfiguredRoot) ||
+			scope.includes(validatedProviderSourceStatPath(
+				providerDiscoveredPath(source),
+			)) {
+			filtered = append(filtered, source)
+		}
+	}
+	return filtered
 }
 
 func providerSourcePathSet(sources []parser.SourceRef) map[string]struct{} {
@@ -10203,6 +10317,9 @@ type sourceMissingMember struct {
 type processResult struct {
 	results            []parser.ParseResult
 	excludedSessionIDs []string
+	// preservedSessionIDs are higher-ranked members omitted by a shared source;
+	// they remain present while lower-ranked source ownership is reconciled.
+	preservedSessionIDs []string
 	// sourceMissingMembers carries stored sessions whose virtual member
 	// source no longer exists inside a still-present shared container
 	// (e.g. a Windsurf conversation deleted from state.vscdb). They must
@@ -11046,8 +11163,28 @@ func (e *Engine) processProviderFile(
 			e.anomalies.recordUnsupportedSourceLayout(string(file.Agent), file.Path)
 		}
 		excludedSessionIDs := append([]string(nil), outcome.ExcludedSessionIDs...)
+		preservedSessionIDs := providerPreservedSessionIDs(provider, source)
 		var missingMembers []sourceMissingMember
-		if outcome.ForceReplace && outcome.ResultSetComplete {
+		if file.Agent == parser.AgentKiro &&
+			parser.KiroSQLiteSourcePresent(source) &&
+			outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 {
+			// Only a present SQLite container owns a complete membership set.
+			// Current and legacy JSONL sources can legitimately parse to no
+			// accepted records during a partial rewrite and must preserve archive rows.
+			missingMembers, err = e.providerSourceMissingSessionOwnershipsForCompleteResultWithPreserved(
+				ctx, provider, source, preservedSessionIDs, nil,
+			)
+			if err != nil {
+				return processResult{
+					err:            err,
+					mtime:          fingerprint.MTimeNS,
+					cacheSkip:      cacheSkip,
+					cacheKey:       cacheKey,
+					noCacheSkip:    true,
+					retentionLease: lease,
+				}, true
+			}
+		} else if outcome.ForceReplace && outcome.ResultSetComplete {
 			owned, ownershipErr :=
 				e.providerSourceSessionOwnershipsForForceReplace(
 					ctx, provider, source,
@@ -11083,8 +11220,11 @@ func (e *Engine) processProviderFile(
 			}
 		}
 		skipRes := processResult{
-			skip:                 !outcome.ForceReplace,
+			// A complete Kiro source can report no current rows while still
+			// owning stored members that need source-missing reconciliation.
+			skip:                 !outcome.ForceReplace && len(missingMembers) == 0,
 			excludedSessionIDs:   excludedSessionIDs,
+			preservedSessionIDs:  preservedSessionIDs,
 			sourceMissingMembers: missingMembers,
 			mtime:                fingerprint.MTimeNS,
 			cacheSkip:            cacheSkip,
@@ -11113,17 +11253,18 @@ func (e *Engine) processProviderFile(
 	parsedResults := parseOutcomeResults(outcome.Results)
 	parsedCount := len(parsedResults)
 	excludedSessionIDs := append([]string(nil), outcome.ExcludedSessionIDs...)
+	preservedSessionIDs := providerPreservedSessionIDs(provider, source)
 	var missingMembers []sourceMissingMember
 	// Parse-diff intentionally reports a removed Trae member through its
 	// presence sweep. It never filters unchanged results or writes tombstones,
 	// so ownership reconciliation is needed only by real sync engines.
-	if ((file.Agent == parser.AgentOmnigent && outcome.ForceReplace) ||
+	if (file.Agent == parser.AgentKiro ||
+		(file.Agent == parser.AgentOmnigent && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentTrae && !e.forceParse)) &&
 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 {
-		missingMembers, err =
-			e.providerSourceMissingSessionOwnershipsForCompleteResult(
-				ctx, provider, source, parsedResults,
-			)
+		missingMembers, err = e.providerSourceMissingSessionOwnershipsForCompleteResultWithPreserved(
+			ctx, provider, source, preservedSessionIDs, parsedResults,
+		)
 		if err != nil {
 			return processResult{
 				err:            err,
@@ -11174,6 +11315,7 @@ func (e *Engine) processProviderFile(
 	res := processResult{
 		results:              filteredResults,
 		excludedSessionIDs:   excludedSessionIDs,
+		preservedSessionIDs:  preservedSessionIDs,
 		sourceMissingMembers: missingMembers,
 		mtime:                fingerprint.MTimeNS,
 		cacheSkip:            cacheSkip,
@@ -11315,6 +11457,20 @@ func (e *Engine) providerSourceSessionIDsForForceReplace(
 	return ids, nil
 }
 
+type preservedSessionIDProvider interface {
+	PreservedSessionIDs(parser.SourceRef) []string
+}
+
+func providerPreservedSessionIDs(
+	provider parser.Provider, source parser.SourceRef,
+) []string {
+	preserved, ok := provider.(preservedSessionIDProvider)
+	if !ok {
+		return nil
+	}
+	return preserved.PreservedSessionIDs(source)
+}
+
 // providerSourceSessionOwnershipsForForceReplace lists the stored active
 // sessions owned by a force-replaced source, paired with the exact stored
 // file path each row is tracked under, so callers can either hard-delete
@@ -11395,16 +11551,22 @@ func (e *Engine) providerSourceSessionOwnershipsForForceReplace(
 	return members, nil
 }
 
-func (e *Engine) providerSourceMissingSessionOwnershipsForCompleteResult(
+func (e *Engine) providerSourceMissingSessionOwnershipsForCompleteResultWithPreserved(
 	ctx context.Context,
 	provider parser.Provider,
 	source parser.SourceRef,
+	preservedSessionIDs []string,
 	results []parser.ParseResult,
 ) ([]sourceMissingMember, error) {
 	emitted := make(map[string]struct{}, len(results))
 	for _, result := range results {
 		id := applyIDPrefixToID(e.idPrefix, result.Session.ID)
 		if id != "" {
+			emitted[id] = struct{}{}
+		}
+	}
+	for _, id := range preservedSessionIDs {
+		if id := applyIDPrefixToID(e.idPrefix, id); id != "" {
 			emitted[id] = struct{}{}
 		}
 	}
@@ -17178,6 +17340,9 @@ func shouldReplaceFullParseMessages(
 ) bool {
 	return forceReplace || pw.forceReplace || pw.needsRetry || stale ||
 		revivingSourceMissing ||
+		// Kiro full parses rebuild the complete accepted message projection;
+		// append semantics would retain rows removed or rewritten by the source.
+		pw.sess.Agent == parser.AgentKiro ||
 		pw.sess.Agent == parser.AgentCowork ||
 		// Copilot execution start/completion records arrive after the
 		// assistant tool-call message and attach result events to it. An
@@ -18183,21 +18348,6 @@ func (e *Engine) FindSourceFile(sessionID string) string {
 		}
 		return ""
 	}
-	if def.Type == parser.AgentKiro {
-		for _, dir := range e.agentDirs[parser.AgentKiro] {
-			dbPath := kiroSQLiteDBPath(dir)
-			if dbPath == "" ||
-				!parser.KiroSQLiteSessionExists(
-					dbPath, rawSessionID,
-				) {
-				continue
-			}
-			return parser.KiroSQLiteVirtualPath(
-				dbPath, rawSessionID,
-			)
-		}
-	}
-
 	bareID := strings.TrimPrefix(rawID, def.IDPrefix)
 	storedPath := e.db.GetSessionFilePath(sessionID)
 
@@ -19301,74 +19451,8 @@ func (e *Engine) applyWorktreeMappingToSingleSession(
 	return mapped.Project, nil
 }
 
-// filterShadowedLegacyKiroFiles drops discovered legacy Kiro JSONL sources
-// whose logical session ID already exists in a current-store SQLite database
-// under any configured Kiro root. The Kiro provider performs the same
-// shadowing during its own Discover, but only across the roots it is
-// configured with; a scoped sync (e.g. SyncRootsSince over a single root)
-// configures the provider with that scope only, so the engine reapplies the
-// cross-root shadow here using every configured Kiro root. This keeps a legacy
-// file from being imported when its session lives in the SQLite store of a
-// different, out-of-scope root.
-func (e *Engine) filterShadowedLegacyKiroFiles(
-	files []parser.DiscoveredFile,
-) []parser.DiscoveredFile {
-	if !hasLegacyKiroCandidates(files) {
-		return files
-	}
-
-	currentIDs := make(map[string]struct{})
-	for _, dir := range e.agentDirs[parser.AgentKiro] {
-		for id := range parser.KiroSQLiteSessionIDs(dir) {
-			currentIDs[id] = struct{}{}
-		}
-	}
-	if len(currentIDs) == 0 {
-		return files
-	}
-
-	out := files[:0]
-	for _, file := range files {
-		if file.Agent != parser.AgentKiro ||
-			filepath.Base(file.Path) == kiroSQLiteDBName {
-			out = append(out, file)
-			continue
-		}
-		legacyID := parser.KiroSessionIDFromPath(file.Path)
-		if _, shadowed := currentIDs[legacyID]; shadowed {
-			continue
-		}
-		out = append(out, file)
-	}
-	return out
-}
-
-func hasLegacyKiroCandidates(files []parser.DiscoveredFile) bool {
-	for _, file := range files {
-		if file.Agent == parser.AgentKiro &&
-			filepath.Base(file.Path) != kiroSQLiteDBName {
-			return true
-		}
-	}
-	return false
-}
-
 // kiroSQLiteDBName is the filename of the current-store Kiro SQLite DB.
 const kiroSQLiteDBName = "data.sqlite3"
-
-// kiroSQLiteDBPath returns the current-store Kiro SQLite DB path when the
-// configured root contains one, or "" otherwise.
-func kiroSQLiteDBPath(dir string) string {
-	if dir == "" {
-		return ""
-	}
-	path := filepath.Join(dir, kiroSQLiteDBName)
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return ""
-	}
-	return path
-}
 
 // parseKiroSQLiteVirtualPath splits a virtual Kiro SQLite source path back
 // into its database path and raw session ID using the provider-neutral

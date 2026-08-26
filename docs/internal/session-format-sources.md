@@ -1265,6 +1265,18 @@ add an archived or maintained mirror without replacing the original identity.
 - **Format:** Legacy JSONL plus companion metadata JSON, and newer SQLite
   session databases.
 
+  The issue-reported current layout uses
+  `~/.kiro/sessions/<workspace>/sess_<id>/messages.jsonl` or the direct
+  `sess_<id>/messages.jsonl` form, with optional `session.json`. Agentsview
+  admits only these exact producer-relative shapes: one workspace segment,
+  no `.history` or `snapshots` workspace, a valid `sess_<id>` directory, and
+  no nested session directory. It preserves the literal `sess_<id>` identity
+  and maps user, assistant, tool-call, and tool-result envelope fields;
+  unknown and malformed records are ignored. This observed layout has no
+  pinned producer schema source. For duplicate IDs, SQLite outranks current
+  JSONL, current outranks legacy JSONL, configured root order breaks ties
+  within a class, and recency then canonical path provide deterministic ties.
+
 - **Evidence:** `documentation`.
 
 - **Upstream:** Kiro's first-party [license page](https://kiro.dev/license/) and
