@@ -1395,6 +1395,9 @@ func EnsureSchema(
 			time.Since(step).Round(time.Millisecond),
 		)
 	}
+	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
+		return err
+	}
 	step = time.Now()
 	remoteScrubbed, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db)
 	if err != nil {
@@ -1628,6 +1631,9 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 	if _, err := runSourceCurationBackfill(ctx, db, false); err != nil {
 		return err
 	}
+	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
+		return err
+	}
 	if _, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db); err != nil {
 		return err
 	}
@@ -1642,6 +1648,23 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	return markTokenCoverageRepairDone(ctx, db)
+}
+
+// repairLegacySourceMissingDeletionPG restores mirror rows written while
+// source absence was represented as deletion. Source availability is local
+// SQLite sync state; PostgreSQL retains only user-owned deletion state.
+func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
+	_, err := pg.ExecContext(ctx, `
+		UPDATE sessions
+		SET deleted_at = NULL,
+		    source_deleted_at = NULL,
+		    deletion_cause = NULL,
+		    updated_at = NOW()
+		WHERE deletion_cause = 'source_missing'`)
+	if err != nil {
+		return fmt.Errorf("repairing legacy PG source-missing deletions: %w", err)
+	}
+	return nil
 }
 
 func backfillSourceCurationBaselines(

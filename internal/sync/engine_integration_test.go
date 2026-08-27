@@ -1803,7 +1803,7 @@ func TestSyncRootsSinceKiroLegacyShadowedBySQLiteOutsideScope(t *testing.T) {
 	assert.Equal(t, 0, stats.TotalSessions, "total sessions")
 }
 
-func TestSyncEngineKiroPartialSQLitePreservesShadowedAndTombstonesRemoved(
+func TestSyncEngineKiroPartialSQLitePreservesShadowedAndMarksRemovedSourceMissing(
 	t *testing.T,
 ) {
 	winnerRoot := t.TempDir()
@@ -1835,14 +1835,13 @@ func TestSyncEngineKiroPartialSQLitePreservesShadowedAndTombstonesRemoved(
 
 	activeRemoved, err = env.db.GetSession(context.Background(), "kiro:removed")
 	require.NoError(t, err)
-	assert.Nil(t, activeRemoved)
+	assert.NotNil(t, activeRemoved,
+		"a removed member must remain browsable")
 	archivedRemoved, err := env.db.GetSessionFull(
 		context.Background(), "kiro:removed",
 	)
 	require.NoError(t, err)
-	require.NotNil(t, archivedRemoved)
-	require.NotNil(t, archivedRemoved.DeletionCause)
-	assert.Equal(t, "source_missing", *archivedRemoved.DeletionCause)
+	assertSourceMissingState(t, archivedRemoved)
 	activeShadowed, err = env.db.GetSession(context.Background(), "kiro:shadowed")
 	require.NoError(t, err)
 	assert.NotNil(t, activeShadowed)
@@ -1922,7 +1921,7 @@ func TestSyncRootsSinceKiroArbitratesAcrossConfiguredRootsBeforeProcessing(
 	assertMessageContent(t, env.db, "kiro:"+rawID, "configured winner")
 }
 
-func TestSyncRootsSinceKiroTombstonesRemovedAllShadowedMember(
+func TestSyncRootsSinceKiroMarksRemovedAllShadowedMemberSourceMissing(
 	t *testing.T,
 ) {
 	winnerRoot := t.TempDir()
@@ -1954,15 +1953,13 @@ func TestSyncRootsSinceKiroTombstonesRemovedAllShadowedMember(
 
 	active, err := env.db.GetSession(context.Background(), "kiro:removed")
 	require.NoError(t, err)
-	assert.Nil(t, active,
-		"a removed member must be tombstoned even when all remaining DB rows are shadowed")
+	assert.NotNil(t, active,
+		"a removed member must remain browsable even when all remaining DB rows are shadowed")
 	archived, err := env.db.GetSessionFull(
 		context.Background(), "kiro:removed",
 	)
 	require.NoError(t, err)
-	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assertSourceMissingState(t, archived)
 }
 
 func TestSyncRootsSinceKiroOverlappingRootsKeepInScopeWinner(t *testing.T) {
@@ -2026,10 +2023,13 @@ func TestReconcileWatchRootsKiroDiscoveryFailureDoesNotAbortOtherAgents(
 	err = env.engine.ReconcileWatchRoots(t.Context(), nil, true)
 	require.Error(t, err, "the failed Kiro scope must stay queued for retry")
 
-	claudeGone, err := env.db.GetSession(t.Context(), "claude-session")
+	claudeMissing, err := env.db.GetSession(t.Context(), "claude-session")
 	require.NoError(t, err)
-	assert.Nil(t, claudeGone,
-		"a Kiro discovery failure must not abort other agents' reconciliation")
+	assert.NotNil(t, claudeMissing,
+		"a missing Claude source must remain browsable")
+	claudeArchived, err := env.db.GetSessionFull(t.Context(), "claude-session")
+	require.NoError(t, err)
+	assertSourceMissingState(t, claudeArchived)
 	kiroKept, err := env.db.GetSession(t.Context(), "kiro:"+rawID)
 	require.NoError(t, err)
 	assert.NotNil(t, kiroKept,
@@ -2221,7 +2221,7 @@ func TestReconcileWatchRootsTombstonesSessionsBelowDeletedRoot(t *testing.T) {
 
 	gone, err := env.db.GetSession(t.Context(), "deleted-root-session")
 	require.NoError(t, err)
-	assert.Nil(t, gone,
+	assert.NotNil(t, gone,
 		"authoritative watch-root reconciliation must tombstone stored descendants")
 }
 
@@ -2251,7 +2251,7 @@ func TestReconcileWatchRootsFullNilTombstonesEveryConfiguredLocalRoot(t *testing
 			for i := 1; i < total; i++ {
 				gone, err := env.db.GetSession(t.Context(), fmt.Sprintf("full-%03d", i))
 				require.NoError(t, err)
-				assert.Nil(t, gone, "full reconciliation must tombstone missing source %d", i)
+				assert.NotNil(t, gone, "full reconciliation keeps missing source %d browsable", i)
 			}
 		})
 	}
@@ -2596,10 +2596,7 @@ func TestReconcileWatchRootsOpenCodeHybridUnreadableSQLiteWithholdsTombstones(
 	))
 	prior, getErr = env.db.GetSessionFull(t.Context(), "opencode:"+priorID)
 	require.NoError(t, getErr)
-	require.NotNil(t, prior)
-	require.NotNil(t, prior.DeletionCause)
-	assert.Equal(t, "source_missing", *prior.DeletionCause,
-		"a successful retry may tombstone the now-authoritatively missing SQLite source")
+	assertSourceMissingState(t, prior)
 }
 
 func TestReconcileWatchRootsOpenCodeHybridCardinalityAndIdleGate(t *testing.T) {
@@ -2848,7 +2845,11 @@ func TestColdArchiveChangedPathAndReconciliationAreCardinalityBounded(t *testing
 			))
 			deletedSession, err := env.db.GetSession(t.Context(), "changed-session")
 			require.NoError(t, err)
-			deleted := deletedSession == nil
+			require.NotNil(t, deletedSession)
+			full, err := env.db.GetSessionFull(t.Context(), "changed-session")
+			require.NoError(t, err)
+			assertSourceMissingState(t, full)
+			deleted := full.SourceMissingAt != nil
 			assert.True(t, deleted,
 				"authoritative reconciliation must tombstone the deleted source")
 
@@ -2911,7 +2912,7 @@ func TestReconcileWatchRootsKiroPreservesOnlySQLiteSourcesWithHashPaths(t *testi
 		"a vanished Kiro SQLite store must preserve its archived members")
 	legacySession, err := env.db.GetSession(t.Context(), "kiro:"+legacyID)
 	require.NoError(t, err)
-	assert.Nil(t, legacySession,
+	assert.NotNil(t, legacySession,
 		"an ordinary Kiro JSONL source must tombstone even when its root and filename contain #")
 }
 
@@ -2961,7 +2962,7 @@ func TestReconcileWatchRootsKiroSQLiteBasenameJSONLRemainsLegacy(t *testing.T) {
 	for _, id := range legacyIDs {
 		stored, err := env.db.GetSession(t.Context(), "kiro:"+id)
 		require.NoError(t, err)
-		assert.Nil(t, stored, "deleted legacy source %s must tombstone", id)
+		assert.NotNil(t, stored, "deleted legacy source %s remains browsable", id)
 	}
 }
 
@@ -2991,11 +2992,10 @@ func TestWatcherPathDeletionTombstonesPersistentArchiveSource(t *testing.T) {
 
 	active, err := env.db.GetSession(t.Context(), "watcher-delete")
 	require.NoError(t, err)
-	assert.Nil(t, active, "watcher deletion must hide the missing source")
+	assert.NotNil(t, active, "watcher deletion must preserve the missing source")
 	archived, err := env.db.GetSessionFull(t.Context(), "watcher-delete")
 	require.NoError(t, err)
-	require.NotNil(t, archived, "watcher deletion must retain the archive row")
-	assert.NotNil(t, archived.DeletedAt)
+	assertSourceMissingState(t, archived)
 }
 
 func TestSyncEngineWorktreesShareProject(t *testing.T) {
@@ -4035,12 +4035,7 @@ func TestResyncAllTombstonesOmittedStaleClaudeFork(t *testing.T) {
 
 	stale, err := env.db.GetSessionFull(t.Context(), staleID)
 	require.NoError(t, err)
-	require.NotNil(t, stale,
-		"the archived fork must remain available as a revivable tombstone")
-	require.NotNil(t, stale.DeletedAt,
-		"the complete rebuild parse must retire the omitted stale fork")
-	require.NotNil(t, stale.DeletionCause)
-	assert.Equal(t, "source_missing", *stale.DeletionCause)
+	assertSourceMissingState(t, stale)
 	messages, err := env.db.GetAllMessages(t.Context(), staleID)
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
@@ -4093,12 +4088,7 @@ func TestResyncContributorTombstonesOmittedStaleClaudeFork(t *testing.T) {
 
 	stale, err := env.db.GetSessionFull(t.Context(), staleID)
 	require.NoError(t, err)
-	require.NotNil(t, stale,
-		"the archived contributor fork must remain a revivable tombstone")
-	require.NotNil(t, stale.DeletedAt,
-		"the contributor rebuild parse must retire the omitted stale fork")
-	require.NotNil(t, stale.DeletionCause)
-	assert.Equal(t, "source_missing", *stale.DeletionCause)
+	assertSourceMissingState(t, stale)
 }
 
 func TestResyncContributorExclusionIsNotRestoredAsOrphan(t *testing.T) {
@@ -6731,7 +6721,7 @@ func TestReconcileWatchRootsCodexPreservesLiveDuplicateOfRemovedArchivedCopy(
 	))
 	tombstoned, err := env.db.GetSession(t.Context(), "codex:"+uuid)
 	require.NoError(t, err)
-	assert.Nil(t, tombstoned,
+	assert.NotNil(t, tombstoned,
 		"deleting the last on-disk copy must still tombstone the session")
 }
 
@@ -6804,7 +6794,7 @@ func TestReconcileWatchRootsCodexReplacementIndexBuildsOncePerPass(
 			for i := 1; i < 3; i++ {
 				gone, err := env.db.GetSession(t.Context(), "codex:"+uuidFor(i))
 				require.NoError(t, err)
-				assert.Nil(t, gone,
+				assert.NotNil(t, gone,
 					"sessions with no surviving copy must tombstone")
 			}
 			result := env.engine.LastReconciliationResult()
@@ -16595,10 +16585,10 @@ func TestRestartedEngineCodexIndexRenameNotMaskedByStatDigest(t *testing.T) {
 // transcript (e.g. a fork branch an older parser split out) makes the
 // path map to multiple DB sessions, so GetSessionForIncremental declines
 // and every append full-parses the whole file, forever — re-parsing can
-// never re-emit the stale ID. A complete full parse must tombstone such
-// rows as source-missing so the incremental path recovers; a later parse
-// that re-emits the ID revives the row.
-func TestSyncAllTombstonesStaleClaudeForkRow(t *testing.T) {
+// never re-emit the stale ID. A complete full parse must mark such rows
+// source-missing so the incremental path recovers. A later parse that re-emits
+// the ID clears that source state.
+func TestSyncAllMarksStaleClaudeForkSourceMissing(t *testing.T) {
 	env := setupTestEnv(t)
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUser(tsEarly, "hello there", "/workspace/api").
@@ -16649,14 +16639,13 @@ func TestSyncAllTombstonesStaleClaudeForkRow(t *testing.T) {
 	))
 	require.Equal(t, 1, env.engine.SyncAll(t.Context(), nil).Synced)
 
-	var deletedAt, cause sql.NullString
+	var deletedAt, sourceMissingAt sql.NullString
 	require.NoError(t, env.db.Reader().QueryRow(
-		`SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?`,
+		`SELECT deleted_at, source_missing_at FROM sessions WHERE id = ?`,
 		staleID,
-	).Scan(&deletedAt, &cause), "query stale fork row")
-	assert.True(t, deletedAt.Valid,
-		"stale fork row should be tombstoned as source-missing")
-	assert.Equal(t, "source_missing", cause.String)
+	).Scan(&deletedAt, &sourceMissingAt), "query stale fork row")
+	assert.False(t, deletedAt.Valid)
+	assert.True(t, sourceMissingAt.Valid)
 
 	// With the transcript mapping to a single active session again, the
 	// next append stays on the incremental path instead of re-parsing
@@ -16716,11 +16705,7 @@ func TestSyncAllRetriesStaleClaudeForkCleanupAfterEstablishingBaseline(
 	require.Zero(t, second.Failed)
 	stale, err = env.db.GetSessionFull(t.Context(), staleID)
 	require.NoError(t, err)
-	require.NotNil(t, stale)
-	require.NotNil(t, stale.DeletedAt,
-		"the second pass must retry and tombstone the stale fork")
-	require.NotNil(t, stale.DeletionCause)
-	assert.Equal(t, "source_missing", *stale.DeletionCause)
+	assertSourceMissingState(t, stale)
 }
 
 func TestSyncAllTombstonesStaleClaudeForkAfterZeroResultParse(t *testing.T) {
@@ -16763,14 +16748,13 @@ func TestSyncAllTombstonesStaleClaudeForkAfterZeroResultParse(t *testing.T) {
 	assert.Equal(t, 1, stats.Synced,
 		"the original session should sync while the replay is excluded")
 
-	var deletedAt, cause sql.NullString
+	var deletedAt, sourceMissingAt sql.NullString
 	require.NoError(t, env.db.Reader().QueryRow(
-		`SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?`,
+		`SELECT deleted_at, source_missing_at FROM sessions WHERE id = ?`,
 		legacyForkID,
-	).Scan(&deletedAt, &cause), "query legacy fork row")
-	assert.True(t, deletedAt.Valid,
-		"legacy fork should be tombstoned after a complete zero-result parse")
-	assert.Equal(t, "source_missing", cause.String)
+	).Scan(&deletedAt, &sourceMissingAt), "query legacy fork row")
+	assert.False(t, deletedAt.Valid)
+	assert.True(t, sourceMissingAt.Valid)
 
 	steady := env.engine.SyncAll(t.Context(), nil)
 	require.Zero(t, steady.Failed)
@@ -16851,9 +16835,7 @@ func TestFullSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
 				"a member-only tombstone must notify connected clients")
 			stale, err := env.db.GetSessionFull(t.Context(), staleID)
 			require.NoError(t, err)
-			require.NotNil(t, stale)
-			require.NotNil(t, stale.DeletionCause)
-			assert.Equal(t, "source_missing", *stale.DeletionCause)
+			assertSourceMissingState(t, stale)
 		})
 	}
 }

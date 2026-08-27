@@ -1646,7 +1646,7 @@ func (e *Engine) applyChangedPathSyncLocked(
 			ctx, prepared.missingPaths, nil,
 		)
 		if err != nil {
-			return stats, tombstoned, fmt.Errorf("watcher source tombstone: %w", err)
+			return stats, tombstoned, fmt.Errorf("watcher source reconciliation: %w", err)
 		}
 	}
 	e.mu.Lock()
@@ -3497,13 +3497,13 @@ func (e *Engine) resyncBuildLocked(
 
 	// Metadata restoration deliberately copies user-owned deletion state from
 	// the original archive. Reconcile archive-only Claude members afterwards so
-	// an active legacy fork cannot overwrite the source_missing tombstone that
+	// an available legacy fork cannot overwrite the source-missing state that
 	// this rebuild just established.
 	deferredTombstoned, err := e.reconcileCopiedSourceMissingMembers(
 		ctx, newDB, origPath, stats.sourceMissingArchiveMembers,
 	)
 	if err != nil {
-		log.Printf("resync: tombstone copied source-missing sessions: %v", err)
+		log.Printf("resync: mark copied sessions source-missing: %v", err)
 		stats.Aborted = true
 		stats.Warnings = append(stats.Warnings,
 			"copied source-missing reconciliation failed, aborting swap: "+
@@ -6544,7 +6544,7 @@ func (e *Engine) tombstoneMissingWatchSourceScopesLocked(
 							// The container still exists but the streamed pass no
 							// longer yields this member; tombstone directly — the
 							// guards below all assume a vanished stored path.
-							changed, err := e.tombstoneSessionSourceOwnership(
+							changed, err := e.markSessionSourceMissing(
 								ctx, ownership.Machine, ownership.Agent,
 								ownership.ID, ownership.FilePath,
 							)
@@ -6768,7 +6768,7 @@ func (e *Engine) tombstoneMissingWatchSourceScopesLocked(
 								}
 							}
 						}
-						changed, err := e.tombstoneSessionSourceOwnership(
+						changed, err := e.markSessionSourceMissing(
 							ctx, ownership.Machine, ownership.Agent,
 							ownership.ID, ownership.FilePath,
 						)
@@ -6820,12 +6820,12 @@ func canonicalProviderStatHashAgent(agent string) parser.AgentType {
 	return a
 }
 
-func (e *Engine) tombstoneSessionSourceOwnership(
+func (e *Engine) markSessionSourceMissing(
 	ctx context.Context, machine, agent, id, filePath string,
 ) (bool, error) {
 	// Clear durable freshness state first. If this fails, leave the session
-	// active so a later reconciliation can retry the cache invalidation and
-	// tombstone as one recoverable operation.
+	// unchanged so a later reconciliation can retry the cache invalidation and
+	// source-state transition as one recoverable operation.
 	if _, err := e.clearSkipPersistent(filePath); err != nil {
 		return false, fmt.Errorf("clear source skip cache: %w", err)
 	}
@@ -6844,13 +6844,13 @@ func (e *Engine) tombstoneSessionSourceOwnership(
 	// same physical directory is later restored byte-for-byte, the stale
 	// digest would short-circuit providerSourceFreshBeforeFingerprint on
 	// the next warm pass and silently skip the source, preventing the
-	// tombstoned row from being revived by reconciliation.
+	// source-missing row from returning to sync eligibility.
 	if err := e.db.DeleteProviderStatHash(
 		ctx, canonicalProviderStatHashAgent(agent), filePath,
 	); err != nil {
 		return false, fmt.Errorf("clear provider_freshness: %w", err)
 	}
-	changed, err := e.db.SoftDeleteSessionSourceOwnership(
+	changed, err := e.db.MarkSessionSourceMissing(
 		ctx, machine, agent, id, filePath,
 	)
 	if err != nil || !changed {
@@ -6858,14 +6858,14 @@ func (e *Engine) tombstoneSessionSourceOwnership(
 	}
 	// The skip family was removed before the database transition. Drop the
 	// remaining source trust so a byte-identical return is reverified and can
-	// revive the tombstoned row.
+	// clear the source-missing state.
 	e.invalidateVerifiedSource(parser.AgentType(agent), filePath)
 	return true, nil
 }
 
 // reconcileSourceMissingMembers applies the per-member CWD decision shared by
-// batch and single-session writes. A member without deletion proof cannot be
-// tombstoned yet, so baseline records only that exact admitted ownership; the
+// batch and single-session writes. A member without source-absence proof cannot
+// be marked source-missing yet, so baseline records only that exact admitted ownership; the
 // caller persists those records at the correct point in its write ordering.
 func (e *Engine) reconcileSourceMissingMembers(
 	ctx context.Context,
@@ -6921,7 +6921,7 @@ func (e *Engine) reconcileSourceMissingMembers(
 				continue
 			}
 		}
-		changed, err := e.tombstoneSessionSourceOwnership(
+		changed, err := e.markSessionSourceMissing(
 			ctx, member.machine, string(agent),
 			member.sessionID, member.filePath,
 		)
@@ -6942,8 +6942,8 @@ func (e *Engine) reconcileSourceMissingMembers(
 // reconcileCopiedSourceMissingMembers completes rebuild-time reconciliation
 // after orphan copy has materialized archive-only rows in the replacement.
 // Exact baselines copied from the archive authorize an immediate guarded
-// tombstone.
-// Baseline-free legacy rows remain active for this pass but gain exact proof,
+// source-missing transition.
+// Baseline-free legacy rows remain available for this pass but gain exact proof,
 // preserving the normal two-pass upgrade safety rule.
 func (e *Engine) reconcileCopiedSourceMissingMembers(
 	ctx context.Context,
@@ -6982,13 +6982,13 @@ func (e *Engine) reconcileCopiedSourceMissingMembers(
 				member.sessionID, err,
 			)
 		}
-		changed, err := target.SoftDeleteSessionSourceOwnership(
+		changed, err := target.MarkSessionSourceMissing(
 			ctx, member.machine, string(member.agent),
 			member.sessionID, member.filePath,
 		)
 		if err != nil {
 			return tombstoned, fmt.Errorf(
-				"tombstone copied source-missing member %s: %w",
+				"mark copied member %s source-missing: %w",
 				member.sessionID, err,
 			)
 		}
@@ -9241,8 +9241,7 @@ func (e *Engine) collectAndBatch(
 }
 
 type collectAndBatchOptions struct {
-	preserveMissingSources bool
-	observeResult          func(syncJob)
+	observeResult func(syncJob)
 }
 
 func (e *Engine) collectAndBatchWithOptions(
@@ -9784,15 +9783,15 @@ func (e *Engine) collectAndBatchWithOptions(
 				stats.parserExcludedIDs, excludedSessionIDs...,
 			)
 		}
-		// Virtual members that vanished from a still-existing shared
-		// container are tombstoned with their exact source ownership,
-		// matching the reconciliation audit, instead of hard-deleted.
+		// Virtual members that vanished from a still-existing shared container
+		// are marked source-missing with their exact source ownership, matching
+		// the reconciliation audit, instead of being hidden or hard-deleted.
 		// The cwd-filter freeze is judged per member against the
 		// archived cwd (missingMemberTombstoneAllowed), not source-wide:
 		// unchanged survivors are dropped from r.results before this
 		// point, so the source-wide gate would freeze an allowed
 		// member's deletion whenever everything else was unchanged.
-		if len(r.sourceMissingMembers) > 0 && !options.preserveMissingSources {
+		if len(r.sourceMissingMembers) > 0 {
 			tombstoned, deferred, tombstoneErr := e.reconcileSourceMissingMembers(
 				ctx, r.agent, r.sourceMissingMembers,
 				baselineExactOwnership, rejectExactOwnership,
@@ -10304,9 +10303,9 @@ type sessionParseError struct {
 }
 
 // sourceMissingMember identifies one stored session whose virtual member
-// source vanished from a still-existing shared container. The write seam
-// tombstones its exact source ownership (deletion_cause = source_missing,
-// revivable) instead of hard-deleting it as a parser exclusion.
+// source vanished from a still-existing shared container. The write seam marks
+// its exact source ownership missing instead of hard-deleting it as a parser
+// exclusion. The archived session remains visible.
 type sourceMissingMember struct {
 	sessionID string
 	filePath  string
@@ -10323,7 +10322,7 @@ type processResult struct {
 	// sourceMissingMembers carries stored sessions whose virtual member
 	// source no longer exists inside a still-present shared container
 	// (e.g. a Windsurf conversation deleted from state.vscdb). They must
-	// be tombstoned, never routed through DeleteParserExcludedSessions.
+	// be marked source-missing, never routed through DeleteParserExcludedSessions.
 	sourceMissingMembers []sourceMissingMember
 	// sessionErrs carries per-session parse failures from the
 	// shared-db fan-out loops. Normal sync logs and skips these;
@@ -11204,14 +11203,21 @@ func (e *Engine) processProviderFile(
 					parser.IsRegularFile(providerDiscoveredPath(source))
 			traeContainerExists := file.Agent == parser.AgentTrae &&
 				parser.IsRegularFile(providerDiscoveredPath(source))
+			sourceFileMissing := false
+			if statPath := validatedProviderSourceStatPath(file.Path); statPath != "" {
+				_, statErr := e.lstatSource(statPath)
+				sourceFileMissing = os.IsNotExist(statErr)
+			}
 			if e.pathRewriter != nil ||
 				(providerVirtualSourceContainerExists(file.Path) ||
-					omnigentContainerExists || traeContainerExists) {
+					omnigentContainerExists || traeContainerExists ||
+					sourceFileMissing) {
 				// The provider re-resolved this exact virtual member against a
 				// still-present shared container, or authoritatively parsed an
-				// empty Omnigent or Trae container. The member was removed from the
-				// container, not the container from disk. Carry the stored
-				// ownership to the revivable tombstone seam.
+				// empty Omnigent or Trae container, or the backing source itself
+				// is gone. Carry the stored ownership to the recoverable
+				// source-missing seam instead of treating absence as a parser
+				// exclusion.
 				missingMembers = owned
 			} else {
 				for _, member := range owned {
@@ -13243,8 +13249,7 @@ func providerFingerprintHashEstablishesFreshness(agent parser.AgentType) bool {
 // providerSourceUnchangedInDB. Unlike providerFingerprintHashMatchesDB, an
 // absent hash can never establish freshness here: the stat already disagrees,
 // so only a positive content match may skip. GetFileHashByAgentPath excludes
-// recoverable source-missing tombstones, so a returning member still revives
-// through a full parse.
+// source-missing rows, so a returning member still passes through a full parse.
 func (e *Engine) providerSourceHashFreshDespiteStat(
 	agent parser.AgentType,
 	lookupPath string,
@@ -13366,7 +13371,7 @@ func (e *Engine) providerSingleSessionFresh(
 			return 0, false, false, false
 		}
 	}
-	// A source-missing primary tombstone must read as absent here: it cannot
+	// A source-missing primary must read as unavailable here: it cannot
 	// vouch for the source (shouldSkipFile ignores it), so only the rowless
 	// marker can prove an unchanged source that no longer admits a primary.
 	primaryPath := e.db.GetSessionFilePathNotSourceMissing(fullID)
@@ -15672,7 +15677,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
 		}
 
 		// The session row must exist before messages can be inserted (FK
-		// constraint), but a source-missing row stays tombstoned until every
+		// constraint), but a row stays source-missing until every
 		// dependent write succeeds below. For incremental updates
 		// (writeIncremental), messages are written first since the session
 		// already exists.
@@ -15763,7 +15768,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
 
 		// Advance data_version only after the message and usage writes
 		// succeeded. The pending upsert deliberately does not touch this
-		// column, and the source-missing tombstone is cleared only after this
+		// column, and source-missing state is cleared only after this
 		// succeeds, so an old current version cannot hide a failed rewrite.
 		if err := e.db.SetSessionDataVersion(
 			s.ID, dataVersionForWrite(pw),
@@ -15801,11 +15806,11 @@ func (e *Engine) writeBatchWithOutcomeContext(
 		if ctx.Err() != nil {
 			return outcome
 		}
-		if err := e.db.ReviveSourceMissingSession(s.ID); err != nil {
+		if err := e.db.ClearSessionSourceMissing(s.ID); err != nil {
 			if ctx.Err() != nil {
 				return outcome
 			}
-			log.Printf("revive source-missing session %s: %v", s.ID, err)
+			log.Printf("clear source-missing state for session %s: %v", s.ID, err)
 			outcome.failedSessions++
 			continue
 		}
@@ -17674,8 +17679,8 @@ func (e *Engine) writeSessionFullWithResolver(
 		)
 		return err
 	}
-	if err := e.db.ReviveSourceMissingSession(s.ID); err != nil {
-		log.Printf("revive source-missing session %s: %v", s.ID, err)
+	if err := e.db.ClearSessionSourceMissing(s.ID); err != nil {
+		log.Printf("clear source-missing state for session %s: %v", s.ID, err)
 		return err
 	}
 
@@ -19224,10 +19229,10 @@ func (e *Engine) processAndWriteSessionFile(
 			"delete parser-excluded sessions: %w", err,
 		)
 	}
-	// A virtual member gone from a still-existing shared container is
-	// tombstoned with its exact source ownership, mirroring
+	// A virtual member gone from a still-existing shared container is marked
+	// source-missing with its exact source ownership, mirroring
 	// collectAndBatch, so a single-session resync preserves the archive
-	// row as a revivable source-missing tombstone. The cwd-filter
+	// row with recoverable source-missing state. The cwd-filter
 	// freeze is judged per member against the archived cwd, matching
 	// the batch path.
 	if len(res.sourceMissingMembers) > 0 {
