@@ -28,7 +28,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	github.com/tidwall/gjson v1.19.0
 	go.kenn.io/docbank v0.13.0
-	go.kenn.io/kit v0.21.3
+	go.kenn.io/kit v0.22.0
 	golang.org/x/mod v0.40.0
 	golang.org/x/net v0.58.0
 	golang.org/x/perf v0.0.0-20260615155930-9e4b9ddef5b6

@@ -1332,7 +1332,7 @@ func TestEncoderContextCancellationAbortsBackoffPromptly(t *testing.T) {
 
 // TestEncoder400ReturnsPermanentHTTPStatusError covers fix 1a: a non-200
 // response must come back as a *HTTPStatusError carrying the status code,
-// so callers (kit's FillOptions.OnEncodeError) can distinguish a permanent
+// so callers (kit's WithFillEncodeError handler) can distinguish a permanent
 // rejection from a transient one instead of string-matching the message.
 func TestEncoder400ReturnsPermanentHTTPStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
