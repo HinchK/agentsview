@@ -11,6 +11,7 @@ import (
 
 var _ Provider = (*claudeProvider)(nil)
 var _ S3Provider = (*claudeProvider)(nil)
+var _ RawCaptureProvider = (*claudeProvider)(nil)
 
 type claudeProviderFactory struct {
 	def AgentDef
@@ -77,8 +78,56 @@ func (p *claudeProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+func (p *claudeProvider) PlanRawCapture(
+	ctx context.Context,
+	source SourceRef,
+) (RawCapturePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return RawCapturePlan{}, err
+	}
+	src, ok := source.Opaque.(claudeSource)
+	if !ok || src.Root == "" || src.Path == "" || isS3URI(src.Root) {
+		return RawCapturePlan{}, invalidRawCapturePlan("claude source is not a local discovered transcript")
+	}
+	rel, err := filepath.Rel(src.Root, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"resolve claude source path: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	entries := []RawCaptureEntry{{
+		Path:       filepath.ToSlash(rel),
+		LocalPath:  src.Path,
+		Appendable: true,
+	}}
+	sidecars, err := claudeLayoutSidecarFiles(ctx, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"read Claude tool results: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	for _, path := range sidecars {
+		rel, err := filepath.Rel(src.Root, path)
+		if err != nil {
+			return RawCapturePlan{}, invalidRawCapturePlan(
+				"resolve Claude tool result: %s", rawCaptureFilesystemError(err),
+			)
+		}
+		entries = append(entries, RawCaptureEntry{
+			Path: filepath.ToSlash(rel), LocalPath: path,
+		})
+	}
+	return RawCapturePlan{
+		ConfiguredRoot: src.Root,
+		CaptureRoot:    src.Root,
+		SourceKey:      source.Key,
+		Entries:        entries,
+	}, nil
+}
+
 // ComputeMultiFileStatHash implements parser.MultiFileStatHasher for the
-// single-file Claude transcript. Claude has no sibling companions; the
+// Claude transcript. Tool-result companions are immutable and do not affect
+// the transcript freshness gate; raw capture enumerates them separately.
 // digest exists so stat-verified freshness persists in provider_freshness
 // across process restarts, sparing a fresh engine (daemon restart or a
 // one-shot CLI sync) the full-content hash that Fingerprint performs for
@@ -763,6 +812,12 @@ func claudeProviderCapabilities() Capabilities {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
+		},
+		RawCapture: RawCaptureCapabilities{
+			Support:  CapabilitySupported,
+			Shape:    RawCaptureShapeFiles,
+			Append:   RawCaptureAppendOne,
+			Snapshot: RawCaptureSnapshotNone,
 		},
 	}
 }
