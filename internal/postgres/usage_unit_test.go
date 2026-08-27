@@ -103,6 +103,11 @@ func (c *usageProbeConn) QueryContext(
 	c.state.mu.Unlock()
 
 	normalized := strings.ToLower(query)
+	if strings.Contains(normalized, "from genai_pricing") {
+		return &usageProbeRows{columns: []string{
+			"version", "source_ref", "source", "data_json", "updated_at",
+		}}, nil
+	}
 	if strings.Contains(normalized, "from model_pricing") {
 		return &usageProbeRows{
 			columns: []string{
@@ -181,6 +186,7 @@ func (c *usageProbeConn) QueryContext(
 				"message_ordinal",
 				"usage_source",
 				"ts",
+				"pricing_ts",
 				"model",
 				"token_usage",
 				"web_search_requests",
@@ -214,6 +220,7 @@ func usageProbeUsageRow(
 		sessionID,
 		int64(0),
 		"message",
+		ts,
 		ts,
 		"claude-sonnet",
 		`{"input_tokens":100,"output_tokens":50}`,
@@ -664,6 +671,7 @@ func TestPGActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T
 					usageSource: "provider",
 					model:       "daimon-kimi-code",
 					ts:          sql.NullTime{Time: tt.timestamp, Valid: true},
+					pricingTS:   sql.NullTime{Time: tt.timestamp, Valid: true},
 					inputTokens: 1_000_000,
 				},
 				resolver,
@@ -707,6 +715,10 @@ func TestPGActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 			usageSource: "provider",
 			model:       "daimon-kimi-code",
 			ts: sql.NullTime{
+				Time:  pricingpkg.KimiModelEraCutoff,
+				Valid: true,
+			},
+			pricingTS: sql.NullTime{
 				Time:  pricingpkg.KimiModelEraCutoff,
 				Valid: true,
 			},

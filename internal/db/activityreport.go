@@ -1323,8 +1323,10 @@ func sqliteActivityReportRowStatus(
 func sqliteActivityReportRowStatusWithWebSearchRequests(
 	r dailyUsageScanRow, webSearches int, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
-	pricedModel, lookup := pricing.Resolve(
-		r.model, usageLookupModel(r.model, r.ts))
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS),
+	)
 	var inTok, outTok, crTok, rdTok int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {

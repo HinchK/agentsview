@@ -417,6 +417,7 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
+	COALESCE(m.timestamp, '') AS pricing_ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -454,6 +455,7 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
+	COALESCE(ue.occurred_at, '') AS pricing_ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -500,6 +502,7 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
+	COALESCE(m.timestamp, '') AS pricing_ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -530,6 +533,7 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
+	COALESCE(ue.occurred_at, '') AS pricing_ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -559,6 +563,7 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
+	COALESCE(m.timestamp, '') AS pricing_ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -588,6 +593,7 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
+	COALESCE(ue.occurred_at, '') AS pricing_ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -696,6 +702,7 @@ type usageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       string
+	pricingTS                string
 	model                    string
 	tokenJSON                string
 	inputTokens              int
@@ -726,6 +733,7 @@ type dailyUsageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       string
+	pricingTS                string
 	model                    string
 	tokenJSON                string
 	webSearchRequests        sql.NullInt64
@@ -759,6 +767,7 @@ SELECT
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
 	u.token_usage,
 	u.input_tokens,
@@ -859,6 +868,7 @@ SELECT
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
 	u.token_usage,
 	` + cols.webSearch + ` AS web_search_requests,
@@ -1048,6 +1058,7 @@ SELECT
 	NULL AS message_ordinal,
 	'cursor' AS usage_source,
 	cu.occurred_at AS ts,
+	cu.occurred_at AS pricing_ts,
 	cu.model,
 	'' AS token_usage,
 	cu.input_tokens,
@@ -1391,6 +1402,7 @@ func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
 		&r.tokenJSON,
 		&r.inputTokens,
@@ -1431,6 +1443,7 @@ func scanDailyUsageRowWithMachine(
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
 		&r.tokenJSON,
 		&r.webSearchRequests,
@@ -1559,6 +1572,11 @@ func usageLookupModel(model, ts string) string {
 	return model
 }
 
+func usagePricingTimestamp(ts string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339Nano, ts)
+	return parsed
+}
+
 func dailyUsageAmounts(
 	r dailyUsageScanRow, pricing *export.PricingResolver,
 ) (
@@ -1575,12 +1593,15 @@ func dailyUsageAmounts(
 	cacheCrTok = int(fact.CacheCreationTokens)
 	cacheRdTok = int(fact.CacheReadTokens)
 	priced, err := priceUsageFact(usagePriceInput{
-		Fact: fact, Timestamp: r.ts, ReportedModel: r.model,
+		Fact: fact, Timestamp: r.pricingTS, ReportedModel: r.model,
 	}, pricing)
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{}, err
 	}
-	_, lookup := pricing.Resolve(r.model, usageLookupModel(r.model, r.ts))
+	_, lookup := pricing.ResolveAt(
+		r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS),
+	)
 	if priced.Reported > 0 {
 		pricing.RecordResolvedReported(r.model, priced.PricedModel, lookup)
 	} else {
@@ -1607,7 +1628,7 @@ func dailyUsageFact(r dailyUsageScanRow) (usagefacts.Fact, bool) {
 	if r.usageSource == "message" {
 		return usagefacts.FromMessage(usagefacts.MessageInput{
 			Ordinal: int(r.messageOrdinal.Int64), Role: "assistant",
-			Timestamp: r.ts, Model: r.model, TokenUsage: r.tokenJSON,
+			Timestamp: r.pricingTS, Model: r.model, TokenUsage: r.tokenJSON,
 			ClaudeMessageID: r.claudeMessageID,
 			ClaudeRequestID: r.claudeRequestID,
 			SourceUUID:      r.sourceUUID,
@@ -1625,7 +1646,7 @@ func dailyUsageFact(r dailyUsageScanRow) (usagefacts.Fact, bool) {
 	}
 	return usagefacts.FromEvent(usagefacts.EventInput{
 		MessageOrdinal: ordinal, Source: r.usageSource,
-		Timestamp: r.ts, Model: r.model,
+		Timestamp: r.pricingTS, Model: r.model,
 		CostSource: r.costSource, DedupKey: r.usageDedupKey,
 		InputTokens:              int64(r.inputTokens),
 		OutputTokens:             int64(r.outputTokens),
@@ -1938,8 +1959,49 @@ func (db *DB) loadPricingMapFrom(
 		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
 		out[model] = rates
 	}
+	genAI, err := genAIEffectivePricingRow(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	rows := pricingMapRows(out)
+	return append(rows, genAI), nil
+}
 
-	return pricingMapRows(out), nil
+func genAIEffectivePricingRow(
+	ctx context.Context, q sessionExportQuerier,
+) (export.EffectivePricingRow, error) {
+	stored, err := getGenAIPricingFrom(ctx, q)
+	if err != nil {
+		return export.EffectivePricingRow{}, err
+	}
+	if stored == nil {
+		embedded := pricingpkg.EmbeddedGenAIDocument()
+		return export.EffectivePricingRow{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: export.PricingRowSourceEmbedded,
+		}, nil
+	}
+	document, err := pricingpkg.ParseGenAIDocument(
+		stored.Data, stored.Version, stored.SourceRef,
+	)
+	if err != nil {
+		return export.EffectivePricingRow{}, fmt.Errorf(
+			"parsing stored GenAI pricing document: %w", err,
+		)
+	}
+	var updatedAt *time.Time
+	if parsed, parseErr := time.Parse(time.RFC3339Nano, stored.UpdatedAt); parseErr == nil {
+		utc := parsed.UTC()
+		updatedAt = &utc
+	}
+	source := export.PricingRowSourceFetched
+	if stored.Source == GenAIPricingSourceEmbedded {
+		source = export.PricingRowSourceEmbedded
+	}
+	return export.EffectivePricingRow{
+		GenAI: document.Prices, GenAIVersion: document.Version,
+		GenAISource: source, GenAIUpdatedAt: updatedAt,
+	}, nil
 }
 
 func customPricingSource() export.PricingRowSource {
@@ -2998,8 +3060,10 @@ func sessionRowCostWithWebSearchRequests(
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
-	pricedModel, lookup := pricing.Resolve(
-		r.model, usageLookupModel(r.model, r.ts))
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, usageLookupModel(r.model, r.pricingTS),
+		usagePricingTimestamp(r.pricingTS),
+	)
 	if r.cost.Valid {
 		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil

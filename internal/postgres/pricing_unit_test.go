@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,6 +39,8 @@ type pricingProbeState struct {
 	execs            []string
 	err              error
 	rows             [][]driver.Value
+	genAIRows        [][]driver.Value
+	genAIErr         error
 	block            <-chan struct{}
 	afterCancelBlock <-chan struct{}
 	done             chan struct{}
@@ -106,6 +109,18 @@ func (c *pricingProbeConn) ExecContext(
 func (c *pricingProbeConn) QueryContext(
 	ctx context.Context, query string, _ []driver.NamedValue,
 ) (driver.Rows, error) {
+	if strings.Contains(strings.ToLower(query), "from genai_pricing") {
+		c.state.mu.Lock()
+		values := append([][]driver.Value(nil), c.state.genAIRows...)
+		err := c.state.genAIErr
+		c.state.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return &pricingProbeRows{columns: []string{
+			"version", "source_ref", "source", "data_json", "updated_at",
+		}, values: values}, nil
+	}
 	defer func() {
 		if c.state.done != nil {
 			c.state.doneOnce.Do(func() { close(c.state.done) })
@@ -364,6 +379,28 @@ func TestLoadPricingMapUsesFallbackForSentinelOnlyCatalog(t *testing.T) {
 	assert.Contains(t, byPattern, "gpt-5.5")
 }
 
+func TestLoadPricingMapUsesEmbeddedGenAIWhenTableMissing(t *testing.T) {
+	state := &pricingProbeState{
+		genAIErr: errors.New(
+			`relation "genai_pricing" does not exist (SQLSTATE 42P01)`,
+		),
+	}
+	store := &Store{pg: newPricingProbeDB(t, state)}
+
+	rows, err := store.loadPricingMap(context.Background())
+	require.NoError(t, err)
+
+	var genAIRow *export.EffectivePricingRow
+	for i := range rows {
+		if rows[i].GenAI != nil {
+			genAIRow = &rows[i]
+			break
+		}
+	}
+	require.NotNil(t, genAIRow, "embedded GenAI pricing row")
+	assert.Equal(t, export.PricingRowSourceEmbedded, genAIRow.GenAISource)
+}
+
 func TestLoadPricingMapUsesDBRowsAsEffectiveTable(t *testing.T) {
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
@@ -575,6 +612,9 @@ func pricingRowsByPattern(
 ) map[string]export.ModelRates {
 	out := make(map[string]export.ModelRates, len(rows))
 	for _, row := range rows {
+		if row.ModelPattern == "" {
+			continue
+		}
 		out[row.ModelPattern] = row.Rates
 	}
 	return out
@@ -744,10 +784,18 @@ func TestSyncModelPricingSkipsWriteWhenRemoteRowsUnchanged(t *testing.T) {
 		CacheCreationPerMTok: money.MustParseDollars("3"),
 		CacheReadPerMTok:     money.MustParseDollars("4"),
 	}}), "seed local pricing")
+	require.NoError(t, local.UpsertGenAIPricing(ctx, db.GenAIPricingDocument{
+		Version: "genai-prices-test", SourceRef: "upstream-ref",
+		Source: db.GenAIPricingSourceFetched, Data: []byte(`{"test":true}`),
+	}), "seed local GenAI pricing")
 
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
 			"same-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "old",
+		}},
+		genAIRows: [][]driver.Value{{
+			"genai-prices-test", "upstream-ref", db.GenAIPricingSourceFetched,
+			[]byte(`{"test":true}`), "old",
 		}},
 	}
 	pg := newPricingProbeDB(t, state)

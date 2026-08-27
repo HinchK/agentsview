@@ -49,6 +49,7 @@ type usageRollupFact struct {
 type usageDailyContribution struct {
 	AttributedSessionID, LocalDate             string
 	ReportedModel, PricedModel, MatchedPattern string
+	PricingTimestamp                           string
 	RateOK                                     bool
 	RateHash                                   string
 	BandThreshold                              *int
@@ -89,7 +90,10 @@ func priceUsageFact(
 	if model == "" {
 		model = input.Fact.Model
 	}
-	pricedModel, lookup := resolver.Resolve(model, usageLookupModel(model, input.Timestamp))
+	pricedModel, lookup := resolver.ResolveAt(
+		model, usageLookupModel(model, input.Timestamp),
+		usagePricingTimestamp(input.Timestamp),
+	)
 	if err := validateNonnegativeUsageRates(lookup.Rates); err != nil {
 		return usagePriceResult{}, fmt.Errorf("pricing usage row for model %q: %w", model, err)
 	}
@@ -185,9 +189,6 @@ func buildUsageDailyContributions(
 	for _, survivor := range survivors {
 		fact := survivor.Fact
 		timestamp := fact.Fact.RawTimestamp
-		if timestamp == "" {
-			timestamp = fact.DedupTimestamp
-		}
 		priced, err := priceUsageFact(usagePriceInput{
 			Fact: fact.Fact, Timestamp: timestamp, ReportedModel: fact.Model,
 		}, resolver)
@@ -210,10 +211,13 @@ func buildUsageDailyContributions(
 				AttributedSessionID: fact.AttributionSessionID,
 				LocalDate:           fact.LocalDate, ReportedModel: fact.Model,
 				PricedModel: priced.PricedModel, MatchedPattern: priced.MatchedPattern,
-				RateOK: priced.RateOK, RateHash: priced.RateHash,
+				PricingTimestamp: timestamp,
+				RateOK:           priced.RateOK, RateHash: priced.RateHash,
 				BandThreshold: priced.BandThreshold,
 			}
 			rows[itemKey] = row
+		} else if row.PricingTimestamp == "" {
+			row.PricingTimestamp = timestamp
 		}
 		if err := addUsageFactToDailyContribution(row, fact, priced); err != nil {
 			return nil, err
