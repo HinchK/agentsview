@@ -1032,8 +1032,8 @@ func TestCurrentDataVersionGrokMessageTimestamps(t *testing.T) {
 }
 
 func TestCurrentDataVersionPositAssistantCacheAccounting(t *testing.T) {
-	assert.Equal(t, 91, CurrentDataVersion(),
-		"Posit Assistant cache accounting requires a sequential backfill")
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 91,
+		"version 91 is the data-version boundary for Posit Assistant cache accounting")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {

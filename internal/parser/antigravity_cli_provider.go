@@ -100,6 +100,7 @@ func (p *antigravityCLIProvider) Parse(
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, usageEvents, status, err := p.parseSessionWithStatus(
+		ctx,
 		src.Path,
 		req.Source.ProjectHint,
 		machine,

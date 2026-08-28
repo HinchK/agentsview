@@ -1687,14 +1687,25 @@ func (e *Engine) applyChangedPathSyncLocked(
 }
 
 // SyncPathsContext is SyncPaths with caller-controlled cancellation. The
+// parsePolicyContext applies engine-level parse policies to ctx. A
+// discovery-disabled engine must carry the policy on every context that
+// reaches provider parsing -- full syncs, streamed reconciliation, changed
+// paths, single-session refreshes, source lookups, and parse diffs -- so a
+// working directory recorded in a transcript is never probed on the local
+// host regardless of which entry point triggered the parse.
+func (e *Engine) parsePolicyContext(ctx context.Context) context.Context {
+	if e.disableProjectDiscovery {
+		return parser.WithoutFilesystemProjectDiscovery(ctx)
+	}
+	return ctx
+}
+
 // file watcher threads the serve shutdown context through here.
 func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
 	if e.refuseWriteInForceParse("SyncPaths") {
 		return nil
 	}
-	if e.disableProjectDiscovery {
-		ctx = parser.WithoutFilesystemProjectDiscovery(ctx)
-	}
+	ctx = e.parsePolicyContext(ctx)
 	stats, tombstoned, err := func() (SyncStats, int, error) {
 		e.syncMu.Lock()
 		defer e.syncMu.Unlock()
@@ -4905,6 +4916,7 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 	if err := ctx.Err(); err != nil {
 		return SyncStats{Aborted: true}, metrics, 0, eligibility, err
 	}
+	ctx = e.parsePolicyContext(ctx)
 	if force {
 		e.clearWatcherOverflowCaches()
 	}
@@ -7196,6 +7208,7 @@ func (e *Engine) syncAllLocked(
 	if ctx.Err() != nil {
 		return SyncStats{Aborted: true}
 	}
+	ctx = e.parsePolicyContext(ctx)
 
 	if recordSyncState {
 		e.recordSyncStarted()
@@ -18410,6 +18423,7 @@ func (e *Engine) findProviderSourceFile(
 	rawSessionID string,
 	storedPath string,
 ) string {
+	ctx = e.parsePolicyContext(ctx)
 	mode := e.providerMigrationModes[def.Type]
 	if mode != parser.ProviderMigrationProviderAuthoritative {
 		return ""
@@ -18469,6 +18483,7 @@ func (e *Engine) providerSessionSourceMtime(
 	rawSessionID string,
 	storedPath string,
 ) int64 {
+	ctx = e.parsePolicyContext(ctx)
 	factory, ok := e.providerFactories[def.Type]
 	if !ok || factory == nil {
 		return 0
@@ -18865,6 +18880,7 @@ func (e *Engine) SyncSingleSessionContext(
 			sessionID,
 		)
 	}
+	ctx = e.parsePolicyContext(ctx)
 	e.syncMu.Lock()
 	preserved := false
 	sessionsChanged := false

@@ -428,7 +428,11 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (91: Posit Assistant inferred cache-write normalization. Existing
 // non-Anthropic auto-cached model rows need re-parsing so their persisted
 // uncached prompt remainder is priced as input rather than cache creation.)
-const dataVersion = 91
+// (92: Antigravity CLI workspace project normalization. Existing rows store
+// the raw workspace path from history.jsonl as the project; re-parsing routes
+// it through the shared cwd normalizer so sessions from different git
+// worktrees of the same repo group under one project.)
+const dataVersion = 92
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
