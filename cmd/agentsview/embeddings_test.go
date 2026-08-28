@@ -229,7 +229,7 @@ func TestNewVectorEncoderWiresOllamaCPUFallback(t *testing.T) {
 				OllamaCPUFallback: true,
 			},
 		},
-	}, "local", "")
+	}, "local", "", false)
 	require.NoError(t, err)
 
 	out, err := enc(context.Background(), []string{"alpha"})

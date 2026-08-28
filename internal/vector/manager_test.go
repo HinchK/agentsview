@@ -284,6 +284,37 @@ func TestManagerWaitBlocksUntilAsyncBuildCompletes(t *testing.T) {
 	}
 }
 
+func TestManagerShutdownCancelsDetachedStartBuild(t *testing.T) {
+	// Models a document build stuck retrying HTTP 429 responses forever
+	// (EncoderConfig.RetryRateLimits): the encoder returns only once its
+	// context is canceled. Shutdown must cancel the detached build so daemon
+	// shutdown does not hang on Wait.
+	ix := openTestIndex(t)
+	stuckEncoder := func(ctx context.Context, _ []string) ([][]float32, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	m := NewManager(
+		ix, twoDocSource(), soloEncoders(stuckEncoder), fakeGeneration("fake-model"),
+	)
+	require.NoError(t, m.StartBuild(BuildRequest{}))
+	waitFor(t, func() bool { return m.Status().Running }, "build never reported running")
+
+	done := make(chan struct{})
+	go func() {
+		m.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "Shutdown did not cancel the detached build")
+	}
+	status := m.Status()
+	assert.False(t, status.Running)
+	assert.Contains(t, status.LastError, context.Canceled.Error())
+}
+
 func TestManagerTryBuildReturnsFalseWhileRunning(t *testing.T) {
 	ix := openTestIndex(t)
 	src := twoDocSource()

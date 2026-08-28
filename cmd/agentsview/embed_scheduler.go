@@ -722,8 +722,11 @@ func setupVectorServing(
 		RecallScheduler:      recallScheduler,
 		RecallMutationNotify: recallMutationNotify,
 		Close: func() error {
-			mgr.Wait()
-			recallMgr.Wait()
+			// Shutdown, not Wait: a detached API build may be waiting out
+			// provider rate limits indefinitely and must be canceled for
+			// daemon shutdown to complete.
+			mgr.Shutdown()
+			recallMgr.Shutdown()
 			ixErr := ix.Close()
 			recallErr := recallIX.Close()
 			lockErr := lock.Close()
