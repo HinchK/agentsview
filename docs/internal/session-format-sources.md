@@ -838,15 +838,68 @@ add an archived or maintained mirror without replacing the original identity.
   confirms local chat persistence and the separate SQLite history index.
   Cursor support on the official forum documents the
   [`~/.cursor/projects/<project>/agent-transcripts` layout](https://forum.cursor.com/t/chat-history-gone-after-pc-restart-agent-transcripts-files-emptied-how-to-recover/158251/5)
-  and identifies `state.vscdb` as metadata. Cursor's public GitHub
-  organization was also searched 2026-07-19; no transcript schema or producer
-  source was found.
+  and identifies `state.vscdb` as metadata **for this CLI producer**. That
+  characterization does not extend to Cursor IDE (the GUI editor, see below):
+  for the GUI, `state.vscdb` is the only transcript store, not metadata beside
+  one. Cursor's public GitHub organization was also searched 2026-07-19; no
+  transcript schema or producer source was found.
 - **Usage and cost:** The consumed text/JSONL transcripts have no reliable
   per-message token, cache, reasoning, credit, or monetary-cost fields.
 - **Agentsview:** `internal/parser/cursor.go`,
   `internal/parser/cursor_paths.go`, and `internal/parser/cursor_provider.go`;
   workspace identity uses a filesystem-backed unique-match resolver, while
   role and attribution boundaries are reconstructed from Markdown.
+
+## Cursor IDE (`cursor-ide`)
+
+- **Format:** A shared VS Code-style global-state SQLite database
+  (`state.vscdb`), whose `cursorDiskKV` key-value table holds one JSON blob
+  per key: `composerData:<uuid>` is one chat session, and
+  `bubbleId:<composerId>:<bubbleUuid>` is one turn of that session. This is a
+  distinct product and store from Cursor Agent (the CLI, above): the GUI
+  writes no `agent-transcripts` files at all.
+- **Evidence:** `no-public-source`.
+- **Upstream:** Cursor's public GitHub organization and first-party docs were
+  searched 2026-08-25; no `cursorDiskKV`, `composerData`, or `bubbleId` schema
+  was found. This is consistent with two independent local-history tools
+  hitting the same wall (see agentsview issue #1515): a VS Code local-history
+  extension states it does not decode Cursor's DB-only chat blobs, and `ctx`
+  (`https://github.com/ctxrs/ctx`, checked at `8c6d670`) reads only
+  `agent-transcripts` and contains none of those three strings. Evidence here
+  is instead direct inspection of a live local `state.vscdb` (macOS, 86MB,
+  `PRAGMA quick_check` = `ok`): `composerData` documents observed at `_v: 16`
+  and bubble documents at `_v: 3`. `composerData.createdAt` and
+  `.lastUpdatedAt` are epoch milliseconds; bubble `.createdAt` is a separate
+  ISO-8601 string encoding. `composerData.fullConversationHeadersOnly` is the
+  session's turn order (`bubbleId` + `type`: `1` user, `2` assistant); the
+  sibling `conversationMap` field, structurally an alternative inline-message
+  store, was observed empty (`{}`) on every real conversation inspected,
+  including multi-hundred-KB ones, so it is not a usable source at this schema
+  version. An assistant bubble's tool call is inline on that bubble's
+  `toolFormerData` (name, `rawArgs`, `result`), unlike Claude's separate
+  call/result blocks. `workspaceIdentifier.uri.fsPath` and
+  `trackedGitRepos[].{repoPath,branches[].branchName}` give cwd and git
+  branch. The issue's reporter additionally documents that a Cursor version
+  update (3.16.29) has shrunk or wiped some users' `cursorDiskKV` rows, so the
+  parser tolerates a `fullConversationHeadersOnly` entry whose `bubbleId` row
+  is missing rather than failing the whole session.
+- **Usage and cost:** No per-message or per-session token, cache, reasoning,
+  credit, or monetary-cost fields were observed in `composerData` or bubble
+  documents. Agentsview emits no usage events for this agent; cost is
+  unpriced.
+- **Agentsview:** `internal/parser/cursor_ide.go` and
+  `internal/parser/cursor_ide_provider.go`, built on the shared
+  `multiSessionContainerSourceSet` framework (see Zed, below). Fingerprinting
+  never hashes the full database (86MB+ locally, 500MB+ reported in the wild):
+  a container-level fingerprint uses whole-file size, composite mtime, and a
+  SQLite transaction-state hash over just the database and WAL headers, so a
+  rewrite that leaves size and mtime unchanged still misses the skip cache; a
+  member-level fingerprint digests every parse input of that one composer (the
+  raw `composerData` document plus its bubble rows' keys and values), so an
+  equal-length bubble rewrite, a header reorder, or a rename that leaves
+  `lastUpdatedAt` untouched still reads as changed. A chat deleted inside
+  Cursor IDE is retired through stored-source-hint tombstones on `state.vscdb`
+  change events and through complete-container ownership reconciliation.
 
 ## Amp (`amp`)
 

@@ -1110,6 +1110,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newCortexProviderFactory(def)
 	case AgentCursor:
 		return newCursorProviderFactory(def)
+	case AgentCursorIDE:
+		return newCursorIDEProviderFactory(def)
 	case AgentChatGPT:
 		return newImportOnlyProviderFactory(def)
 	case AgentDeepSeekTUI:

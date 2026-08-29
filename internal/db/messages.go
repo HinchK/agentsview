@@ -369,6 +369,33 @@ func (db *DB) GetAllMessages(
 	return msgs, nil
 }
 
+// ListMessageSourceUUIDs returns the non-empty source_uuid values of a
+// session's messages, in ordinal order. The sync engine uses it to verify
+// that a truncated shared-container reparse still contains every archived
+// message before letting it replace the stored transcript.
+func (db *DB) ListMessageSourceUUIDs(
+	ctx context.Context, sessionID string,
+) ([]string, error) {
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT source_uuid
+		FROM messages
+		WHERE session_id = ? AND source_uuid != ''
+		ORDER BY ordinal ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying message source uuids: %w", err)
+	}
+	defer rows.Close()
+	var uuids []string
+	for rows.Next() {
+		var uuid string
+		if err := rows.Scan(&uuid); err != nil {
+			return nil, fmt.Errorf("scanning message source uuid: %w", err)
+		}
+		uuids = append(uuids, uuid)
+	}
+	return uuids, rows.Err()
+}
+
 func (db *DB) GetResumeModelCounts(
 	ctx context.Context, sessionID string,
 ) ([]ModelCount, error) {

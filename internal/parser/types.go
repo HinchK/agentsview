@@ -28,6 +28,7 @@ const (
 	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
+	AgentCursorIDE      AgentType = "cursor-ide"
 	AgentIflow          AgentType = "iflow"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
@@ -313,6 +314,28 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".cursor/projects"},
 		IDPrefix:    "cursor:",
 		FileBased:   true,
+	},
+	{
+		// Cursor IDE (the GUI editor) is a distinct product from Cursor Agent
+		// (the CLI, see AgentCursor above): it stores every chat session in
+		// one shared VS Code-style global-state SQLite database
+		// (state.vscdb), fanned out into one session per composer addressed
+		// by a "<db>#<composerID>" virtual path.
+		Type:        AgentCursorIDE,
+		DisplayName: "Cursor IDE",
+		EnvVar:      "CURSOR_IDE_DIR",
+		ConfigKey:   "cursor_ide_dirs",
+		DefaultDirs: cursorIDEDefaultDirs(),
+		IDPrefix:    "cursor-ide:",
+		FileBased:   true,
+		// state.vscdb is VS Code's shared global-state database: besides
+		// Cursor's own chat data, its ItemTable co-locates Cursor's live
+		// auth tokens (observed keys cursorAuth/accessToken and
+		// cursorAuth/refreshToken) plus whatever other installed extensions
+		// have stored there, and composerData blobs carry per-composer sync
+		// encryption keys. Remote sync stays disabled until there is an
+		// allowlisted export schema, matching Omnigent's chat.db precedent.
+		RemoteSyncExcluded: true,
 	},
 	{
 		Type:        AgentAmp,

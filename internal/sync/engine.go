@@ -2304,6 +2304,17 @@ func providerVirtualSourceContainerExists(path string) bool {
 	return container != path && parser.IsRegularFile(container)
 }
 
+// providerPersistentSharedContainerSource reports whether source addresses a
+// whole shared-database container whose archive rows are all virtual members:
+// Omnigent's chat.db or Cursor IDE's state.vscdb. Such containers have no
+// stored row under their own physical path, so skip-cache identity carries
+// the container hash and parser data version instead of a stored-row check,
+// and container parses are cached only after their member writes commit.
+func providerPersistentSharedContainerSource(source parser.SourceRef) bool {
+	return parser.IsOmnigentContainerSource(source) ||
+		parser.IsCursorIDEContainerSource(source)
+}
+
 func providerDeletedPhysicalSQLiteSource(
 	agent parser.AgentType, path string,
 ) bool {
@@ -11214,7 +11225,8 @@ func (e *Engine) processProviderFile(
 			omnigentContainerExists :=
 				parser.IsOmnigentContainerSource(source) &&
 					parser.IsRegularFile(providerDiscoveredPath(source))
-			traeContainerExists := file.Agent == parser.AgentTrae &&
+			sharedContainerExists := (file.Agent == parser.AgentTrae ||
+				file.Agent == parser.AgentCursorIDE) &&
 				parser.IsRegularFile(providerDiscoveredPath(source))
 			sourceFileMissing := false
 			if statPath := validatedProviderSourceStatPath(file.Path); statPath != "" {
@@ -11223,14 +11235,14 @@ func (e *Engine) processProviderFile(
 			}
 			if e.pathRewriter != nil ||
 				(providerVirtualSourceContainerExists(file.Path) ||
-					omnigentContainerExists || traeContainerExists ||
+					omnigentContainerExists || sharedContainerExists ||
 					sourceFileMissing) {
 				// The provider re-resolved this exact virtual member against a
 				// still-present shared container, or authoritatively parsed an
-				// empty Omnigent or Trae container, or the backing source itself
-				// is gone. Carry the stored ownership to the recoverable
-				// source-missing seam instead of treating absence as a parser
-				// exclusion.
+				// empty Omnigent, Trae, or Cursor IDE container, or the backing
+				// source itself is gone. Carry the stored ownership to the
+				// recoverable source-missing seam instead of treating absence
+				// as a parser exclusion.
 				missingMembers = owned
 			} else {
 				for _, member := range owned {
@@ -11279,6 +11291,7 @@ func (e *Engine) processProviderFile(
 	// so ownership reconciliation is needed only by real sync engines.
 	if (file.Agent == parser.AgentKiro ||
 		(file.Agent == parser.AgentOmnigent && outcome.ForceReplace) ||
+		(file.Agent == parser.AgentCursorIDE && outcome.ForceReplace) ||
 		(file.Agent == parser.AgentTrae && !e.forceParse)) &&
 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 {
 		missingMembers, err = e.providerSourceMissingSessionOwnershipsForCompleteResultWithPreserved(
@@ -11331,6 +11344,8 @@ func (e *Engine) processProviderFile(
 	filteredResults := e.dropUnchangedSharedSQLiteResults(
 		file, parsedResults, providerSemantics.UnchangedResults,
 	)
+	filteredResults, truncationVerifyFailed :=
+		e.dropShrinkingTruncatedCursorIDEResults(ctx, file, filteredResults)
 	res := processResult{
 		results:              filteredResults,
 		excludedSessionIDs:   excludedSessionIDs,
@@ -11339,7 +11354,7 @@ func (e *Engine) processProviderFile(
 		mtime:                fingerprint.MTimeNS,
 		cacheSkip:            cacheSkip,
 		cacheKey:             cacheKey,
-		noCacheSkip:          !cleanCache,
+		noCacheSkip:          !cleanCache || truncationVerifyFailed,
 		forceReplace:         outcome.ForceReplace || incForceReplace,
 		suppressPresenceSweep: outcome.SkipReason == parser.SkipUnsupportedSource ||
 			!outcome.ResultSetComplete,
@@ -11351,14 +11366,18 @@ func (e *Engine) processProviderFile(
 		sourceCwdStored:          cwdDecision.storedCwd,
 		sourceCwdStoredOK:        cwdDecision.storedOK,
 	}
-	if file.Agent == parser.AgentOmnigent && cacheSkip && cleanCache &&
+	if (file.Agent == parser.AgentOmnigent ||
+		file.Agent == parser.AgentCursorIDE) && cacheSkip && cleanCache &&
 		!e.forceParseRequested(file) &&
 		outcome.ResultSetComplete && len(outcome.SourceErrors) == 0 &&
 		fingerprint.Hash != "" {
-		// A whole-container omnigent parse may only be skip-cached after its
-		// member writes commit (cache-after-write); virtual member parses keep
-		// the immediate cache path.
-		res.cacheAfterWrite = parser.IsOmnigentContainerSource(source)
+		// A whole-container parse may only be skip-cached after its member
+		// writes commit (cache-after-write); virtual member parses keep the
+		// immediate cache path. A truncation-verification failure must not
+		// be promoted either: caching that pass as clean would freeze the
+		// refused result behind a cached skip instead of retrying it.
+		res.cacheAfterWrite = providerPersistentSharedContainerSource(source) &&
+			!truncationVerifyFailed
 	}
 	// Incremental-append providers (Claude and Codex) need the stored file
 	// identity so a later sync can detect an atomic file replacement
@@ -11456,6 +11475,91 @@ func (e *Engine) dropUnchangedSharedSQLiteResults(
 		// Unchanged: drop so the write batch neither rewrites nor recounts it.
 	}
 	return kept
+}
+
+// dropShrinkingTruncatedCursorIDEResults keeps a Cursor IDE composer whose
+// parse saw headers referencing missing bubble rows (a partial cursorDiskKV
+// wipe, flagged IsTruncated by the parser) from force-replacing an archived
+// session that has messages the truncated transcript no longer carries.
+// Every message's source_uuid is its bubble UUID, so the guard admits a
+// truncated result only when it still contains every archived bubble: a
+// message count alone would admit a wipe of an earlier bubble masked by
+// newly added turns. First-time discovery and a gapped conversation that
+// keeps growing still write, so a wiped database continues to surface its
+// remaining content. The emitted result still counts as present for
+// ownership reconciliation, so a preserved session stays active rather than
+// being marked source-missing.
+// The returned verifyFailed reports that an archive read failed during
+// verification: the caller must not skip-cache the pass as clean, so the
+// dropped result is re-attempted instead of frozen behind a cached skip.
+func (e *Engine) dropShrinkingTruncatedCursorIDEResults(
+	ctx context.Context,
+	file parser.DiscoveredFile,
+	results []parser.ParseResult,
+) (kept []parser.ParseResult, verifyFailed bool) {
+	if file.Agent != parser.AgentCursorIDE || len(results) == 0 ||
+		e.forceParseRequested(file) {
+		return results, false
+	}
+	type messageSourceUUIDReader interface {
+		ListMessageSourceUUIDs(context.Context, string) ([]string, error)
+	}
+	reader := messageSourceUUIDReader(e.db)
+	if e.archiveStore != nil {
+		// A rebuild writes into a fresh database while the original archive
+		// remains readable as archiveStore. Verifying against the empty
+		// rebuild target would admit every truncated transcript, and once
+		// written there the orphan copy would never rescue the fuller
+		// original. A refused write instead leaves the session out of the
+		// rebuild, and the orphan copy carries the archived full transcript
+		// across.
+		archived, ok := e.archiveStore.(messageSourceUUIDReader)
+		if !ok {
+			kept = results[:0]
+			for _, r := range results {
+				if r.Session.IsTruncated {
+					verifyFailed = true
+					continue
+				}
+				kept = append(kept, r)
+			}
+			return kept, verifyFailed
+		}
+		reader = archived
+	}
+	kept = results[:0]
+	for _, r := range results {
+		if !r.Session.IsTruncated {
+			kept = append(kept, r)
+			continue
+		}
+		id := applyIDPrefixToID(e.idPrefix, r.Session.ID)
+		archived, err := reader.ListMessageSourceUUIDs(ctx, id)
+		if err != nil {
+			// The archive cannot be verified; refusing the overwrite is the
+			// recoverable direction.
+			verifyFailed = true
+			continue
+		}
+		incoming := make(map[string]struct{}, len(r.Messages))
+		for _, msg := range r.Messages {
+			if msg.SourceUUID != "" {
+				incoming[msg.SourceUUID] = struct{}{}
+			}
+		}
+		containsArchive := true
+		for _, uuid := range archived {
+			if _, ok := incoming[uuid]; !ok {
+				containsArchive = false
+				break
+			}
+		}
+		if !containsArchive {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept, verifyFailed
 }
 
 func (e *Engine) providerSourceSessionIDsForForceReplace(
@@ -12552,10 +12656,10 @@ func providerProcessCacheKey(
 	key = providerProcessCacheKeyWithHash(
 		key, fingerprint, providerSemantics,
 	)
-	// A whole-container omnigent cache identity includes the parser data
-	// version: the container has no stored row of its own, so a restart must
-	// not accept an entry recorded by an older parser version.
-	if parser.IsOmnigentContainerSource(source) {
+	// A whole-container cache identity includes the parser data version: the
+	// container has no stored row of its own, so a restart must not accept
+	// an entry recorded by an older parser version.
+	if providerPersistentSharedContainerSource(source) {
 		separator := "?"
 		if strings.Contains(key, "?") {
 			separator = "&"
@@ -12639,11 +12743,12 @@ func (e *Engine) providerSkipCacheEntryFreshInDB(
 		!providerSemantics.FingerprintHashRequiredForFreshness {
 		return true, false
 	}
-	if parser.IsOmnigentContainerSource(source) {
-		// A whole-container omnigent source has only virtual member rows in
-		// the archive, so its entry is fresh without ever finding a row for
-		// the physical container path: the cache identity already carries the
-		// container hash and parser data version. This is distinct from
+	if providerPersistentSharedContainerSource(source) {
+		// A whole-container source (Omnigent chat.db, Cursor IDE state.vscdb)
+		// has only virtual member rows in the archive, so its entry is fresh
+		// without ever finding a row for the physical container path: the
+		// cache identity already carries the container hash and parser data
+		// version. This is distinct from
 		// ProviderSyncSemantics.SkipCacheFreshWithoutStoredRow below, which
 		// trusts an entry only while NO row exists yet and resumes stored-row
 		// hash validation once the provider persists one.
@@ -18529,6 +18634,14 @@ func (e *Engine) providerSessionSourceMtime(
 			return 0
 		}
 	}
+	if def.Type == parser.AgentCursorIDE && fingerprint.Hash != "" {
+		// SourceMtime is an equality-only change token (see the Codebuff
+		// branch): folding the member content digest in lets the watcher's
+		// polling fallback see an edit that leaves lastUpdatedAt untouched.
+		h := fnv.New64a()
+		_, _ = fmt.Fprintf(h, "%d|%s", fingerprint.MTimeNS, fingerprint.Hash)
+		return int64(h.Sum64())
+	}
 	return fingerprint.MTimeNS
 }
 
@@ -18546,6 +18659,13 @@ func providerSourceMtimeNeedsFingerprint(agent parser.AgentType) bool {
 	switch agent {
 	case parser.AgentPositAssistant, parser.AgentQoder:
 		// These providers store sidecars whose mtimes the plain path stat misses.
+		return true
+	case parser.AgentCursorIDE:
+		// A "state.vscdb#<composer>" virtual path cannot be stat'ed. The
+		// path-shape check already routes it through the member fingerprint
+		// because Windsurf's database shares the state.vscdb name; this
+		// entry makes cursor-ide's session-watcher token independent of
+		// that coincidence.
 		return true
 	default:
 		// RooCode is deliberately absent: its fingerprint content-hashes
