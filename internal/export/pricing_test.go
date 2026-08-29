@@ -82,6 +82,63 @@ func TestPricingResolverUsesHistoricalGenAIPricesBeforeFlatFallback(t *testing.T
 	assert.Equal(t, PricingRowSourceCustom, customLookup.Rates.Source)
 }
 
+func TestPricingResolverUsesHistoricalGenAIPricesForEffortTierSuffix(t *testing.T) {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	resolver := NewPricingResolver([]EffectivePricingRow{
+		{
+			ModelPattern: "gpt-5.6-luna",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("9"),
+				Source:       PricingRowSourceFetched,
+			},
+		},
+		{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: PricingRowSourceEmbedded,
+		},
+	})
+
+	pricedModel, lookup := resolver.ResolveAt(
+		"gpt-5-6-luna-high", "gpt-5-6-luna-high",
+		time.Date(2026, 7, 29, 23, 59, 59, 0, time.UTC),
+	)
+
+	require.True(t, lookup.OK)
+	assert.Equal(t, "gpt-5-6-luna-high", pricedModel)
+	assert.Equal(t, money.MustParseDollars("1"), lookup.Rates.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("6"), lookup.Rates.OutputPerMTok)
+}
+
+func TestPricingResolverUsesGenAIOnlyBaseForEffortTierSuffix(t *testing.T) {
+	genAI, err := pricingpkg.ParseGenAIPrices([]byte(`[
+		{
+			"id": "genai-only",
+			"name": "GenAI Only",
+			"api_pattern": "https://example.invalid",
+			"model_match": {"starts_with": "only-model"},
+			"models": [{
+				"id": "only-model",
+				"match": {"equals": "only-model"},
+				"prices": {"input_mtok": 2, "output_mtok": 8}
+			}]
+		}
+	]`))
+	require.NoError(t, err)
+	resolver := NewPricingResolver([]EffectivePricingRow{{
+		GenAI: genAI, GenAISource: PricingRowSourceEmbedded,
+	}})
+
+	pricedModel, lookup := resolver.ResolveAt(
+		"only-model-high", "only-model-high",
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+	)
+
+	assert.Equal(t, "only-model-high", pricedModel)
+	require.True(t, lookup.OK)
+	assert.Equal(t, money.MustParseDollars("2"), lookup.Rates.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("8"), lookup.Rates.OutputPerMTok)
+}
+
 func TestPricingResolverBuildBlockUsesRecordedLookup(t *testing.T) {
 	updatedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	resolver := NewPricingResolver([]EffectivePricingRow{{
