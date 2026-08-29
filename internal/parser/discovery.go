@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -89,6 +90,50 @@ type OpenCodeSource struct {
 	Root        string
 	SessionRoot string
 	DBPath      string
+	DBPaths     []string
+}
+
+func (f openCodeFormat) matchesDBName(name string) bool {
+	if name == f.dbName ||
+		runtime.GOOS == "windows" && strings.EqualFold(name, f.dbName) {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		name = strings.ToLower(name)
+	}
+	if f.agent != AgentOpenCode || !strings.HasPrefix(name, "opencode-") ||
+		!strings.HasSuffix(name, ".db") {
+		return false
+	}
+	channel := strings.TrimSuffix(strings.TrimPrefix(name, "opencode-"), ".db")
+	return channel != "" && strings.IndexFunc(channel, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) &&
+			r != '.' && r != '_' && r != '-'
+	}) == -1
+}
+
+func (f openCodeFormat) dbPaths(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var canonical string
+	var channels []string
+	for _, entry := range entries {
+		if entry.IsDir() || !f.matchesDBName(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if reconciliationScopeSamePath(entry.Name(), f.dbName) {
+			canonical = path
+		} else {
+			channels = append(channels, path)
+		}
+	}
+	if canonical != "" {
+		return append([]string{canonical}, channels...)
+	}
+	return channels
 }
 
 // openCodeFormat parameterizes the shared OpenCode storage format by
@@ -129,12 +174,18 @@ func resolveOpenCodeFormatSource(
 	}
 
 	sessionRoot := filepath.Join(root, "storage", f.sessionSubdir)
+	dbPaths := f.dbPaths(root)
+	dbPath := ""
+	if len(dbPaths) > 0 {
+		dbPath = dbPaths[0]
+	}
 	if info, err := os.Stat(sessionRoot); err == nil && info.IsDir() {
 		return OpenCodeSource{
 			Mode:        OpenCodeSourceStorage,
 			Root:        root,
 			SessionRoot: sessionRoot,
-			DBPath:      filepath.Join(root, f.dbName),
+			DBPath:      dbPath,
+			DBPaths:     dbPaths,
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		storageRoot := filepath.Join(root, "storage")
@@ -143,17 +194,18 @@ func resolveOpenCodeFormatSource(
 				Mode:        OpenCodeSourceStorage,
 				Root:        root,
 				SessionRoot: sessionRoot,
-				DBPath:      filepath.Join(root, f.dbName),
+				DBPath:      dbPath,
+				DBPaths:     dbPaths,
 			}
 		}
 	}
 
-	dbPath := filepath.Join(root, f.dbName)
-	if info, err := os.Stat(dbPath); err == nil && !info.IsDir() {
+	if dbPath != "" {
 		return OpenCodeSource{
-			Mode:   OpenCodeSourceSQLite,
-			Root:   root,
-			DBPath: dbPath,
+			Mode:    OpenCodeSourceSQLite,
+			Root:    root,
+			DBPath:  dbPath,
+			DBPaths: dbPaths,
 		}
 	}
 
@@ -227,13 +279,17 @@ func findOpenCodeFormatSourceFile(
 				}
 			}
 		}
-		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
+		for _, dbPath := range src.DBPaths {
+			if OpenCodeSQLiteSessionExists(dbPath, sessionID) {
+				return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+			}
 		}
 		return ""
 	case OpenCodeSourceSQLite:
-		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
+		for _, dbPath := range src.DBPaths {
+			if OpenCodeSQLiteSessionExists(dbPath, sessionID) {
+				return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+			}
 		}
 		return ""
 	default:
@@ -244,15 +300,15 @@ func findOpenCodeFormatSourceFile(
 func openCodeFormatStorageSessionIDs(
 	f openCodeFormat, root string,
 ) map[string]struct{} {
+	ids := make(map[string]struct{})
 	src := resolveOpenCodeFormatSource(f, root)
 	if src.Mode != OpenCodeSourceStorage {
-		return nil
+		return ids
 	}
 	entries, err := os.ReadDir(src.SessionRoot)
 	if err != nil {
-		return nil
+		return ids
 	}
-	ids := make(map[string]struct{})
 	for _, entry := range entries {
 		if !isDirOrSymlink(entry, src.SessionRoot) {
 			continue
@@ -287,8 +343,7 @@ func resolveOpenCodeFormatWatchRoots(
 	src := resolveOpenCodeFormatSource(f, root)
 	switch src.Mode {
 	case OpenCodeSourceStorage:
-		if info, err := os.Stat(src.DBPath); err == nil &&
-			!info.IsDir() {
+		if len(src.DBPaths) > 0 {
 			return []string{root}
 		}
 		return []string{filepath.Join(root, "storage")}
@@ -313,7 +368,9 @@ func parseOpenCodeFormatVirtualPath(
 	}
 	dbPath = sourcePath[:idx]
 	sessionID = sourcePath[idx+1:]
-	if filepath.Base(dbPath) != dbName {
+	name := filepath.Base(dbPath)
+	if name != dbName &&
+		(dbName != openCodeFmt.dbName || !openCodeFmt.matchesDBName(name)) {
 		return "", "", false
 	}
 	return dbPath, sessionID, true
@@ -342,6 +399,10 @@ func OpenCodeSQLiteVirtualPath(
 	dbPath, sessionID string,
 ) string {
 	return dbPath + "#" + sessionID
+}
+
+func ParseOpenCodeSQLiteVirtualPath(path string) (string, string, bool) {
+	return parseOpenCodeFormatVirtualPath(openCodeFmt.dbName, path)
 }
 
 func openCodeSessionProject(path string) string {

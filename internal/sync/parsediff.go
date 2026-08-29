@@ -434,6 +434,10 @@ var perSessionDBVirtualSourceBases = []string{
 }
 
 func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
+	if agent == parser.AgentOpenCode {
+		_, _, ok := parser.ParseOpenCodeSQLiteVirtualPath(path)
+		return ok
+	}
 	if _, _, ok := parser.ParseVirtualSourcePathForBase(
 		path, parser.WindsurfStateDBName,
 	); ok {
