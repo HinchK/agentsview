@@ -430,9 +430,10 @@ jobs:
 
       # internal/duckdb is excluded from -race (CGo-heavy, race-insensitive,
       # and 7+ minutes on its own); it is still covered without -race by the
-      # main test job's ./... run.
+      # main test job's ./... run. Limit package fan-out because the race
+      # detector makes highly parallel runs slow enough to exhaust deadlines.
       - name: Run Go tests (race detector)
-        run: go test -tags "fts5" -race $(go list ./... | grep -v '/internal/duckdb$') -count=1 -timeout=20m
+        run: go list ./... | grep -v '/internal/duckdb$' | xargs go test -p 4 -tags "fts5" -race -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
