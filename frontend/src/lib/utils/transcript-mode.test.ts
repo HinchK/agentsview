@@ -53,11 +53,15 @@ function toolMsg(
   });
 }
 
-function ordinalsOf(messages: Message[]) {
+function ordinalsOf(
+  messages: Message[],
+  keepAnswerBeforeTrailingTools = false,
+) {
   const items = buildDisplayItems(messages);
   return filterDisplayItemsByTranscriptMode(
     items,
     "focused",
+    { keepAnswerBeforeTrailingTools },
   ).flatMap((item) => item.ordinals);
 }
 
@@ -94,6 +98,29 @@ describe("filterDisplayItemsByTranscriptMode", () => {
         userMsg(3),
       ]),
     ).toEqual([0, 3]);
+  });
+
+  it("keeps an answer when the provider supports post-answer tool work", () => {
+    expect(
+      ordinalsOf(
+        [
+          userMsg(0),
+          assistantMsg(1, "answer"),
+          toolMsg(2),
+          userMsg(3),
+        ],
+        true,
+      ),
+    ).toEqual([0, 1, 3]);
+  });
+
+  it("still shows nothing when post-answer tool work produced no text", () => {
+    expect(
+      ordinalsOf(
+        [userMsg(0), toolMsg(1), userMsg(2)],
+        true,
+      ),
+    ).toEqual([0, 2]);
   });
 
   it("keeps the final non-tool assistant at session end", () => {

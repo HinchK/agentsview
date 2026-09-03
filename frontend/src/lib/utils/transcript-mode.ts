@@ -9,17 +9,20 @@ export function filterDisplayItemsByTranscriptMode(
   mode: "normal" | "focused",
   options?: {
     isMessageVisible?: (message: Message) => boolean;
+    keepAnswerBeforeTrailingTools?: boolean;
   },
 ): DisplayItem[] {
   if (mode === "normal") return items;
 
+  const keepAnswerBeforeTrailingTools =
+    options?.keepAnswerBeforeTrailingTools === true;
   const filtered: DisplayItem[] = [];
   let pendingAssistant: MessageItem | null = null;
   let toolAfterPendingAssistant = false;
 
   for (const item of items) {
     if (item.kind === "tool-group") {
-      if (pendingAssistant) {
+      if (pendingAssistant && !keepAnswerBeforeTrailingTools) {
         toolAfterPendingAssistant = true;
       }
       continue;
