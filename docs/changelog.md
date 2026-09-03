@@ -3,6 +3,18 @@ title: Changelog
 description: Release history for AgentsView
 ---
 
+## Unreleased
+
+**Improvements**
+
+- Shrink large archives by storing each **tool result** once instead of also
+  copying it into the call summary. Direct readers of
+  `tool_calls.result_content` now find that text in `tool_result_events`.
+  Existing archives resync on the next start, and a PostgreSQL mirror
+  re-pushes every session once.
+
+---
+
 ## 0.42.0
 
 <small>2026-09-01</small>

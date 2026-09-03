@@ -1923,6 +1923,9 @@ func attachToolCallsWithQuerier(
 	if err := attachToolResultEvents(ctx, q, msgs); err != nil {
 		return err
 	}
+	// A summary that only repeated its single event is not stored. Refill it
+	// here, once, so no consumer of a loaded message has to know that.
+	RestoreMessageResultContent(msgs)
 	return nil
 }
 
@@ -2486,22 +2489,55 @@ func (db *DB) SetToolCallSubagentSession(
 	return nil
 }
 
+// soleToolResultEventTx returns a one-element slice when the call
+// identified by (session, owning message ordinal, call index) has exactly
+// one stored result event, and nil for every other count, which never
+// dedups. The key is the same triple attachToolResultEvents and
+// ToolCallResultContentSQL use, so every site agrees on which event a
+// summary is compared against. MIN over the single row is its content.
+func soleToolResultEventTx(
+	tx *sql.Tx, sessionID string, messageOrdinal, callIndex int,
+) ([]ToolResultEvent, error) {
+	var count int
+	var content sql.NullString
+	if err := tx.QueryRow(
+		`SELECT COUNT(*), MIN(content) FROM tool_result_events
+		 WHERE session_id = ?
+		   AND tool_call_message_ordinal = ?
+		   AND call_index = ?`,
+		sessionID, messageOrdinal, callIndex,
+	).Scan(&count, &content); err != nil {
+		return nil, fmt.Errorf(
+			"counting tool result events for %s/%d/%d: %w",
+			sessionID, messageOrdinal, callIndex, err,
+		)
+	}
+	if count != 1 {
+		return nil, nil
+	}
+	return []ToolResultEvent{{Content: content.String}}, nil
+}
+
 func applyToolCallSubagentLinkTx(
 	tx *sql.Tx, sessionID string, link ToolCallSubagentLink,
 	blockedResultCategories map[string]bool,
 ) (bool, error) {
 	var toolName, category, currentSubagent, currentResultContent string
-	var currentResultContentLen int
+	var currentResultContentLen, messageOrdinal, callIndex int
 	if err := tx.QueryRow(
-		`SELECT tool_name, category, COALESCE(subagent_session_id, ''),
-		        COALESCE(result_content_length, 0),
-		        COALESCE(result_content, '')
-		 FROM tool_calls
-		 WHERE session_id = ? AND tool_use_id = ?`,
+		`SELECT tc.tool_name, tc.category,
+		        COALESCE(tc.subagent_session_id, ''),
+		        COALESCE(tc.result_content_length, 0),
+		        COALESCE(tc.result_content, ''),
+		        m.ordinal, COALESCE(tc.call_index, 0)
+		 FROM tool_calls tc
+		 JOIN messages m ON m.id = tc.message_id
+		 WHERE tc.session_id = ? AND tc.tool_use_id = ?`,
 		sessionID, link.ToolUseID,
 	).Scan(
 		&toolName, &category, &currentSubagent,
 		&currentResultContentLen, &currentResultContent,
+		&messageOrdinal, &callIndex,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -2529,11 +2565,25 @@ func applyToolCallSubagentLinkTx(
 		return err == nil, err
 	}
 	resultContent := link.ResultContent
+	resultContentLen := ResolveResultContentLength(
+		resultContent, link.ResultContentLen,
+	)
 	if blockedResultCategories[category] {
 		resultContent = ""
+	} else {
+		// A linked result carries no events of its own, but the call it
+		// targets may already have one stored. Re-storing a summary the
+		// event repeats would undo the dedup on every incremental pass.
+		sole, err := soleToolResultEventTx(
+			tx, sessionID, messageOrdinal, callIndex,
+		)
+		if err != nil {
+			return false, err
+		}
+		resultContent = DedupToolCallResultSummary(resultContent, sole)
 	}
 	if currentSubagent == storedSubagent &&
-		currentResultContentLen == link.ResultContentLen &&
+		currentResultContentLen == resultContentLen &&
 		currentResultContent == resultContent {
 		return false, nil
 	}
@@ -2542,7 +2592,7 @@ func applyToolCallSubagentLinkTx(
 		 SET subagent_session_id = ?, result_content_length = ?,
 		     result_content = ?
 		 WHERE session_id = ? AND tool_use_id = ?`,
-		nilIfEmpty(currentSubagent), link.ResultContentLen, resultContent,
+		nilIfEmpty(currentSubagent), resultContentLen, resultContent,
 		sessionID, link.ToolUseID,
 	)
 	return err == nil, err
@@ -2718,22 +2768,40 @@ func resolveToolCalls(
 	for i, m := range msgs {
 		for callIdx, tc := range m.ToolCalls {
 			calls = append(calls, ToolCall{
-				MessageID:           ids[i],
-				SessionID:           m.SessionID,
-				ToolName:            tc.ToolName,
-				Category:            tc.Category,
-				ToolUseID:           tc.ToolUseID,
-				InputJSON:           tc.InputJSON,
-				SkillName:           tc.SkillName,
-				ResultContentLength: tc.ResultContentLength,
-				ResultContent:       tc.ResultContent,
-				SubagentSessionID:   tc.SubagentSessionID,
-				FilePath:            tc.FilePath,
-				CallIndex:           callIdx,
+				MessageID: ids[i],
+				SessionID: m.SessionID,
+				ToolName:  tc.ToolName,
+				Category:  tc.Category,
+				ToolUseID: tc.ToolUseID,
+				InputJSON: tc.InputJSON,
+				SkillName: tc.SkillName,
+				ResultContentLength: ResolveResultContentLength(
+					tc.ResultContent, tc.ResultContentLength,
+				),
+				ResultContent: DedupToolCallResultSummary(
+					tc.ResultContent, tc.ResultEvents,
+				),
+				SubagentSessionID: tc.SubagentSessionID,
+				FilePath:          tc.FilePath,
+				CallIndex:         callIdx,
 			})
 		}
 	}
 	return calls
+}
+
+// ResolveResultContentLength returns the length to store for a tool-result
+// summary. Non-empty text is measured; a supplied length is kept only when
+// the text is empty, which is the withheld (blocked category) and deduped
+// (single event holds the text) cases where the length records how large
+// the summary was. The same rule applies to result events. It holds by
+// construction at every write path, so a caller can neither omit the length
+// nor store one that disagrees with the text.
+func ResolveResultContentLength(text string, supplied int) int {
+	if text != "" {
+		return len(text)
+	}
+	return supplied
 }
 
 type toolResultEventRow struct {
@@ -2749,9 +2817,9 @@ func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
 		for callIndex, tc := range m.ToolCalls {
 			for eventIndex, ev := range tc.ResultEvents {
 				ev.EventIndex = eventIndex
-				if ev.ContentLength == 0 {
-					ev.ContentLength = len(ev.Content)
-				}
+				ev.ContentLength = ResolveResultContentLength(
+					ev.Content, ev.ContentLength,
+				)
 				if ev.ToolUseID == "" {
 					ev.ToolUseID = tc.ToolUseID
 				}
