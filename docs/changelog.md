@@ -56,6 +56,11 @@ description: Release history for AgentsView
 
 **Bug fixes**
 
+- Teach `session search` `--exclude-session` (repeatable) so identifier hunts
+  can drop the live conversation before `--limit` fills with its own echoes.
+  `skills install --server` / `AGENTSVIEW_SKILLS_SERVER` bakes remote-daemon
+  flags into the finding-history examples so they no longer silently query
+  local SQLite; `--server ""` un-bakes it again. (#1511)
 - Keep archived sessions available after their original source files disappear.
 - Finish full reconciliation even when a source must be deferred, and show
   progress while a full resync completes its final archive work.

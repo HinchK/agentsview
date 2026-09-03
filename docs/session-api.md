@@ -584,6 +584,7 @@ with `--include-one-shot`, `--include-automated`, or `--include-children`.
 | `--include-children`  | `include_children`  | bool                                                                                                                                                                              |
 | `--include-automated` | `include_automated` | bool                                                                                                                                                                              |
 | `--include-one-shot`  | `include_one_shot`  | bool                                                                                                                                                                              |
+| `--exclude-session`   | `exclude_session`   | repeatable session ID to drop before `--limit`                                                                                                                                    |
 | `--limit`             | `limit`             | int; default 50, max 500                                                                                                                                                          |
 | `--cursor`            | `cursor`            | int — pagination cursor from a previous response                                                                                                                                  |
 
