@@ -12,8 +12,12 @@ import (
 )
 
 const (
-	defaultParseRetentionBytes       = int64(64 << 20)
-	defaultBulkParseRetentionBytes   = int64(128 << 20)
+	defaultParseRetentionBytes = int64(64 << 20)
+	// Keep all eight workers available for the roughly 6 MiB sources that
+	// exposed bulk-sync throttling under the four-times-source-size estimate.
+	// Together with the pending-result limit, the two explicit pipeline bounds
+	// total 768 MiB.
+	defaultBulkParseRetentionBytes   = int64(256 << 20)
 	defaultBulkPendingRetentionBytes = int64(512 << 20)
 	parseRetentionFixedBytes         = int64(64 << 10)
 	parseRetentionMultiplier         = int64(4)

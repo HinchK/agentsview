@@ -217,6 +217,19 @@ func TestBulkParseRetentionBudgetBoundsConcurrentSourceWeight(t *testing.T) {
 	assert.Equal(t, int64(2), budget.acquired.Load())
 }
 
+func TestBulkParseRetentionBudgetAdmitsWorkerPoolForMediumSources(t *testing.T) {
+	budget := newBulkParseRetentionBudget(defaultBulkParseRetentionBytes)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	for range maxWorkers {
+		lease, err := budget.acquire(ctx, 6<<20)
+		require.NoError(t, err,
+			"bulk admission must preserve the full worker pool for medium sources")
+		t.Cleanup(lease.Release)
+	}
+}
+
 func TestBulkParseRetentionBudgetScavengesOncePerParseBearingPass(t *testing.T) {
 	budget := newBulkParseRetentionBudget(defaultBulkParseRetentionBytes)
 	var scavenges int
