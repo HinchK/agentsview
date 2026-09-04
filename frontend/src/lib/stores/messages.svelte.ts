@@ -4,6 +4,7 @@ import { configureGeneratedClient, isAbortError, withAbort } from "../api/runtim
 import { clearContentCaches } from "../utils/content-parser.js";
 import { computeMainModel } from "../utils/model.js";
 import { buildReadProgressToken, readProgress } from "./read-progress.svelte.js";
+import { sessions } from "./sessions.svelte.js";
 
 const MESSAGE_PAGE_SIZE = 1000;
 const FULL_SESSION_MESSAGE_THRESHOLD = 3_000;
@@ -36,6 +37,10 @@ class MessagesStore {
   );
   private abortController: AbortController | null = null;
   private cancelledSessionId: string | null = null;
+  // The session id alone cannot tell a stale load's late 404 apart
+  // from the current load for the same session, so failures check
+  // this before reporting a missing session.
+  private loadGeneration: number = 0;
   private reloadPromise: Promise<void> | null = null;
   private reloadSessionId: string | null = null;
   private pendingReload: boolean = false;
@@ -75,6 +80,7 @@ class MessagesStore {
     this.cancelledSessionId = null;
     this.loading = true;
 
+    const generation = ++this.loadGeneration;
     const ac = new AbortController();
     this.abortController = ac;
 
@@ -91,6 +97,12 @@ class MessagesStore {
         pendingToken = buildReadProgressToken(sess);
       } catch (err) {
         if (isAbortError(err)) return;
+        // This probe is the only detail fetch a plain click on an
+        // already-hydrated sidebar row makes, so it is what detects
+        // a session deleted behind a cached row.
+        if (this.loadGeneration === generation) {
+          sessions.markActiveSessionMissing(id, err);
+        }
         console.warn("Failed to fetch session metadata:", err);
       }
 
@@ -109,6 +121,9 @@ class MessagesStore {
     } catch (err) {
       if (isAbortError(err)) return;
       if (this.sessionId === id) this.historyComplete = false;
+      if (this.loadGeneration === generation) {
+        sessions.markActiveSessionMissing(id, err);
+      }
       console.warn("Failed to load session messages:", err);
     } finally {
       if (this.sessionId === id) {
@@ -172,6 +187,9 @@ class MessagesStore {
   }
 
   cancelInFlight(): void {
+    // A request that rejected just before the abort is not an
+    // AbortError, so retire the load's generation as well.
+    this.loadGeneration++;
     const hasInFlightRead =
       this.loading ||
       this.loadingOlder ||

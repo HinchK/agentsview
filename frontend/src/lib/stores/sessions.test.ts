@@ -18,7 +18,7 @@ import { starred } from "./starred.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
 import type { Filters } from "./sessions.svelte.js";
 import type { Session } from "../api/types.js";
-import { callGenerated } from "../api/runtime.js";
+import { ApiError, callGenerated } from "../api/runtime.js";
 import { rollingRange } from "../utils/dates.js";
 
 const api = vi.hoisted(() => ({
@@ -61,7 +61,8 @@ vi.mock("../api/client.js", () => ({
   watchEvents: api.watchEvents,
 }));
 
-vi.mock("../api/runtime.js", () => ({
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
   configureGeneratedClient: vi.fn(),
   callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
   isAbortError: vi.fn(
@@ -2729,6 +2730,226 @@ describe("SessionsStore", () => {
 
       expect(sessions.activeSessionId).toBe("existing");
       expect(api.getSession).not.toHaveBeenCalled();
+    });
+
+    it("flags not-found when the metadata fetch 404s", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(404, "session not found"),
+      );
+
+      await sessions.navigateToSession("missing");
+
+      expect(sessions.activeSessionId).toBe("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+    });
+
+    it("does not flag not-found for non-404 failures", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(500, "boom"),
+      );
+
+      await sessions.navigateToSession("missing");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("clears the not-found flag when the selection changes", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(404, "session not found"),
+      );
+      await sessions.navigateToSession("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      sessions.sessions = [makeSession({ id: "other" })];
+      sessions.selectSession("other");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("retryActiveSession refetches and clears the flag on success", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValueOnce(
+        new ApiError(404, "session not found"),
+      );
+      await sessions.navigateToSession("late");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "late" }),
+      );
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionId).toBe("late");
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.sessions.some((s) => s.id === "late")).toBe(true);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+    });
+
+    it("retryActiveSession keeps the flag while the session is still missing", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(404, "session not found"),
+      );
+      await sessions.navigateToSession("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionId).toBe("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion);
+    });
+
+    it("retryActiveSession keeps the flag when the retry fails without a 404", async () => {
+      sessions.sessions = [makeSession({ id: "gone" })];
+      sessions.selectSession("gone");
+      sessions.activeSessionNotFound = true;
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(500, "boom"),
+      );
+
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(true);
+    });
+
+    it("retryActiveSession verifies a hydrated row and recovers", async () => {
+      sessions.sessions = [
+        makeSession({ id: "gone", first_message: "cached" }),
+      ];
+      sessions.selectSession("gone");
+      sessions.activeSessionNotFound = true;
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "gone", first_message: "restored" }),
+      );
+
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+      expect(sessions.sessions[0]!.first_message).toBe("restored");
+    });
+
+    it("retryActiveSession rehydrates an index-only row and recovers", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "late",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValueOnce(
+        new ApiError(404, "session not found"),
+      );
+      await sessions.navigateToSession("late");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "late", first_message: "synced" }),
+      );
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("does not bump the load version on a first successful load", async () => {
+      mockSidebarPage();
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "fresh" }),
+      );
+
+      await sessions.navigateToSession("fresh");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion);
+    });
+
+    it("ignores a stale hydration 404 after the sidebar index moved on", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      let rejectGet!: (err: unknown) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise((_resolve, reject) => {
+          rejectGet = reject;
+        }),
+      );
+
+      const promise = sessions.navigateToSession("stale");
+      sessions.sidebarIndexVersion += 1;
+      rejectGet(new ApiError(404, "session not found"));
+      await promise;
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("flags not-found when index-only hydration 404s", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(404, "session not found"),
+      );
+
+      await sessions.navigateToSession("stale");
+
+      expect(sessions.activeSessionId).toBe("stale");
+      expect(sessions.activeSessionNotFound).toBe(true);
+      expect(sessions.sessions[0]!.is_index_only).toBe(true);
+    });
+
+    it("does not flag not-found when index-only hydration fails without a 404", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(500, "boom"),
+      );
+
+      await sessions.navigateToSession("stale");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("does not flag not-found when hydration 404s for an inactive row", async () => {
+      sessions.sessions = [
+        makeSession({ id: "active" }),
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      sessions.selectSession("active");
+      vi.mocked(api.getSession).mockRejectedValue(
+        new ApiError(404, "session not found"),
+      );
+
+      await sessions.hydrateVisibleSessions(["stale"]);
+
+      expect(sessions.activeSessionNotFound).toBe(false);
     });
 
     it("hydrates an already-loaded index-only session", async () => {

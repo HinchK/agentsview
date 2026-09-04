@@ -35,6 +35,14 @@ vi.mock("../api/runtime.js", () => ({
   },
 }));
 
+const sessionsStore = vi.hoisted(() => ({
+  markActiveSessionMissing: vi.fn(),
+}));
+
+vi.mock("./sessions.svelte.js", () => ({
+  sessions: sessionsStore,
+}));
+
 vi.mock("../api/generated/index", () => ({
   SessionsService: {
     getApiV1SessionsId: vi.fn(({ id }) => api.getSession(id)),
@@ -130,6 +138,72 @@ describe("MessagesStore", () => {
     readProgress.reset();
     vi.clearAllMocks();
     runtimeMocks.signals.length = 0;
+  });
+
+  it("reports a failed metadata fetch to the sessions store", async () => {
+    const err = new Error("session not found");
+    vi.mocked(api.getSession).mockRejectedValue(err);
+    vi.mocked(api.getMessages).mockResolvedValue(makeMessagesResponse([]));
+
+    await messages.loadSession("s1");
+
+    expect(sessionsStore.markActiveSessionMissing).toHaveBeenCalledWith(
+      "s1",
+      err,
+    );
+  });
+
+  it("does not report aborted metadata fetches", async () => {
+    vi.mocked(api.getSession).mockRejectedValue(generatedCancelError());
+
+    await messages.loadSession("s1");
+
+    expect(sessionsStore.markActiveSessionMissing).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stale metadata 404 after a newer load for the same session", async () => {
+    const staleProbe = createDeferred<Session>();
+    vi.mocked(api.getSession).mockReturnValueOnce(staleProbe.promise);
+    const staleLoad = messages.loadSession("s1");
+    await Promise.resolve();
+    messages.cancelInFlight();
+
+    vi.mocked(api.getSession).mockResolvedValueOnce(makeSession("s1", 1));
+    vi.mocked(api.getMessages).mockResolvedValue(
+      makeMessagesResponse([makeMessage(0)]),
+    );
+    await messages.loadSession("s1");
+    expect(messages.messages).toHaveLength(1);
+
+    staleProbe.reject(new Error("session not found"));
+    await staleLoad;
+
+    expect(sessionsStore.markActiveSessionMissing).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stale message-load failure after a newer load for the same session", async () => {
+    vi.mocked(api.getSession).mockResolvedValueOnce(makeSession("s1", 1));
+    const stalePage = createDeferred<MessagesResponse>();
+    vi.mocked(api.getMessages).mockReturnValueOnce(
+      stalePage.promise as ReturnType<typeof api.getMessages>,
+    );
+    const staleLoad = messages.loadSession("s1");
+    await vi.waitFor(() => {
+      expect(vi.mocked(api.getMessages)).toHaveBeenCalledTimes(1);
+    });
+    messages.cancelInFlight();
+
+    vi.mocked(api.getSession).mockResolvedValueOnce(makeSession("s1", 1));
+    vi.mocked(api.getMessages).mockResolvedValue(
+      makeMessagesResponse([makeMessage(0)]),
+    );
+    await messages.loadSession("s1");
+    expect(messages.messages).toHaveLength(1);
+
+    stalePage.reject(new Error("session not found"));
+    await staleLoad;
+
+    expect(sessionsStore.markActiveSessionMissing).not.toHaveBeenCalled();
   });
 
   it('aborts in-flight reads without clearing cached messages', async () => {
