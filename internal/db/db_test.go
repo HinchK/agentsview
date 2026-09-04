@@ -1077,12 +1077,17 @@ func TestCurrentDataVersionPositAssistantProviderIdentity(t *testing.T) {
 
 func TestCurrentDataVersionAntigravityCLICwdAndWorktreeProject(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 96,
-		"Antigravity CLI cwd and worktree project recovery require a sequential backfill")
+		"version 96 is the data-version boundary for Antigravity CLI cwd and worktree project recovery")
 }
 
 func TestCurrentDataVersionToolResultSummaryDedup(t *testing.T) {
-	assert.Equal(t, 97, CurrentDataVersion(),
-		"dropping summaries a single result event repeats requires a re-parse")
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 97,
+		"version 97 is the data-version boundary for tool-result summary deduplication")
+}
+
+func TestCurrentDataVersionPiSkillAttribution(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 98,
+		"version 98 is the data-version boundary for Pi skill attribution")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
