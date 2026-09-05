@@ -1100,7 +1100,7 @@ agentsview export sessions --format ndjson --limit 100
 agentsview export sessions --all --format ndjson --project agentsview
 ```
 
-The JSON top level has `schema_version`, `database_id`, `cursor`, `pricing`,
+The JSON top level has `schema_version`, `archive_id`, `database_id`, `cursor`, `pricing`,
 `projects`, and `sessions`. NDJSON writes the same metadata as the first line,
 then one session row per following line. Current builds emit
 `schema_version: 6`; see [Session Export](/docs/session-export/#versioning) for
