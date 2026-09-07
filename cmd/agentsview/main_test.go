@@ -3594,3 +3594,26 @@ func TestOpenCodeAbsentRootPollsTheConfiguredDir(t *testing.T) {
 	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
 		"the dir must become pollable as soon as it appears")
 }
+
+func TestCollectWatchRootsWatchesAliasHomeIndexes(t *testing.T) {
+	base := t.TempDir()
+	primary := filepath.Join(base, "codex")
+	alias := filepath.Join(base, "codex-alt")
+	sessionsDir := filepath.Join(primary, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	require.NoError(t, os.MkdirAll(alias, 0o755))
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {sessionsDir},
+		},
+		ProviderMetadata: map[parser.AgentType]map[string][]string{
+			parser.AgentCodex: {sessionsDir: {primary, alias}},
+		},
+	}
+
+	roots, _, _, _ := collectWatchRoots(cfg)
+
+	aliasRoot, ok := findCollectedWatchRoot(roots, alias)
+	require.True(t, ok, "the alias home must be watched for session_index.jsonl")
+	assert.False(t, aliasRoot.recursive)
+}

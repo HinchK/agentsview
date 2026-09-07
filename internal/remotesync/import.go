@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -83,8 +84,9 @@ func requireCompleteProcessing(stats syncpkg.SyncStats) error {
 // this mapping independent from Importer lets prepared HTTP imports and future
 // rebuild contributors share the exact engine inputs and cache translation.
 type importLayout struct {
-	engineDirs map[parser.AgentType][]string
-	paths      remotePathMap
+	engineDirs   map[parser.AgentType][]string
+	metadataDirs map[parser.AgentType]map[string][]string
+	paths        remotePathMap
 }
 
 type remotePathMap struct {
@@ -126,6 +128,24 @@ func newImportLayout(targets TargetSet, root string) (importLayout, error) {
 		}
 		layout.paths.remoteDirs = append(layout.paths.remoteDirs, remoteFile)
 		layout.paths.localDirs = append(layout.paths.localDirs, local)
+	}
+	codexMetadata := make(map[string][]string)
+	for remoteRoot, indexes := range selectedCodexIndexFiles(targets, targets.CodexIndexFiles) {
+		localRoot, err := safeRemappedRemotePath(root, remoteRoot)
+		if err != nil {
+			return importLayout{}, err
+		}
+		codexMetadata[localRoot] = nil
+		for _, index := range indexes {
+			localIndex, err := safeRemappedRemotePath(root, index)
+			if err != nil {
+				return importLayout{}, err
+			}
+			codexMetadata[localRoot] = append(codexMetadata[localRoot], filepath.Dir(localIndex))
+		}
+	}
+	if len(codexMetadata) > 0 {
+		layout.metadataDirs = map[parser.AgentType]map[string][]string{parser.AgentCodex: codexMetadata}
 	}
 	return layout, nil
 }
@@ -187,6 +207,7 @@ func importEngineConfig(
 ) syncpkg.EngineConfig {
 	return syncpkg.EngineConfig{
 		AgentDirs:               layout.engineDirs,
+		ProviderMetadata:        layout.metadataDirs,
 		Machine:                 host,
 		IDPrefix:                rebuildIDPrefix(host),
 		PathRewriter:            layout.paths.pathRewriter(),

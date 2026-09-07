@@ -431,6 +431,9 @@ type Emitter interface {
 type EngineConfig struct {
 	AgentDirs      map[parser.AgentType][]string
 	SourceMachines map[parser.AgentType]map[string]string
+	// ProviderMetadata carries the resolved metadata directories used to
+	// configure provider instances, including temporary remote imports.
+	ProviderMetadata map[parser.AgentType]map[string][]string
 	// DisabledAgents identifies providers omitted from this local filesystem
 	// engine. Remote import engines leave it empty and import every transferred
 	// provider.
@@ -867,7 +870,10 @@ func NewEngine(
 	}
 	providerFactories := parser.ProviderFactories()
 	if cfg.ProviderFactories != nil {
-		providerFactories = cfg.ProviderFactories
+		providerFactories = append([]parser.ProviderFactory(nil), cfg.ProviderFactories...)
+	}
+	for i, factory := range providerFactories {
+		providerFactories[i] = parser.ConfigureProviderFactory(factory, cfg.ProviderMetadata[factory.Definition().Type])
 	}
 	disabledAgents := append([]parser.AgentType(nil), cfg.DisabledAgents...)
 	providerFactories = slices.DeleteFunc(
@@ -1090,6 +1096,7 @@ func pathWithinRoot(path, root string) bool {
 // the scheduler. Call once when the engine's owner shuts down;
 // safe to call repeatedly.
 func (e *Engine) Close() {
+
 	e.signalSched.stop()
 }
 
@@ -1126,13 +1133,8 @@ func providerFactoryMap(
 // short-circuit its parse on a 0==0 digest match between
 // ComputeMultiFileStatHash(path) and the previously-stored 0. The
 // probe construction must be side-effect-free: a fresh provider is
-// allocated per agent with an empty ProviderConfig (no roots, no
-// machine), and a probe that passes both gates is retained for the
-// engine's lifetime as the cached hasher. Retaining a config-less
-// instance is safe only because ComputeMultiFileStatHash is stateless
-// — a pure function of its chatPath argument and the filesystem — so
-// implementations must not depend on provider construction state such
-// as Roots or Machine.
+// allocated from the engine's configured factory and retained for the engine's
+// lifetime. Metadata directories are immutable and belong to that factory.
 //
 // Freebuff sessions intentionally route through this single
 // AgentCodebuff entry: AgentFreebuff is a recognized AgentType string
@@ -1218,7 +1220,7 @@ func (e *Engine) recordProviderStatHash(
 	if _, ok := e.providerStatHashers[hash.agent]; !ok {
 		return
 	}
-	if !providerStatHashMetadataVerified(hash) {
+	if !e.providerStatHashMetadataVerified(hash) {
 		return
 	}
 	if err := e.db.UpsertProviderStatHash(
@@ -1235,11 +1237,11 @@ func (e *Engine) recordProviderStatHash(
 // its title sidecar. A missing session_index.jsonl is normal and verified;
 // read and scan failures are transient and must leave the previous digest in
 // place so a later pass retries the title check.
-func providerStatHashMetadataVerified(hash pendingProviderStatHash) bool {
+func (e *Engine) providerStatHashMetadataVerified(hash pendingProviderStatHash) bool {
 	if hash.agent != parser.AgentCodex {
 		return true
 	}
-	if err := parser.VerifyCodexSessionIndex(hash.physicalPath); err != nil {
+	if err := e.codexMetadata().Verify(hash.physicalPath); err != nil {
 		log.Printf(
 			"verify Codex title index before freshness write for %s: %v",
 			hash.physicalPath, err,
@@ -13622,7 +13624,7 @@ func (e *Engine) stampProviderStatHashForConfirmedSource(
 	if statHash == nil || statHash.digest == 0 {
 		return
 	}
-	if !providerStatHashMetadataVerified(*statHash) {
+	if !e.providerStatHashMetadataVerified(*statHash) {
 		return
 	}
 	if err := e.db.UpsertProviderStatHash(
@@ -13912,7 +13914,7 @@ func (e *Engine) providerIncrementalContentChanged(
 // file_mtime (parser.CodexEffectiveMtime), so a cold→warm cycle does
 // not drift; other MultiFileStatHasher agents fall through to
 // chat-only since they have no sibling companions to fold in.
-func providerStatFreshnessMtime(
+func (e *Engine) providerStatFreshnessMtime(
 	agent parser.AgentType,
 	lookupPath string,
 	chatInfo os.FileInfo,
@@ -13921,7 +13923,7 @@ func providerStatFreshnessMtime(
 	case parser.AgentCodebuff, parser.AgentFreebuff:
 		return parser.CodebuffCompanionMtime(lookupPath, chatInfo)
 	case parser.AgentCodex:
-		return parser.CodexEffectiveMtime(
+		return e.codexMetadata().EffectiveMtime(
 			lookupPath, chatInfo.ModTime().UnixNano(),
 		)
 	default:
@@ -14127,7 +14129,7 @@ func (e *Engine) providerSourceFreshBeforeFingerprint(
 			) {
 				return 0, false
 			}
-			return providerStatFreshnessMtime(file.Agent, lookupPath, info), true
+			return e.providerStatFreshnessMtime(file.Agent, lookupPath, info), true
 		default:
 			// Stored digest disagrees with current component stats.
 			// Forcing provider.Fingerprint instead of falling through
@@ -14558,7 +14560,7 @@ func (e *Engine) tryIncrementalJSONL(
 	// accurate. Other JSONL agents, including TraeX, keep the raw stat.
 	incMtime := info.ModTime().UnixNano()
 	if agent == parser.AgentCodex {
-		incMtime = parser.CodexEffectiveMtime(file.Path, incMtime)
+		incMtime = e.codexMetadata().EffectiveMtime(file.Path, incMtime)
 	}
 
 	// Incremental parse seam: every gate above returns a lease-free decline.
@@ -14867,11 +14869,18 @@ func (e *Engine) codexFingerprintFreshness(
 	}
 	statFresh := storedMtime == effectiveMtime
 	if effectiveMtime < storedMtime {
-		indexPath := parser.CodexSessionIndexPath(path)
-		if indexPath != "" {
-			if _, err := os.Stat(indexPath); errors.Is(err, os.ErrNotExist) {
-				statFresh = true
+		// Only an index that is absent from every home means the stored
+		// mtime came from a since-removed sidecar.
+		indexPaths := e.codexMetadata().IndexPaths(path)
+		allAbsent := len(indexPaths) > 0
+		for _, indexPath := range indexPaths {
+			if _, err := os.Stat(indexPath); !errors.Is(err, os.ErrNotExist) {
+				allAbsent = false
+				break
 			}
+		}
+		if allAbsent {
+			statFresh = true
 		}
 	}
 	if effectiveMtime > storedMtime {
@@ -14901,7 +14910,7 @@ func (e *Engine) codexFingerprintFreshness(
 func (e *Engine) codexIndexNeedsRefreshSince(
 	path string, cutoffNs int64,
 ) bool {
-	indexMtime := parser.CodexEffectiveMtime(path, 0)
+	indexMtime := e.codexMetadata().EffectiveMtime(path, 0)
 	if indexMtime == 0 || indexMtime < cutoffNs {
 		return false
 	}
@@ -14927,7 +14936,7 @@ func (e *Engine) codexIndexSessionNameState(
 	if uuid == "" {
 		return false, false
 	}
-	currentName, ok, err := parser.ReadCodexThreadNameEntry(path, uuid)
+	currentName, ok, err := e.codexMetadata().ReadThreadName(path, uuid)
 	if err != nil {
 		return false, false
 	}
@@ -14977,10 +14986,12 @@ func (e *Engine) classifyCodexIndexPath(
 	if filepath.Base(path) != parser.CodexSessionIndexFilename {
 		return nil
 	}
-	indexDir := filepath.Dir(path)
 	var sessionRoots []string
 	for _, agDir := range e.agentDirs[parser.AgentCodex] {
-		if agDir != "" && filepath.Dir(agDir) == indexDir {
+		if agDir == "" {
+			continue
+		}
+		if slices.Contains(e.codexMetadata().IndexFiles(agDir), path) {
 			sessionRoots = append(sessionRoots, agDir)
 		}
 	}
@@ -20384,4 +20395,11 @@ func (e *Engine) scanOneSession(
 
 func scanShouldReport(i, total int) bool {
 	return (i+1)%scanProgressInterval == 0 || i+1 == total
+}
+
+func (e *Engine) codexMetadata() parser.CodexMetadata {
+	if provider, ok := e.providerStatHashers[parser.AgentCodex].(parser.CodexMetadataProvider); ok {
+		return provider.Metadata()
+	}
+	return parser.CodexMetadata{}
 }

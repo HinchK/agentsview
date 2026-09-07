@@ -25,8 +25,10 @@ func ResolveTargets(cfg config.Config) (TargetSet, error) {
 	dirs := make(map[parser.AgentType][]string)
 	files := make(map[parser.AgentType][]string)
 	providerExtraFiles := make(map[parser.AgentType][]string)
+	codexIndexFiles := make(map[string][]string)
 	var forbiddenRoots []string
-	for _, def := range parser.Registry {
+	for _, factory := range parser.ProviderFactories() {
+		def := factory.Definition()
 		resolvedDirs := cfg.ResolveDirs(def.Type)
 		if def.RemoteSyncExcluded {
 			for _, dir := range resolvedDirs {
@@ -36,6 +38,11 @@ func ResolveTargets(cfg config.Config) (TargetSet, error) {
 		}
 		if !resolveAgentHasOnDiskSource(def) {
 			continue
+		}
+		var metadata parser.CodexMetadata
+		if def.Type == parser.AgentCodex {
+			provider := factory.NewProvider(parser.ProviderConfig{Roots: resolvedDirs, MetadataDirs: cfg.ProviderMetadata[def.Type]})
+			metadata = provider.(parser.CodexMetadataProvider).Metadata()
 		}
 		for _, dir := range resolvedDirs {
 			// Remote imports assign the serving host to every transported root.
@@ -135,8 +142,15 @@ func ResolveTargets(cfg config.Config) (TargetSet, error) {
 			}
 			dirs[def.Type] = append(dirs[def.Type], dir)
 			if def.Type == parser.AgentCodex {
-				index := filepath.Join(filepath.Dir(dir), parser.CodexSessionIndexFilename)
-				if info, err := os.Stat(index); err == nil && !info.IsDir() {
+				// An empty association must not become inferred parent metadata on import.
+				codexIndexFiles[dir] = nil
+				for _, index := range metadata.IndexFiles(dir) {
+					if info, err := os.Stat(index); err != nil || info.IsDir() {
+						continue
+					}
+					if !slices.Contains(codexIndexFiles[dir], index) {
+						codexIndexFiles[dir] = append(codexIndexFiles[dir], index)
+					}
 					if !slices.Contains(providerExtraFiles[def.Type], index) {
 						providerExtraFiles[def.Type] = append(
 							providerExtraFiles[def.Type], index,
@@ -148,7 +162,8 @@ func ResolveTargets(cfg config.Config) (TargetSet, error) {
 	}
 	return filterForbiddenTargets(TargetSet{
 		Dirs: dirs, Files: files, ProviderExtraFiles: providerExtraFiles,
-		ForbiddenRoots: forbiddenRoots,
+		CodexIndexFiles: codexIndexFiles,
+		ForbiddenRoots:  forbiddenRoots,
 	}), nil
 }
 
@@ -306,7 +321,29 @@ func filterForbiddenTargets(t TargetSet) TargetSet {
 		}
 		t.ProviderExtraFiles[agent] = kept
 	}
+	t.CodexIndexFiles = selectedCodexIndexFiles(t, t.CodexIndexFiles)
 	return t
+}
+
+// Keep associations only for roots and files retained in this target set.
+func selectedCodexIndexFiles(targets TargetSet, indexes map[string][]string) map[string][]string {
+	var selected map[string][]string
+	for _, root := range targets.Dirs[parser.AgentCodex] {
+		if _, ok := indexes[root]; !ok {
+			continue
+		}
+		if selected == nil {
+			selected = make(map[string][]string)
+		}
+		selected[root] = nil
+		for _, index := range indexes[root] {
+			if !slices.Contains(targets.ProviderExtraFiles[parser.AgentCodex], index) {
+				continue
+			}
+			selected[root] = append(selected[root], index)
+		}
+	}
+	return selected
 }
 
 func withoutForbidden(paths []string, forbidden forbiddenRootMatcher) []string {
@@ -851,6 +888,7 @@ func SelectAllowedTargets(allowed TargetSet, requested TargetSet) (TargetSet, bo
 			)
 		}
 	}
+	selected.CodexIndexFiles = selectedCodexIndexFiles(selected, allowed.CodexIndexFiles)
 	return selected, true
 }
 

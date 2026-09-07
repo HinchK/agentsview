@@ -838,3 +838,21 @@ func TestNewPushProgressStreamSenderThrottles(t *testing.T) {
 	send(3)
 	assert.Equal(t, []int{1, 3}, got)
 }
+
+func TestValidatePushWatchScopeAcceptsAliasIndexWithoutEngine(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "primary", "sessions")
+	alias := filepath.Join(base, "profile", "sessions")
+	cfg := config.Config{
+		NoSync:    true,
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {root}},
+		ProviderMetadata: map[parser.AgentType]map[string][]string{
+			parser.AgentCodex: {root: {filepath.Dir(root), filepath.Dir(alias)}},
+		},
+	}
+	require.NoError(t, validatePushWatchScope(t.Context(), daemonPushRequest{
+		WatchBatch: &syncpkg.WatchBatch{Paths: []string{
+			filepath.Join(base, "profile", parser.CodexSessionIndexFilename),
+		}},
+	}, cfg))
+}
