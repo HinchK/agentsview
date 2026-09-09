@@ -1087,7 +1087,13 @@ preservation of archived messages for OpenCode, Kilo, MiMoCode, and Icodemate.
 ## Cursor (`cursor`)
 
 - **Format:** Legacy text and newer JSONL transcripts under per-project
-  `agent-transcripts` directories.
+  `agent-transcripts` directories. Cursor CLI also writes a per-session SQLite
+  store at `~/.cursor/chats/<workspace-hash>/<agent-id>/store.db`, with
+  `blobs` and `meta` tables. Metadata key `0` is hex-encoded UTF-8 JSON
+  carrying `agentId` and `latestRootBlobId`. The selected root's protobuf
+  field-8 turn index supplies assistant reasoning and producer
+  epoch-millisecond timestamps; field-1 system/context blobs are not
+  transcript messages.
 - **Turn timestamps:** Cursor user messages can carry a leading metadata tag in
   the form
   `<timestamp>Weekday, Mon D, YYYY, H:MM AM|PM (UTC±H[:MM])</timestamp>`
@@ -1108,7 +1114,15 @@ preservation of archived messages for OpenCode, Kilo, MiMoCode, and Icodemate.
   characterization does not extend to Cursor IDE (the GUI editor, see below):
   for the GUI, `state.vscdb` is the only transcript store, not metadata beside
   one. Cursor's public GitHub organization was also searched 2026-07-19; no
-  transcript schema or producer source was found.
+  transcript schema or producer source was found. CLI store evidence comes
+  from a structural capture of one Windows install on 2026-09-07, which
+  recorded the store shape without private prompts, paths, IDs, or
+  encryption-key values. A directory measure found one store among 18
+  transcript IDs, one overlapping ID, and no store-only sessions. No published
+  `.proto` or store schema was found; field numbers remain provisional for
+  that captured producer version. Its main database was a 4096-byte header
+  while schema and rows lived in `store.db-wal`, so the reader must keep the
+  WAL attached.
 - **Legacy result evidence (rechecked 2026-09-09):**
   [Issue #1627](https://github.com/kenn-io/agentsview/issues/1627), based on
   read-only inspection of live transcripts on 2026-09-04, reports discarded
@@ -1128,11 +1142,38 @@ preservation of archived messages for OpenCode, Kilo, MiMoCode, and Icodemate.
   unchanged object, verifying recovered output and a skipped fetch on the next
   pass. This uses synthetic input, not additional format evidence.
 - **Usage and cost:** The consumed text/JSONL transcripts have no reliable
-  per-message token, cache, reasoning, credit, or monetary-cost fields.
+  per-message token, cache, reasoning, credit, or monetary-cost fields. The
+  captured store adds no priced usage fields consumed by agentsview.
 - **Agentsview:** `internal/parser/cursor.go`,
   `internal/parser/cursor_paths.go`, and `internal/parser/cursor_provider.go`;
   workspace identity uses a filesystem-backed unique-match resolver, while
   role and attribution boundaries are reconstructed from Markdown.
+  `internal/parser/cursor_store.go` enriches the matching transcript UUID by
+  following only the selected root's turn tree in one deferred read-only
+  transaction (`mode=ro`), without mutating SQL. Discovery and archive
+  identity remain the transcript source (`cursor:<agentId>`). The chats
+  directory is local provider metadata, automatically associated only with a
+  resolved `.cursor/projects` root, with case-insensitive matching on Windows.
+  Custom roots such as `.cursor/archive` remain transcript-only. The chats
+  directory stays outside remote, SSH, and S3 transfer targets. Store-only
+  discovery, native tool-call/result joining, encrypted blob payloads, and
+  cross-version field-number stability remain unsupported; the capture
+  contained no tool result and the reader ignores `blobEncryptionKey`. Unknown
+  reachable blobs do not discard decoded siblings. Missing required tables or
+  columns, unsupported metadata, missing roots or turn indexes, and stores
+  with no decodable turns leave the transcript usable, with a warning. Store
+  open/read errors remain retryable source errors without replacing archived
+  content. Store fingerprint failures prevent freshness skips, and temporary
+  path-access failures retain cached stores and newly observed store
+  candidates for retry. A failed chats scan warns and preserves cached store
+  locations; otherwise sync uses transcripts alone. The next discovery pass
+  retries the scan, and store changes invalidate the composite fingerprint.
+  Reverified 2026-09-09 with synthetic parser and SQLite archive fixtures
+  covering initial import and subsequent transcript updates when store
+  enrichment is unavailable, missing store tables or columns, and recovery
+  after access failures for cached or newly observed stores. A custom root
+  fixture keeps reasoning from sibling live stores out of archived
+  transcripts.
 
 ## Cursor IDE (`cursor-ide`)
 
