@@ -293,6 +293,7 @@ keeps its default directories.
 | OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                    | Per-conversation `base_state.json` + `events/*.json`                                                                                                          |
 | Omnigent              | `~/.omnigent/`                                                                                                                                                   | SQLite `chat.db`, one session per conversation                                                                                                                |
 | Pi                    | `~/.pi/agent/sessions/`                                                                                                                                          | JSONL per session                                                                                                                                             |
+| Tau                   | `~/.tau/sessions/`                                                                                                                                               | JSONL transcripts under `<project>/`, with metadata `index.jsonl` excluded                                                                                   |
 | Prime Agent           | `~/.prime/agent/sessions/`                                                                                                                                       | Flat Pi-family JSONL sessions                                                                                                                                 |
 | Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows) | NDJSON trajectory files                                                                                                                                       |
 | Piebald               | `~/.local/share/piebald/`                                                                                                                                        | SQLite database (`app.db`)                                                                                                                                    |
@@ -327,6 +328,16 @@ Prime Agent support targets the current flat session layout in v0.7.0. That
 release migrates the older per-project layout when Prime Agent opens its session
 store, so open the current Prime Agent once before syncing a legacy archive with
 AgentsView.
+
+Tau stores multiple session transcripts in each project directory under
+`~/.tau/sessions/`. AgentsView reads `.jsonl` files directly below those project
+directories, excludes the exact `index.jsonl` metadata file, and follows the
+latest `leaf` entry when selecting the active history. Set `TAU_SESSIONS_DIR` or
+`tau_dirs` to use another sessions root.
+
+User-run shell commands (`bashExecution`) and messages with the `custom`,
+`branchSummary`, or `compactionSummary` role are not shown. Separate
+`branch_summary` and `compaction` entries are shown.
 
 **Qoder default directories** include the legacy `~/.qoder/projects/` and
 `~/.qoderwork/projects/` export roots, the Qoder CLI CN store, and the current
@@ -718,6 +729,7 @@ export OPENCLAW_DIR=~/custom/openclaw
 export OPENCODE_DIR=~/custom/opencode
 export OPENHANDS_CONVERSATIONS_DIR=~/custom/openhands
 export PI_DIR=~/custom/pi
+export TAU_SESSIONS_DIR=~/custom/tau/sessions
 export PIEBALD_DIR=~/custom/piebald
 export POOLSIDE_DIR=~/custom/poolside/trajectories
 export POSIT_ASSISTANT_DIR=~/custom/posit-assistant/workspaces
@@ -825,7 +837,7 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `opencode_dirs`, `openhands_dirs`, `pi_dirs`, `prime_agent_dirs`,
 `piebald_dirs`, `posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`,
 `qoder_project_dirs`, `qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`,
-`roocode_dirs`, `shelley_dirs`, `traex_sessions_dirs`,
+`roocode_dirs`, `shelley_dirs`, `tau_dirs`, `traex_sessions_dirs`,
 `visualstudio_copilot_dirs`, `vscode_copilot_dirs`, `windsurf_dirs`,
 `warp_dirs`, `workbuddy_project_dirs`, `zcode_dirs`, `zed_dirs`, and
 `zencoder_dirs`. Each accepts an array of paths. Environment variables take
