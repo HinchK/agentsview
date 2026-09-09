@@ -472,7 +472,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // bodies as result events. Existing Cursor rows need re-parsing to recover
 // output from unchanged source files.)
 // (103: Copilot assistant output is reported without a shutdown summary.)
-const dataVersion = 103
+// (104: OpenCode v2 projections, mixed CLI/API history, attachments, and
+// compaction boundaries. Re-parse existing sessions and reconsider skipped
+// sources even when the producer database has not changed.)
+const dataVersion = 104
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
