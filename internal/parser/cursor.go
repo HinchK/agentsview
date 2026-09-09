@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/tidwall/gjson"
 )
@@ -154,13 +155,13 @@ func parseCursorMessages(lines []string) []ParsedMessage {
 }
 
 // splitCursorBlocks splits lines into blocks delimited by
-// "user:" or "assistant:" on a line by itself.
+// "user:" or "assistant:" at the left margin, with optional trailing whitespace.
 func splitCursorBlocks(lines []string) []cursorBlock {
 	var blocks []cursorBlock
 	var current *cursorBlock
 
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+		trimmed := strings.TrimRightFunc(line, unicode.IsSpace)
 		if trimmed == "user:" || trimmed == "assistant:" {
 			if current != nil {
 				blocks = append(blocks, *current)
@@ -368,14 +369,27 @@ func extractAssistantContent(
 			continue
 		}
 
-		// Tool result — skip the header and body
+		// Tool result — attach the body to the preceding call
 		if strings.HasPrefix(trimmed, "[Tool result]") {
 			i++
+			bodyStart := i
 			for i < len(lines) {
 				if isBlockBodyEnd(lines[i]) {
 					break
 				}
 				i++
+			}
+			if len(toolCalls) > 0 {
+				content := strings.TrimSpace(strings.Join(
+					dedentCursorBlock(lines[bodyStart:i]), "\n",
+				))
+				if content == "" {
+					continue
+				}
+				toolCalls[len(toolCalls)-1].ResultEvents = append(
+					toolCalls[len(toolCalls)-1].ResultEvents,
+					ParsedToolResultEvent{Content: content},
+				)
 			}
 			continue
 		}
