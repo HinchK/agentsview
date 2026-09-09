@@ -353,6 +353,21 @@ add an archived or maintained mirror without replacing the original identity.
 
 ## Codex (`codex`)
 
+- **Tool-result image check (2026-09-08):** Reverified the pinned
+  [output payload types and array tests](https://github.com/openai/codex/blob/406dc9239492aff6d295cca5eebe2a548548d42f/codex-rs/protocol/src/models.rs).
+  `function_call_output.output` accepts a string or a content-item array.
+  `FunctionCallOutputContentItem::InputImage` serializes as `input_image` with
+  a string `image_url`; upstream's MCP conversion tests cover inline
+  `data:image/png;base64,...` URLs alongside `input_text` blocks. The
+  archive's drop policy projects supported inline images in these stored
+  arrays, including staged full imports and late results. Claude's text-block
+  decoding is unchanged; this evidence does not establish Claude emitting
+  Codex image blocks. Reverified archive summary handling on 2026-09-09
+  against `summarizeToolCallFromStateTx`: multiple named results get agent
+  labels; an anonymous result is appended without a label. The image
+  projection handles both forms, including JSON arrays with internal blank
+  lines. These summary labels are added by Agentsview, not by the provider.
+
 - **Performance fixture check (2026-09-04):** Rechecked the pinned rollout
   recorder below for session metadata and rollout-item persistence.
   `cmd/perfsim` generates dated rollouts with session metadata, turn context,

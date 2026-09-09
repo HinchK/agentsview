@@ -14,6 +14,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -1397,6 +1398,7 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	if err := db.requireWritable(); err != nil {
 		return err
 	}
+	msgs, _ = db.ProjectToolResultImages(msgs)
 	if len(msgs) == 0 {
 		return nil
 	}
@@ -1586,6 +1588,20 @@ func applyMessageTokenUsageUpdateTx(
 func (db *DB) WriteSessionIncremental(
 	sessionID string, msgs []Message, update IncrementalSessionUpdate,
 ) (bool, error) {
+	if err := db.requireWritable(); err != nil {
+		return false, err
+	}
+	msgs, _ = db.ProjectToolResultImages(msgs)
+	if db.ToolResultImages() == config.ToolResultImagesDrop {
+		update.SubagentLinks = append([]ToolCallSubagentLink(nil), update.SubagentLinks...)
+		for i := range update.SubagentLinks {
+			content, _ := StripToolResultImages(update.SubagentLinks[i].ResultContent)
+			update.SubagentLinks[i].ResultContent = content
+			update.SubagentLinks[i].ResultContentLen = ResolveResultContentLength(
+				content, update.SubagentLinks[i].ResultContentLen,
+			)
+		}
+	}
 	t := time.Now()
 	defer func() {
 		if d := time.Since(t); d > slowOpThreshold {
@@ -1638,7 +1654,7 @@ func (db *DB) WriteSessionIncremental(
 	for _, resultUpdate := range update.ToolCallResultUpdates {
 		changed, inserted, err := applyToolCallResultUpdateTx(
 			tx, sessionID, resultUpdate,
-			update.BlockedResultCategories,
+			update.BlockedResultCategories, db.ToolResultImages(),
 		)
 		if err != nil {
 			return false, err
@@ -1788,6 +1804,7 @@ type savedPin struct {
 func (db *DB) ReplaceSessionMessages(
 	sessionID string, msgs []Message,
 ) error {
+	msgs, _ = db.ProjectToolResultImages(msgs)
 	msgs = append([]Message(nil), msgs...)
 	_ = ValidateAndSanitize(nil, msgs, nil)
 
@@ -2094,6 +2111,7 @@ func (db *DB) replaceSessionContent(
 	signals SessionSignalUpdate, findings []SecretFinding,
 	cp *ParserCheckpoint, blobs *ParserCheckpointBlobs,
 ) error {
+	msgs, _ = db.ProjectToolResultImages(msgs)
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -3262,6 +3280,7 @@ func applyToolCallSubagentLinkTx(
 func applyToolCallResultUpdateTx(
 	tx *sql.Tx, sessionID string, update ToolCallResultUpdate,
 	blockedResultCategories map[string]bool,
+	imagePolicy config.ToolResultImages,
 ) (bool, []ToolResultEvent, error) {
 	if strings.TrimSpace(update.ToolUseID) == "" || len(update.Events) == 0 {
 		return false, nil, nil
@@ -3346,6 +3365,14 @@ func applyToolCallResultUpdateTx(
 	// stripped-byte count before the blank overwrites Content, losing the
 	// original result length the full and staged paths both preserve.
 	if !blocked {
+		if imagePolicy == config.ToolResultImagesDrop {
+			for i := range incoming {
+				incoming[i].Content, _ = StripToolResultImages(incoming[i].Content)
+				incoming[i].ContentLength = ResolveResultContentLength(
+					incoming[i].Content, incoming[i].ContentLength,
+				)
+			}
+		}
 		toolCall := ToolCall{ResultEvents: incoming}
 		_ = SanitizeToolCall(&toolCall)
 		incoming = toolCall.ResultEvents
@@ -3411,6 +3438,17 @@ func applyToolCallResultUpdateTx(
 	}
 	var storedSummary string
 	if !blocked {
+		// Existing events can predate a switch from keep to drop. Project the
+		// assembled summary too, so a late update cannot store their raw images
+		// again. Blocked results retain their original accounting length.
+		if imagePolicy == config.ToolResultImagesDrop {
+			projected, stats := StripToolResultImages(summary)
+			if stats.Payloads > 0 {
+				summary = projected
+				resultLength = len(summary)
+			}
+		}
+
 		sole, err := soleToolResultEventTx(
 			tx, sessionID, position.MessageOrdinal, position.CallIndex,
 		)

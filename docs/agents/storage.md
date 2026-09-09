@@ -41,6 +41,33 @@ checkpoint, and enabled derived state together. Cancellation aborts publication;
 cleanup detaches with a context that survives cancellation. Scratch storage is
 not an archive or a mirror and is removed after the import.
 
+Tool-result image retention uses the canonical `config.ToolResultImages` policy
+on writable SQLite handles. The zero value keeps content. Drop mode projects a
+valid inline `data:image/...;base64` block into an `agentsview_image`
+placeholder before derived lengths, display comparisons, and persistence. Raw
+event digests are captured before projection so distinct provider events remain
+distinct and replayed late results stay no-ops. The projection preserves
+ordinary text, metadata, block order, unsupported shapes, and future
+placeholders. Combined summaries project labeled and anonymous sections using
+JSON boundaries, so blank lines inside arrays do not split them. Late result
+writes also project the rebuilt summary when older events predate drop mode.
+`db strip --images` applies the projection to existing rows one session at a
+time. The command updates `tool_calls.result_content` and
+`tool_result_events.content` directly in one transaction per session,
+recalculates their stored lengths, and keeps every event coordinate and metadata
+column unchanged. Each changed session also gets a full secret scan of its
+projected transcript inside that transaction, preserving findings with their
+current offsets and rule version. A changed session gets the normal transcript
+revision, Recall, signal, artifact export, usage notification, and post-commit
+revocation sequence. An unchanged session gets none of those publications. Full
+resync applies this same projection only to the IDs returned by its trashed and
+orphaned session copies, before the replacement is published. Freshly parsed
+sessions already carry the projection. Large Codex imports project events before
+scratch insertion; staged summaries and signals use that projected content. The
+command counts raw `tool_calls.result_content` and `tool_result_events.content`
+bytes separately from decoded image bytes. `db compact` reports file-size
+reclamation separately.
+
 ## Backend Parity
 
 - Keep observable behavior and query shape aligned between SQLite and
