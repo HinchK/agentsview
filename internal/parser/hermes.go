@@ -959,6 +959,13 @@ func buildHermesStateResult(
 	}
 
 	applyHermesStateMetadata(sess, ss, selectedPath, project)
+	// Match transcript parsing: advance stale or unset end times from messages.
+	// Both state.db readers sort by timestamp ASC, id ASC, so the last is newest.
+	if len(stateMessages) > 0 {
+		if latest := stateMessages[len(stateMessages)-1].timestamp; latest.After(sess.EndedAt) && latest.After(sess.StartedAt) {
+			sess.EndedAt = latest
+		}
+	}
 	return ParseResult{
 		Session:     *sess,
 		Messages:    msgs,
@@ -1006,7 +1013,7 @@ func applyHermesStateMetadata(
 	if !ss.startedAt.IsZero() {
 		sess.StartedAt = ss.startedAt
 	}
-	if !ss.endedAt.IsZero() {
+	if ss.endedAt.After(sess.EndedAt) {
 		sess.EndedAt = ss.endedAt
 	}
 	if ss.parentSessionID != "" {
