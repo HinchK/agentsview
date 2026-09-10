@@ -16,18 +16,31 @@ import (
 // date-based pricing: those names left the static set (the seed
 // deletes their stale rows) and k3/k3-agent moved from K2.6 to K3
 // rates. Version 3 removed moonshot/kimi-k3 after LiteLLM added it.
-const supplementalVersion = "3"
+// Version 4 adds namespaced Codex mappings and a temporary Bedrock Astra
+// fallback until the pinned LiteLLM snapshot includes it.
+const supplementalVersion = "4"
 
 // Canonical pricing models runtime aliases resolve to.
 // KimiK26Canonical exists in the embedded LiteLLM snapshot;
 // KimiK3Canonical is seeded by the supplemental set below because the
 // LiteLLM catalog lists only the provider-qualified Kimi K3 name.
 // GPT56LunaCanonical is the catalog id for Codex Luna Reserve (gpt-reserve).
+// The Bedrock constants are the standard catalog rows for namespaced Codex
+// models that otherwise collide with provider-qualified variants.
+// GPT6AstraCanonical is the catalog id for Codex's namespaced Astra model.
 const (
-	KimiK26Canonical    = "moonshot/kimi-k2.6"
-	KimiK3Canonical     = "kimi-k3"
-	GPT56LunaCanonical  = "gpt-5.6-luna"
-	GPTReserveModelName = "gpt-reserve"
+	KimiK26Canonical           = "moonshot/kimi-k2.6"
+	KimiK3Canonical            = "kimi-k3"
+	GPT56LunaCanonical         = "gpt-5.6-luna"
+	BedrockGPT54Canonical      = "bedrock_mantle/openai.gpt-5.4"
+	BedrockGPT56LunaCanonical  = "bedrock_mantle/openai.gpt-5.6-luna"
+	BedrockGPT56TerraCanonical = "bedrock_mantle/openai.gpt-5.6-terra"
+	GPT6AstraCanonical         = "bedrock_mantle/openai.gpt-6-astra"
+	GPTReserveModelName        = "gpt-reserve"
+	CodexGPT54ModelName        = "openai.gpt-5.4"
+	CodexGPT56LunaModelName    = "openai.gpt-5.6-luna"
+	CodexGPT56TerraModelName   = "openai.gpt-5.6-terra"
+	CodexAstraModelName        = "openai.gpt-6-astra"
 )
 
 // KimiModelEraCutoff is the UTC instant at which the date-ambiguous
@@ -58,17 +71,23 @@ var kimiAmbiguousDateAliases = []string{
 type FixedPricingAlias struct {
 	Name      string
 	Canonical string
+	// Exact preserves provider and region qualifiers on catalog model names.
+	Exact bool
 }
 
-// fixedPricingAliases are timestamp-independent reported names that
-// never appear as catalog keys. Codex writes gpt-reserve for Luna
-// Reserve turns; Kimi Work writes k2d6-agent for the K2.6 era. A
-// static supplemental rate row for these names would hide later
-// catalog updates for the canonical model, including Pydantic
-// time-window rates for GPT-5.6 Luna.
+// fixedPricingAliases are timestamp-independent reported names that need a
+// curated catalog target. Codex writes gpt-reserve for Luna Reserve turns and
+// namespaced model ids that can collide with provider-qualified rows; Kimi Work
+// writes k2d6-agent for the K2.6 era. A static supplemental rate row for these
+// names would hide later catalog updates for the canonical model, including
+// Pydantic time-window rates for GPT-5.6 Luna.
 var fixedPricingAliases = []FixedPricingAlias{
 	{Name: "k2d6-agent", Canonical: KimiK26Canonical},
 	{Name: GPTReserveModelName, Canonical: GPT56LunaCanonical},
+	{Name: CodexGPT54ModelName, Canonical: BedrockGPT54Canonical, Exact: true},
+	{Name: CodexGPT56LunaModelName, Canonical: BedrockGPT56LunaCanonical, Exact: true},
+	{Name: CodexGPT56TerraModelName, Canonical: BedrockGPT56TerraCanonical, Exact: true},
+	{Name: CodexAstraModelName, Canonical: GPT6AstraCanonical, Exact: true},
 }
 
 // DateAliasedModels returns the sorted unqualified date-ambiguous
@@ -109,7 +128,7 @@ func isDateAliasedModel(model string) bool {
 func fixedCanonicalModel(model string) string {
 	name := pricingAliasName(model)
 	for _, alias := range fixedPricingAliases {
-		if alias.Name == name {
+		if alias.Name == model || (!alias.Exact && alias.Name == name) {
 			return alias.Canonical
 		}
 	}
@@ -160,12 +179,11 @@ func CanonicalModelForTimestamp(model, ts string) string {
 	return CanonicalModelForDate(model, t)
 }
 
-// supplementalPricing lists curated pricing aliases for internal model
-// names that never appear in the upstream LiteLLM catalog (neither in
-// the embedded snapshot nor in the fetched table), so sessions priced
-// through them would otherwise report $0.
+// supplementalPricing lists curated pricing fallbacks for model names
+// that are absent from the pinned LiteLLM snapshot, so sessions priced
+// through them would otherwise report $0 before a live refresh.
 //
-// The rates below are ESTIMATES at the Kimi K3 list pricing (input
+// The Kimi rates below are ESTIMATES at the Kimi K3 list pricing (input
 // 3.00, output 15.00, cache creation 0, cache read 0.30 per MTok):
 // the Kimi CLI reports k3 and kimi-k3, and Kimi Work (the kimi-desktop
 // daimon runtime) reports k3-agent, none of which carry public rate
@@ -175,6 +193,20 @@ func CanonicalModelForTimestamp(model, ts string) string {
 // these rows like any other fallback row, so a later LiteLLM refresh
 // still overwrites them if upstream lists the real models.
 var supplementalPricing = []ModelPricing{
+	{
+		ModelPattern:         GPT6AstraCanonical,
+		InputPerMTok:         money.MustParseDollars("11.00"),
+		OutputPerMTok:        money.MustParseDollars("55.00"),
+		CacheCreationPerMTok: money.MustParseDollars("13.75"),
+		CacheReadPerMTok:     money.MustParseDollars("1.10"),
+		Bands: []PricingBand{{
+			AboveInputTokens:     272_000,
+			InputPerMTok:         money.MustParseDollars("22.00"),
+			OutputPerMTok:        money.MustParseDollars("82.50"),
+			CacheCreationPerMTok: money.MustParseDollars("27.50"),
+			CacheReadPerMTok:     money.MustParseDollars("2.20"),
+		}},
+	},
 	{
 		ModelPattern:         "k3",
 		InputPerMTok:         money.MustParseDollars("3.00"),
@@ -198,9 +230,9 @@ var supplementalPricing = []ModelPricing{
 	},
 }
 
-// SupplementalPricing returns the curated alias set, copied for caller
+// SupplementalPricing returns the curated fallback set, copied for caller
 // safety. It is already folded into FallbackPricing; this accessor
 // exists for tests and diagnostics that need the supplementals alone.
 func SupplementalPricing() []ModelPricing {
-	return slices.Clone(supplementalPricing)
+	return cloneModelPricing(supplementalPricing)
 }

@@ -96,6 +96,12 @@ func TestCanonicalModelForDate(t *testing.T) {
 		{"gpt-reserve maps to Luna after cutoff", GPTReserveModelName, post, GPT56LunaCanonical},
 		{"gpt-reserve ignores zero time", GPTReserveModelName, time.Time{}, GPT56LunaCanonical},
 		{"provider-prefixed gpt-reserve", "openai/" + GPTReserveModelName, post, GPT56LunaCanonical},
+		{"Codex GPT-5.4 maps to standard Bedrock model", CodexGPT54ModelName, post, BedrockGPT54Canonical},
+		{"Codex GPT-5.6 Luna maps to standard Bedrock model", CodexGPT56LunaModelName, post, BedrockGPT56LunaCanonical},
+		{"Codex GPT-5.6 Terra maps to standard Bedrock model", CodexGPT56TerraModelName, post, BedrockGPT56TerraCanonical},
+		{"Codex Astra maps to Bedrock model", "openai.gpt-6-astra", post, "bedrock_mantle/openai.gpt-6-astra"},
+		{"qualified Bedrock model passes through", "bedrock_mantle/openai.gpt-5.4", post, ""},
+		{"GovCloud model passes through", "bedrock_mantle/us-gov-west-1/openai.gpt-5.4", post, ""},
 		{"flat k3 alias is not date-ambiguous", "k3", pre, ""},
 		{"flat k3-agent alias is not date-ambiguous", "k3-agent", pre, ""},
 		{"canonical k2.6 model passes through", KimiK26Canonical, pre, ""},
@@ -126,6 +132,7 @@ func TestCanonicalModelForTimestamp(t *testing.T) {
 		{"garbage timestamp falls back to K3", "kimi-for-coding", "not-a-time", KimiK3Canonical},
 		{"explicit K2.6 alias ignores timestamp", "k2d6-agent", "not-a-time", KimiK26Canonical},
 		{"gpt-reserve ignores garbage timestamp", GPTReserveModelName, "not-a-time", GPT56LunaCanonical},
+		{"Codex GPT-5.6 Luna ignores garbage timestamp", CodexGPT56LunaModelName, "not-a-time", BedrockGPT56LunaCanonical},
 		{"non-alias passes through", "k3", "2026-07-18T12:00:00Z", ""},
 	}
 	for _, tt := range tests {
@@ -154,20 +161,41 @@ func TestFallbackPricing_IncludesSupplementals(t *testing.T) {
 	}
 }
 
-// TestFallbackPricing_DateAliasTargetsResolvable proves both canonical
-// models the date-ambiguous aliases map onto exist in the fallback
-// set, so a mapped lookup always resolves: KimiK26Canonical from the
-// embedded snapshot, KimiK3Canonical from the supplemental rows.
-func TestFallbackPricing_DateAliasTargetsResolvable(t *testing.T) {
+// TestFallbackPricing_AliasTargetsResolvable proves every canonical model
+// runtime aliases map onto exists in the fallback set.
+func TestFallbackPricing_AliasTargetsResolvable(t *testing.T) {
 	byPattern := make(map[string]ModelPricing)
 	for _, p := range requireEmbeddedFallbackPricing(t) {
 		byPattern[p.ModelPattern] = p
 	}
-	for _, model := range []string{KimiK26Canonical, KimiK3Canonical, GPT56LunaCanonical} {
+	for _, model := range []string{
+		KimiK26Canonical,
+		KimiK3Canonical,
+		GPT56LunaCanonical,
+		BedrockGPT54Canonical,
+		BedrockGPT56LunaCanonical,
+		BedrockGPT56TerraCanonical,
+		GPT6AstraCanonical,
+	} {
 		_, ok := byPattern[model]
-		assert.True(t, ok,
-			"date-alias target %q missing from FallbackPricing", model)
+		require.True(t, ok,
+			"alias target %q missing from FallbackPricing", model)
 	}
+
+	astra := byPattern[GPT6AstraCanonical]
+	assert.Equal(t, money.MustParseDollars("11"), astra.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("55"), astra.OutputPerMTok)
+	assert.Equal(t, money.MustParseDollars("13.75"),
+		astra.CacheCreationPerMTok)
+	assert.Equal(t, money.MustParseDollars("1.1"), astra.CacheReadPerMTok)
+	require.Len(t, astra.Bands, 1)
+	assert.Equal(t, PricingBand{
+		AboveInputTokens:     272_000,
+		InputPerMTok:         money.MustParseDollars("22"),
+		OutputPerMTok:        money.MustParseDollars("82.5"),
+		CacheCreationPerMTok: money.MustParseDollars("27.5"),
+		CacheReadPerMTok:     money.MustParseDollars("2.2"),
+	}, astra.Bands[0])
 }
 
 // TestFallbackPricing_SupplementalsDoNotCollideWithSnapshot guards
@@ -214,8 +242,31 @@ func TestFixedPricingAliasesReturnsCopy(t *testing.T) {
 func TestSupplementalPricing_ReturnsCopy(t *testing.T) {
 	first := SupplementalPricing()
 	require.NotEmpty(t, first)
-	first[0].InputPerMTok = money.Money{Microdollars: -1}
+	var astra *ModelPricing
+	for i := range first {
+		if first[i].ModelPattern == GPT6AstraCanonical {
+			astra = &first[i]
+			break
+		}
+	}
+	require.NotNil(t, astra)
+	require.NotEmpty(t, astra.Bands)
+	astra.InputPerMTok = money.Money{Microdollars: -1}
+	astra.Bands[0].AboveInputTokens = 1
+
+	second := SupplementalPricing()
+	var secondAstra *ModelPricing
+	for i := range second {
+		if second[i].ModelPattern == GPT6AstraCanonical {
+			secondAstra = &second[i]
+			break
+		}
+	}
+	require.NotNil(t, secondAstra)
 	assert.NotEqual(t, money.Money{Microdollars: -1},
-		SupplementalPricing()[0].InputPerMTok,
+		secondAstra.InputPerMTok,
 		"SupplementalPricing must return an independent copy")
+	assert.NotEqual(t, 1,
+		secondAstra.Bands[0].AboveInputTokens,
+		"SupplementalPricing bands must be independently copied")
 }

@@ -5820,6 +5820,57 @@ func TestGetDailyUsage_GPTReserveLunaPricing(t *testing.T) {
 	assert.NotContains(t, reserve.Pricing.Models, pricingpkg.GPT56LunaCanonical)
 }
 
+func TestGetDailyUsage_CodexNamespacedPricing(t *testing.T) {
+	d := testDB(t)
+	d.SetEmptyCatalogPricing(fallbackRateMap())
+	// This region-qualified row is newer than the embedded snapshot.
+	d.SetEffectivePricing(map[string]export.ModelRates{
+		"bedrock_mantle/us-gov-west-1/openai.gpt-5.4": {
+			InputPerMTok:  money.MustParseDollars("3.3"),
+			OutputPerMTok: money.MustParseDollars("19.8"),
+			Source:        export.PricingRowSourceFetched,
+		},
+	})
+	tests := []struct {
+		model, date, canonical, pattern, input, output, cost string
+	}{
+		{"openai.gpt-5.4", "2026-09-09", "bedrock_mantle/openai.gpt-5.4", "aws/openai.gpt-5.4", "2.75", "16.5", "1.925"},
+		{"openai.gpt-5.6-luna", "2026-07-29", "bedrock_mantle/openai.gpt-5.6-luna", "aws/openai.gpt-5.6-luna", "1.1", "6.6", "0.77"},
+		{"openai.gpt-5.6-luna", "2026-07-30", "bedrock_mantle/openai.gpt-5.6-luna", "aws/openai.gpt-5.6-luna", "0.22", "1.32", "0.154"},
+		{"openai.gpt-5.6-terra", "2026-07-29", "bedrock_mantle/openai.gpt-5.6-terra", "aws/openai.gpt-5.6-terra", "2.75", "16.5", "1.925"},
+		{"openai.gpt-5.6-terra", "2026-07-30", "bedrock_mantle/openai.gpt-5.6-terra", "aws/openai.gpt-5.6-terra", "2.2", "13.2", "1.54"},
+		{"openai.gpt-6-astra", "2026-09-09", "bedrock_mantle/openai.gpt-6-astra", "bedrock_mantle/openai.gpt-6-astra", "11", "55", "6.6"},
+		{"bedrock_mantle/us-gov-west-1/openai.gpt-5.4", "2026-09-09", "bedrock_mantle/us-gov-west-1/openai.gpt-5.4", "bedrock_mantle/us-gov-west-1/openai.gpt-5.4", "3.3", "19.8", "2.31"},
+	}
+	for i, tt := range tests {
+		t.Run(tt.model+"/"+tt.date, func(t *testing.T) {
+			ts := tt.date + "T12:00:00Z"
+			id := fmt.Sprintf("codex-namespaced-%d", i)
+			insertSession(t, d, id, "proj", func(s *Session) {
+				s.Agent = "codex"
+				s.StartedAt = new(ts)
+			})
+			insertMessages(t, d, Message{
+				SessionID: id, Ordinal: 0, Role: "assistant",
+				Timestamp: ts, Model: tt.model,
+				TokenUsage: jsontext.Value(`{"input_tokens":100000,"output_tokens":100000}`),
+			})
+			got, err := d.GetDailyUsage(t.Context(), UsageFilter{
+				From: tt.date, To: tt.date, Timezone: "UTC", Model: tt.model,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, money.MustParseDollars(tt.cost), got.Totals.TotalCost)
+			require.NotNil(t, got.Pricing)
+			resolutions := got.Pricing.Models[tt.model].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, tt.canonical, resolutions[0].PricedModel)
+			assert.Equal(t, new(tt.pattern), resolutions[0].MatchedPattern)
+			assert.Equal(t, money.MustParseDollars(tt.input), resolutions[0].InputCostPerMTok)
+			assert.Equal(t, money.MustParseDollars(tt.output), resolutions[0].OutputCostPerMTok)
+		})
+	}
+}
+
 // TestGetDailyUsage_KimiDateAliasMixedDaySameModel proves one reported
 // model straddling the cutoff sums both eras: a pre-cutoff row prices
 // at K2.6 and a post-cutoff row at K3 within the same model breakdown.
