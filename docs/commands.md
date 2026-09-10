@@ -524,6 +524,71 @@ content measurements, not reclaimed disk space.
 
 ______________________________________________________________________
 
+### `agentsview db migrate --images`
+
+Move retained inline tool-result image payloads from currently stored archive
+rows into the asset store at `{dataDir}/assets`. Each payload is written as a
+content-addressed file named `<sha256hex><ext>`. Before the row changes, an
+existing object must have the expected byte count and SHA-256 digest. A missing
+or corrupt object is replaced while the source bytes remain available. The
+inline `input_image` block is replaced with an `agentsview_image` placeholder
+whose `image_ref` field holds the `asset://` reference. The
+`GET /api/v1/assets/{filename}` route and `renderMarkdown` resolve these
+references from the local assets directory.
+
+The image appears when a tool result's output is switched to formatted mode and
+every other block in that result is a text block. Raw mode shows the stored
+text, including the markdown reference, as it always has, and so does a result
+that still holds an unmigrated image block, such as an SVG or an `image/bmp`
+payload beside a migrated PNG. Under `require_auth` the asset route rejects the
+browser's image request, because an `img` element sends no `Authorization`
+header. Chat-imported images already carry that limit.
+
+Migration changes currently stored rows. A later keep-mode reparse or full
+resync can restore inline bytes from provider source files. The
+`tool_result_images = "drop"` policy keeps supported images projected during
+future ingestion and full resync. The command requires `--images` and never
+changes provider source files. A separate serving host needs the matching
+`{dataDir}/assets` directory as well as the copied database content. Run
+`db compact` separately to measure SQLite file-space reclamation after
+migration. Back up the `{dataDir}/assets` directory together with the archive.
+
+If a session transaction fails after writing assets, its rows remain unchanged
+but complete, unreferenced asset files remain on disk. Retrying the migration
+reuses matching files; there is no automatic cleanup of unreferenced assets.
+Both `db migrate --images` and `db strip --images` report the sessions that
+committed before a later failure.
+
+JPEG assets now use `.jpg` filenames, including `.jpeg` files copied from chat
+imports. Existing `asset://<hash>.jpeg` references still resolve, but re-importing
+an export with those files can create a second copy under `.jpg`.
+
+Only the four passive image media types are migrated: `image/png`, `image/jpeg`,
+`image/webp`, `image/gif`. Every other payload stays inline, including SVG,
+which the serving route refuses as active content, and near-misses such as the
+non-canonical `image/jpg` spelling. `db strip --images` is broader and replaces
+any `image/*` payload with a placeholder, so the two commands do not select the
+same rows.
+
+```bash
+agentsview db migrate --images [flags]
+```
+
+| Flag        | Default | Description                                         |
+| ----------- | ------- | --------------------------------------------------- |
+| `--images`  | `false` | Required image migration operation                  |
+| `--project` |         | Sessions whose project contains this substring      |
+| `--before`  |         | Sessions that ended before this date (`YYYY-MM-DD`) |
+| `--dry-run` | `false` | Preview selected sessions and byte counts           |
+| `--yes`     | `false` | Skip confirmation                                   |
+| `--format`  | `human` | Use `json` for machine-readable output              |
+
+JSON apply requires `--yes`. Preview and a declined confirmation leave the
+archive and assets directory unchanged. Reported stored-content bytes and
+decoded image bytes are content measurements, not reclaimed disk space.
+
+______________________________________________________________________
+
 ### `agentsview version`
 
 Print the version, git commit, and build date. Use `--json` for a stable,

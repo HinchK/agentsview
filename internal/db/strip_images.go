@@ -44,7 +44,7 @@ type stripImageSession struct {
 func (db *DB) PreviewStripToolImages(
 	ctx context.Context, filter StripImagesFilter,
 ) (StripImagesReport, error) {
-	return db.scanStripToolImages(ctx, filter, nil)
+	return db.scanToolImages(ctx, filter, countStrippable, nil)
 }
 
 // StripToolImages transforms selected sessions one at a time. The caller owns
@@ -55,7 +55,7 @@ func (db *DB) StripToolImages(
 	if err := db.requireWritable(); err != nil {
 		return StripImagesReport{}, err
 	}
-	return db.scanStripToolImages(ctx, filter, func(
+	return db.scanToolImages(ctx, filter, countStrippable, func(
 		ctx context.Context, session stripImageSession,
 	) (bool, error) {
 		changed, err := db.stripStoredToolResultRows(ctx, session.id)
@@ -75,7 +75,7 @@ func (db *DB) StripToolImagesForSessions(ctx context.Context, sessionIDs []strin
 		return err
 	}
 	for _, id := range sessionIDs {
-		stats, err := db.stripImageStats(ctx, id)
+		stats, err := db.toolImageStats(ctx, id, countStrippable)
 		if err != nil {
 			return err
 		}
@@ -89,10 +89,27 @@ func (db *DB) StripToolImagesForSessions(ctx context.Context, sessionIDs []strin
 	return nil
 }
 
-// stripStoredToolResultRows projects both stored tool-result tables in one
-// transaction. Direct row updates preserve event coordinates and metadata.
+// storedToolResultProjection transforms one stored result-content string.
+// A returned error aborts the session transaction.
+type storedToolResultProjection func(string) (string, error)
+
+// stripStoredToolResultRows is a wrapper over rewriteStoredToolResultRows
+// that applies the strip projection: StripToolResultImages, discarding stats.
 func (db *DB) stripStoredToolResultRows(
 	ctx context.Context, sessionID string,
+) (bool, error) {
+	return db.rewriteStoredToolResultRows(ctx, sessionID, func(content string) (string, error) {
+		projected, _ := StripToolResultImages(content)
+		return projected, nil
+	})
+}
+
+// rewriteStoredToolResultRows rewrites both stored tool-result tables in one
+// transaction using the given projection. Direct row updates preserve event
+// coordinates and metadata. The projection is called once per stored content
+// string; a projection error closes the open Rows and aborts the transaction.
+func (db *DB) rewriteStoredToolResultRows(
+	ctx context.Context, sessionID string, project storedToolResultProjection,
 ) (bool, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -143,7 +160,11 @@ func (db *DB) stripStoredToolResultRows(
 			return false, fmt.Errorf("scanning tool call: %w", err)
 		}
 		allCalls = append(allCalls, update)
-		projected, _ := StripToolResultImages(update.content)
+		projected, err := project(update.content)
+		if err != nil {
+			callRows.Close()
+			return false, err
+		}
 		if projected != update.content {
 			update.content = projected
 			update.length = ResolveResultContentLength(projected, update.length)
@@ -174,7 +195,11 @@ func (db *DB) stripStoredToolResultRows(
 			eventRows.Close()
 			return false, fmt.Errorf("scanning tool result event: %w", err)
 		}
-		projected, _ := StripToolResultImages(update.content)
+		projected, err := project(update.content)
+		if err != nil {
+			eventRows.Close()
+			return false, err
+		}
 		eventContents[update.key] = append(
 			eventContents[update.key], projected,
 		)
@@ -283,9 +308,10 @@ func (db *DB) stripStoredToolResultRows(
 	return true, nil
 }
 
-func (db *DB) scanStripToolImages(
+func (db *DB) scanToolImages(
 	ctx context.Context,
 	filter StripImagesFilter,
+	count func(string) ToolImageStats,
 	apply func(context.Context, stripImageSession) (bool, error),
 ) (StripImagesReport, error) {
 	sessions, err := db.stripImageSessions(ctx, filter)
@@ -298,15 +324,23 @@ func (db *DB) scanStripToolImages(
 	byProject := make(map[string]*StripImagesProjectReport)
 	for _, session := range sessions {
 		if err := ctx.Err(); err != nil {
-			return StripImagesReport{}, err
+			return report, err
 		}
-		stats, err := db.stripImageStats(ctx, session.id)
+		stats, err := db.toolImageStats(ctx, session.id, count)
 		if err != nil {
-			return StripImagesReport{}, err
+			return report, err
 		}
 		if stats.Payloads == 0 {
 			continue
 		}
+		changed := true
+		if apply != nil {
+			changed, err = apply(ctx, session)
+			if err != nil {
+				return report, err
+			}
+		}
+		// Only include sessions whose transaction succeeded in partial reports.
 		project := byProject[session.project]
 		if project == nil {
 			report.Projects = append(report.Projects, StripImagesProjectReport{
@@ -317,16 +351,7 @@ func (db *DB) scanStripToolImages(
 		}
 		project.Sessions++
 		report.Sessions++
-		if apply != nil {
-			changed, err := apply(ctx, session)
-			if err != nil {
-				return StripImagesReport{}, err
-			}
-			if changed {
-				project.Changed++
-				report.Changed++
-			}
-		} else if stats.Payloads > 0 {
+		if changed {
 			project.Changed++
 			report.Changed++
 		}
@@ -391,8 +416,8 @@ func (db *DB) stripImageSessions(
 	return sessions, rows.Err()
 }
 
-func (db *DB) stripImageStats(
-	ctx context.Context, sessionID string,
+func (db *DB) toolImageStats(
+	ctx context.Context, sessionID string, count func(string) ToolImageStats,
 ) (ToolImageStats, error) {
 	var stats ToolImageStats
 	rows, err := db.getReader().QueryContext(ctx, `
@@ -412,7 +437,7 @@ func (db *DB) stripImageStats(
 		if err := rows.Scan(&content); err != nil {
 			return ToolImageStats{}, fmt.Errorf("scanning tool result bytes: %w", err)
 		}
-		_, found := StripToolResultImages(content)
+		found := count(content)
 		stats.Payloads += found.Payloads
 		stats.StoredBytes += found.StoredBytes
 		stats.DecodedBytes += found.DecodedBytes
@@ -421,4 +446,9 @@ func (db *DB) stripImageStats(
 		return ToolImageStats{}, fmt.Errorf("iterating tool result bytes: %w", err)
 	}
 	return stats, nil
+}
+
+func countStrippable(content string) ToolImageStats {
+	_, stats := StripToolResultImages(content)
+	return stats
 }
