@@ -313,13 +313,11 @@ bench-backends: pricing-snapshot ensure-embed-dir
 		AGENTSVIEW_BENCH_MESSAGES_PER_SESSION=$(BENCH_BACKENDS_MESSAGES_PER_SESSION) \
 		CGO_ENABLED=1 go test -tags "fts5,benchdb" ./internal/backendbench $(BENCH_BACKENDS_FLAGS)
 
-# Hot-path benchmark gate. Runs every benchmark in the gated packages
+# Local hot-path benchmark comparison. Runs every benchmark in these packages
 # (sync engine warm/cold/append, message write paths, usage
-# aggregation, secret scanning, signal analysis). This target is the
-# single source of truth for the gate configuration: CI's bench.yml
-# runs it on both the PR head and the merge base, then compares the
-# outputs with `go run ./cmd/benchgate -old old.txt -new new.txt`.
-# Run it before and after touching a gated hot path.
+# aggregation, secret scanning, signal analysis). For a local comparison,
+# run this target before and after a change, then compare the outputs with
+# `go run ./cmd/benchgate -old old.txt -new new.txt`.
 BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets \
 	./internal/signals
 # Count must stay >= 5: benchgate's time gate needs at least 5
@@ -351,11 +349,10 @@ bench-gate: pricing-snapshot ensure-embed-dir
 		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_HEAVY_TIME) \
 		-timeout 25m $(BENCH_GATE_PACKAGES)
 
-# Prints the gate's sample/iteration configuration in shell-evalable
-# form. CI evaluates this on the PR head and passes the values into
-# the merge-base `make bench-gate` invocation, so both sides measure
-# identical workloads even when a PR changes the defaults above (the
-# package list intentionally stays per-side).
+# Prints the sample/iteration configuration in shell-evalable form.
+# Pass these values to the baseline `make bench-gate` invocation so both
+# sides measure identical workloads even when a change updates the defaults
+# above (the package list intentionally stays per-side).
 bench-gate-config:
 	@echo "BENCH_GATE_COUNT=$(BENCH_GATE_COUNT) BENCH_GATE_TIME=$(BENCH_GATE_TIME)"
 	@echo "BENCH_GATE_HEAVY='$(BENCH_GATE_HEAVY)' BENCH_GATE_HEAVY_TIME=$(BENCH_GATE_HEAVY_TIME)"
@@ -639,7 +636,7 @@ help:
 	@echo "  test-short     - Run fast tests only"
 	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
 	@echo "  bench-pg-usage - Run opt-in PostgreSQL usage benchmarks against PG16"
-	@echo "  bench-gate     - Run the hot-path benchmarks CI gates PRs on"
+	@echo "  bench-gate     - Run hot-path benchmarks for local comparison"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
 	@echo "  test-s3        - Run S3 discovery integration tests (Docker)"
 	@echo "  postgres-up    - Start test PostgreSQL container"
