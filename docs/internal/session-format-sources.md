@@ -678,7 +678,12 @@ add an archived or maintained mirror without replacing the original identity.
   initializes session-store schema version 4 without `assistant_usage_events`.
   Running that initialization SQL in isolated SQLite reproduced the missing
   table. A store without the required usage schema leaves transcript and
-  shutdown usage available.
+  shutdown usage available. Missing or incomplete usage schemas are cached as
+  empty usage for the current SQLite state. Reverified 2026-09-10 with
+  isolated syncs of 8 and 800 sessions: metadata-only writes do not reparse
+  transcripts, unchanged states reuse the cached result while the store is
+  locked, and a completed schema imports new usage for only the affected
+  session.
 
 - **Store refresh:** Store database and WAL writes participate in incremental
   sync cutoff filtering without changing session activity timestamps. Parent
@@ -704,6 +709,15 @@ add an archived or maintained mirror without replacing the original identity.
   per-model excess over store output. This is a lower bound: extra store-only
   calls can mask missing output, and missing input or request bands cannot be
   recovered. A recovered row replaces that excess without adding it twice.
+
+- **Store refresh:** The native usage insert leaves `sessions.updated_at`
+  unchanged. Its `(session_id, id)` usage index supports per-session
+  maximum-ID lookups. Agentsview hashes changed sessions' usage rows once per
+  store update and reuses unchanged transcript hashes across provider and
+  engine restarts. Session timestamps still come from the transcript. Startup
+  rebuilds store hashes; runtime refresh follows appends and latest-row
+  removal. Historical edits below an unchanged maximum ID wait for a new
+  engine or CLI sync.
 
 ## Gemini CLI (`gemini`)
 
