@@ -105,6 +105,33 @@ func createCursorIDEDB(t *testing.T, composers []cursorIDETestComposer) string {
 	return dbPath
 }
 
+// assertCursorDiskKVStoredShape pins the on-disk premise the null/empty-blob
+// subtests rest on: a SQL NULL value reports typeof "null", while a stored
+// zero-length BLOB reports typeof "blob" with length 0. Without this check,
+// a driver whose bind path folded []byte{} into NULL (the repo carries a
+// second SQLite driver, modernc.org/sqlite, so this is not hypothetical)
+// would silently collapse the empty-blob subtests into copies of their null
+// siblings and still pass.
+func assertCursorDiskKVStoredShape(t *testing.T, dbPath, key string, wantNull bool) {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer conn.Close()
+	var typ string
+	var length sql.NullInt64
+	require.NoError(t, conn.QueryRow(
+		`SELECT typeof(value), length(value) FROM cursorDiskKV WHERE key = ?`,
+		key,
+	).Scan(&typ, &length))
+	if wantNull {
+		assert.Equal(t, "null", typ)
+		return
+	}
+	assert.Equal(t, "blob", typ)
+	require.True(t, length.Valid)
+	assert.Zero(t, length.Int64)
+}
+
 func TestCursorIDEProviderCapabilities(t *testing.T) {
 	factory, ok := ProviderFactoryByType(AgentCursorIDE)
 	require.True(t, ok)
@@ -435,6 +462,369 @@ func TestParseCursorIDEComposer_EndedAtNotBeforeLastMessage(t *testing.T) {
 		time.Date(2026, 6, 21, 7, 28, 5, 0, time.UTC), result.Session.EndedAt,
 		"a stale lastUpdatedAt must not place EndedAt before the final message")
 	assert.False(t, result.Session.EndedAt.Before(result.Session.StartedAt))
+}
+
+func TestCursorIDEParseContainerKeepsSiblingsPastNullComposer(t *testing.T) {
+	// NULL and a stored zero-length BLOB both scan into a zero-length []byte,
+	// but they are distinct SQLite storage shapes (sql.ErrNoRows never fires
+	// for either). The guard is len(raw) == 0, not raw == nil, precisely so a
+	// database holding either shape stops failing; both cases must be proven
+	// separately so a regression narrowing the predicate to raw == nil would
+	// be caught.
+	cases := []struct {
+		name  string
+		value any
+	}{
+		{name: "null", value: nil},
+		{name: "empty-blob", value: []byte{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := createCursorIDEDB(t, []cursorIDETestComposer{
+				{
+					id:        "husk-0000-0000-0000-000000000000",
+					name:      "Husk chat",
+					createdAt: 1782026756842,
+					updatedAt: 1782026791522,
+					bubbles: []cursorIDETestBubble{{
+						id: "b1", bubbleType: cursorIDEBubbleTypeUser,
+						text: "will be husked", createdAt: "2026-06-21T07:27:29.606Z",
+					}},
+				},
+				{
+					id:        "sibling-one-0000-0000-000000000000",
+					name:      "Sibling one",
+					createdAt: 1782026756842,
+					updatedAt: 1782026791522,
+					bubbles: []cursorIDETestBubble{{
+						id: "b1", bubbleType: cursorIDEBubbleTypeUser,
+						text: "kept one", createdAt: "2026-06-21T07:27:29.606Z",
+					}},
+				},
+				{
+					id:        "sibling-two-0000-0000-000000000000",
+					name:      "Sibling two",
+					createdAt: 1782026756842,
+					updatedAt: 1782026791522,
+					bubbles: []cursorIDETestBubble{{
+						id: "b1", bubbleType: cursorIDEBubbleTypeUser,
+						text: "kept two", createdAt: "2026-06-21T07:27:29.606Z",
+					}},
+				},
+			})
+			writer, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			_, err = writer.Exec(
+				`UPDATE cursorDiskKV SET value = ? WHERE key = ?`,
+				tc.value, "composerData:husk-0000-0000-0000-000000000000",
+			)
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			assertCursorDiskKVStoredShape(t, dbPath,
+				"composerData:husk-0000-0000-0000-000000000000", tc.value == nil)
+
+			root := filepath.Dir(dbPath)
+			provider, ok := NewProvider(AgentCursorIDE, ProviderConfig{
+				Roots: []string{root}, Machine: "devbox",
+			})
+			require.True(t, ok)
+
+			discovered, err := provider.Discover(context.Background())
+			require.NoError(t, err)
+			require.Len(t, discovered, 1)
+
+			fingerprint, err := provider.Fingerprint(context.Background(), discovered[0])
+			require.NoError(t, err)
+
+			outcome, err := provider.Parse(context.Background(), ParseRequest{
+				Source: discovered[0], Machine: "devbox", Fingerprint: fingerprint,
+			})
+			require.NoError(t, err,
+				"a husk composer must not fail the whole container fan-out")
+			require.Len(t, outcome.Results, 2,
+				"both healthy siblings must survive past the husk composer")
+
+			var ids []string
+			var siblingOne ParseResult
+			for _, r := range outcome.Results {
+				ids = append(ids, r.Result.Session.ID)
+				if r.Result.Session.ID == "cursor-ide:sibling-one-0000-0000-000000000000" {
+					siblingOne = r.Result
+				}
+			}
+			assert.ElementsMatch(t, []string{
+				"cursor-ide:sibling-one-0000-0000-000000000000",
+				"cursor-ide:sibling-two-0000-0000-000000000000",
+			}, ids)
+			assert.NotContains(t, ids, "cursor-ide:husk-0000-0000-0000-000000000000")
+
+			// P3: a surviving sibling's full parsed-session metadata contract
+			// (not just its ID) is unaffected by a sibling husk elsewhere in the
+			// same container.
+			require.Len(t, siblingOne.Messages, 1)
+			assert.Equal(t, "kept one", siblingOne.Messages[0].Content)
+			assert.Equal(t, "b1", siblingOne.Messages[0].SourceUUID)
+			assert.False(t, siblingOne.Session.IsTruncated)
+			assert.Equal(t, "Sibling one", siblingOne.Session.SessionName)
+			assert.NotEmpty(t, siblingOne.Session.File.Hash)
+			assert.False(t, siblingOne.Session.StartedAt.IsZero())
+			assert.False(t, siblingOne.Session.EndedAt.IsZero())
+			// P7: cursor-ide assigns none of these lineage fields; a sibling
+			// surviving a husk composer must not pick any of them up either.
+			assert.Empty(t, siblingOne.Session.RelationshipType)
+			assert.Empty(t, siblingOne.Session.SourceVersion)
+			assert.Empty(t, siblingOne.Session.ParentSessionID)
+			assert.Empty(t, siblingOne.Session.TerminationStatus)
+		})
+	}
+}
+
+func TestParseCursorIDEComposer_NullBubbleValueBecomesGap(t *testing.T) {
+	// NULL and a stored zero-length BLOB are distinct storage shapes but must
+	// take the same absent path; see the guard-boundary note in
+	// TestCursorIDEParseContainerKeepsSiblingsPastNullComposer.
+	cases := []struct {
+		name  string
+		value any
+	}{
+		{name: "null", value: nil},
+		{name: "empty-blob", value: []byte{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			composer := []cursorIDETestComposer{{
+				id:        "null-bubble-0000-0000-000000000000",
+				name:      "Null bubble thread",
+				createdAt: 1782026756842,
+				updatedAt: 1782026791522,
+				bubbles: []cursorIDETestBubble{
+					{id: "b1", bubbleType: cursorIDEBubbleTypeUser, text: "kept", createdAt: "2026-06-21T07:27:29.606Z"},
+					{id: "b2", bubbleType: cursorIDEBubbleTypeAssistant, text: "will be husked", createdAt: "2026-06-21T07:27:31.522Z"},
+				},
+			}}
+
+			// Reference digest: the same composer with bubble b2 intact. This
+			// is the one input for which cursorIDEComposerDigest becomes newly
+			// reachable by this diff: on base, loadCursorIDEBubble errored at
+			// header b2 and parseCursorIDEComposer returned before the digest
+			// call. P6 requires the digest to hash every stored bubble's key
+			// and value bytes unconditionally, so husking b2 must change it.
+			intactPath := createCursorIDEDB(t, composer)
+			intactConn, err := openCursorIDEDB(intactPath)
+			require.NoError(t, err)
+			intactInfo, err := os.Stat(intactPath)
+			require.NoError(t, err)
+			intactResult, err := parseCursorIDEComposer(
+				context.Background(), intactConn, intactPath,
+				"null-bubble-0000-0000-000000000000", "devbox", intactInfo,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, intactResult)
+			require.NotEmpty(t, intactResult.Session.File.Hash)
+			require.NoError(t, intactConn.Close())
+
+			dbPath := createCursorIDEDB(t, composer)
+			writer, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			_, err = writer.Exec(
+				`UPDATE cursorDiskKV SET value = ? WHERE key = ?`,
+				tc.value, "bubbleId:null-bubble-0000-0000-000000000000:b2",
+			)
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			assertCursorDiskKVStoredShape(t, dbPath,
+				"bubbleId:null-bubble-0000-0000-000000000000:b2", tc.value == nil)
+
+			conn, err := openCursorIDEDB(dbPath)
+			require.NoError(t, err)
+			defer conn.Close()
+			info, err := os.Stat(dbPath)
+			require.NoError(t, err)
+
+			result, err := parseCursorIDEComposer(
+				context.Background(), conn, dbPath,
+				"null-bubble-0000-0000-000000000000", "devbox", info,
+			)
+			require.NoError(t, err,
+				"a bubble whose value is NULL or empty must become a truncation gap, not a fatal error")
+			require.NotNil(t, result)
+			require.Len(t, result.Messages, 1)
+			assert.Equal(t, "kept", result.Messages[0].Content)
+			assert.True(t, result.Session.IsTruncated,
+				"a transcript with a husked bubble row must be flagged truncated")
+			assert.Zero(t, result.Session.MalformedLines,
+				"this diff writes no malformed-line counter for a husk bubble")
+			assert.Equal(t, "b1", result.Messages[0].SourceUUID,
+				"the surviving message's SourceUUID must be unchanged")
+
+			assert.NotEmpty(t, result.Session.File.Hash)
+			assert.NotEqual(t, intactResult.Session.File.Hash, result.Session.File.Hash,
+				"husking bubble b2 must change the composer digest")
+		})
+	}
+}
+
+func TestCursorIDEEmptyJSONObjectValuesTakeExistingPaths(t *testing.T) {
+	t.Run("composer", func(t *testing.T) {
+		dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
+			id: "empty-object-composer-0000-00000000",
+		}})
+		writer, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		_, err = writer.Exec(
+			`UPDATE cursorDiskKV SET value = ? WHERE key = ?`,
+			[]byte(`{}`), "composerData:empty-object-composer-0000-00000000",
+		)
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+
+		conn, err := openCursorIDEDB(dbPath)
+		require.NoError(t, err)
+		defer conn.Close()
+		info, err := os.Stat(dbPath)
+		require.NoError(t, err)
+
+		result, err := parseCursorIDEComposer(
+			context.Background(), conn, dbPath,
+			"empty-object-composer-0000-00000000", "devbox", info,
+		)
+		require.NoError(t, err,
+			"a two-byte {} value decodes cleanly and must not take the absent path")
+		assert.Nil(t, result,
+			"a composer with zero headers must not surface as a session")
+
+		// parseCursorIDEComposer's (nil, nil) return is identical whether the
+		// guard fired or the value decoded to zero headers, so it cannot by
+		// itself prove {} took the decode path rather than the absent path. The
+		// discriminator lives one level down: loadCursorIDEComposerMeta reports
+		// ok=true with a real digest for a value that decoded (this {} case),
+		// and ok=false with a zero meta for a husk (TestLoadCursorIDEComposerMetaNullValueReportsNotFound).
+		// A guard broadened to catch len(raw) <= 2 would flip this ok to false,
+		// which is exactly the false-positive this row exists to catch.
+		meta, ok, err := loadCursorIDEComposerMeta(
+			context.Background(), conn, "empty-object-composer-0000-00000000",
+		)
+		require.NoError(t, err)
+		assert.True(t, ok,
+			"a decoded {} composer must report found, unlike a husk composer")
+		assert.NotEmpty(t, meta.digest,
+			"a decoded {} composer must fingerprint with a real digest")
+	})
+
+	t.Run("bubble", func(t *testing.T) {
+		dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
+			id:        "empty-object-bubble-0000-0000000000",
+			name:      "Empty object bubble",
+			createdAt: 1782026756842,
+			updatedAt: 1782026791522,
+			bubbles: []cursorIDETestBubble{
+				{id: "b1", bubbleType: cursorIDEBubbleTypeUser, text: "kept", createdAt: "2026-06-21T07:27:29.606Z"},
+				{id: "b2", bubbleType: cursorIDEBubbleTypeAssistant, text: "will be emptied", createdAt: "2026-06-21T07:27:31.522Z"},
+			},
+		}})
+		writer, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		_, err = writer.Exec(
+			`UPDATE cursorDiskKV SET value = ? WHERE key = ?`,
+			[]byte(`{}`), "bubbleId:empty-object-bubble-0000-0000000000:b2",
+		)
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+
+		conn, err := openCursorIDEDB(dbPath)
+		require.NoError(t, err)
+		defer conn.Close()
+		info, err := os.Stat(dbPath)
+		require.NoError(t, err)
+
+		result, err := parseCursorIDEComposer(
+			context.Background(), conn, dbPath,
+			"empty-object-bubble-0000-0000000000", "devbox", info,
+		)
+		require.NoError(t, err,
+			"a two-byte {} bubble value decodes cleanly and must not take the absent path")
+		require.NotNil(t, result)
+		require.Len(t, result.Messages, 1)
+		assert.Equal(t, "kept", result.Messages[0].Content)
+		assert.True(t, result.Session.IsTruncated,
+			"a bubble that decodes but renders nothing still takes the truncation path")
+
+		// parseCursorIDEComposer's outer result (one surviving message,
+		// truncated=true) is identical whether the {} bubble decoded and then
+		// rendered nothing, or the row was an absent husk, so it cannot by
+		// itself prove {} reached the renderless-bubble branch rather than the
+		// absent-bubble branch. The discriminator is one level down, at
+		// loadCursorIDEBubble itself: a decoded {} returns a non-nil bubble
+		// (this case), while a husk returns nil
+		// (TestParseCursorIDEComposer_NullBubbleValueBecomesGap). A guard
+		// broadened to catch len(raw) <= 2 would flip this to nil, which is
+		// exactly the false-positive this row exists to catch.
+		bubble, err := loadCursorIDEBubble(
+			context.Background(), conn,
+			"empty-object-bubble-0000-0000000000", "b2",
+		)
+		require.NoError(t, err)
+		require.NotNil(t, bubble,
+			"a decoded {} bubble must return non-nil, unlike a husk bubble")
+		assert.Equal(t, cursorIDEBubble{}, *bubble,
+			"a {} bubble decodes to a zero-valued struct, not an absence")
+	})
+}
+
+func TestLoadCursorIDEComposerMetaNullValueReportsNotFound(t *testing.T) {
+	// NULL and a stored zero-length BLOB are distinct storage shapes but must
+	// take the same absent path; see the guard-boundary note in
+	// TestCursorIDEParseContainerKeepsSiblingsPastNullComposer.
+	cases := []struct {
+		name  string
+		value any
+	}{
+		{name: "null", value: nil},
+		{name: "empty-blob", value: []byte{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := createCursorIDEDB(t, []cursorIDETestComposer{{
+				id:        "null-meta-0000-0000-000000000000",
+				name:      "Null meta chat",
+				createdAt: 1782026756842,
+				updatedAt: 1782026791522,
+				bubbles: []cursorIDETestBubble{{
+					id: "b1", bubbleType: cursorIDEBubbleTypeUser, text: "hi",
+					createdAt: "2026-06-21T07:27:29.606Z",
+				}},
+			}})
+			writer, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			_, err = writer.Exec(
+				`UPDATE cursorDiskKV SET value = ? WHERE key = ?`,
+				tc.value, "composerData:null-meta-0000-0000-000000000000",
+			)
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			assertCursorDiskKVStoredShape(t, dbPath,
+				"composerData:null-meta-0000-0000-000000000000", tc.value == nil)
+
+			conn, err := openCursorIDEDB(dbPath)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			meta, ok, err := loadCursorIDEComposerMeta(
+				context.Background(), conn, "null-meta-0000-0000-000000000000",
+			)
+			require.NoError(t, err,
+				"a NULL or empty composer value must fingerprint as absent, not error")
+			assert.False(t, ok)
+			assert.Equal(t, cursorIDEComposerMeta{}, meta)
+
+			assert.True(t,
+				CursorIDEComposerExists(dbPath, "null-meta-0000-0000-000000000000"),
+				"the key remains present in cursorDiskKV even though its value is NULL or empty")
+		})
+	}
 }
 
 func TestParseCursorIDEComposer_TypelessBubbleFallsBackToHeaderType(t *testing.T) {

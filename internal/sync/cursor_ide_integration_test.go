@@ -831,3 +831,131 @@ func TestSyncAllCursorIDEReplacedDatabaseFileReparses(t *testing.T) {
 	assert.Equal(t, "howdy", *sess.FirstMessage,
 		"a replaced database file must miss the skip cache and reparse")
 }
+
+// TestSyncAllCursorIDENullValueRowsDoNotFailThePass uses a synthetic fixture
+// based on issue #1676. A NULL composer and a NULL bubble in sibling A must
+// leave both siblings available and the sync pass complete.
+func TestSyncAllCursorIDENullValueRowsDoNotFailThePass(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "state.vscdb")
+	createCursorIDEStateDB(t, dbPath, []cursorIDESyncComposer{
+		{
+			id: "sibling-a-composer", name: "Sibling A",
+			createdAt: 1782026756842, updatedAt: 1782026791522,
+			bubbles: []cursorIDESyncBubble{
+				{
+					id: "b1", bubbleType: 1, text: "sibling a content",
+					createdAt: "2026-06-21T07:27:29.606Z",
+				},
+				{
+					// Matches the fixture's "bubbleId:%:nullvalue-%" UPDATE, so
+					// applying the fixture nulls this row's value.
+					id: "nullvalue-1", bubbleType: 2, text: "will be nulled by the fixture",
+					createdAt: "2026-06-21T07:27:31.522Z",
+				},
+			},
+		},
+		{
+			id: "sibling-b-composer", name: "Sibling B",
+			createdAt: 1782026756842, updatedAt: 1782026791522,
+			bubbles: []cursorIDESyncBubble{{
+				id: "b1", bubbleType: 1, text: "sibling b content",
+				createdAt: "2026-06-21T07:27:29.606Z",
+			}},
+		},
+	})
+
+	fixture, err := os.ReadFile(
+		filepath.Join("..", "parser", "testdata", "cursor-ide-null-values.sql"),
+	)
+	require.NoError(t, err)
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = writer.Exec(string(fixture))
+	require.NoError(t, err)
+	// Confirm the fixture's own UPDATE actually matched sibling A's
+	// nullvalue-1 bubble, so this test cannot silently regress to proving
+	// only the NULL-composer half again.
+	var nulledValue sql.NullString
+	require.NoError(t, writer.QueryRow(
+		`SELECT value FROM cursorDiskKV WHERE key = ?`,
+		"bubbleId:sibling-a-composer:nullvalue-1",
+	).Scan(&nulledValue))
+	require.False(t, nulledValue.Valid,
+		"the fixture's bubbleId:%%:nullvalue-%% UPDATE must have nulled this row")
+	require.NoError(t, writer.Close())
+
+	engine, database := newCursorIDESyncEngine(t, root)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.True(t, stats.ProcessingComplete(),
+		"NULL cursorDiskKV rows must not fail the sync pass: %+v", stats)
+	assert.Zero(t, stats.Failed)
+	assert.Equal(t, 2, stats.Synced,
+		"both healthy sibling composers must be synced past the husk rows")
+
+	a, err := database.GetSessionFull(t.Context(), "cursor-ide:sibling-a-composer")
+	require.NoError(t, err)
+	require.NotNil(t, a)
+	assert.Equal(t, 1, a.MessageCount,
+		"sibling A's nulled nullvalue-1 bubble must not surface as a message")
+	assert.True(t, a.IsTruncated,
+		"sibling A must be flagged truncated: the fixture nulled one of its two bubbles")
+	require.NotNil(t, a.FirstMessage)
+	assert.Equal(t, "sibling a content", *a.FirstMessage,
+		"sibling A's surviving turn must still carry its original content")
+	assert.Zero(t, a.ParserMalformedLines)
+	b, err := database.GetSessionFull(t.Context(), "cursor-ide:sibling-b-composer")
+	require.NoError(t, err)
+	require.NotNil(t, b)
+	assert.Equal(t, 1, b.MessageCount)
+	assert.False(t, b.IsTruncated,
+		"sibling B is untouched by the fixture and must not be flagged truncated")
+	assert.Zero(t, b.ParserMalformedLines)
+
+	_, hasCursorIDE := stats.Anomalies.MalformedLinesByAgent["cursor-ide"]
+	assert.False(t, hasCursorIDE,
+		"the husk rows must be published through source-missing and truncation, not a counter")
+}
+
+// TestSyncAllCursorIDENullComposerKeepsArchivedTranscript covers P5: a live
+// composer whose value later goes NULL must preserve the archived transcript
+// through the recoverable source-missing seam, not fail the pass or drop the
+// session.
+func TestSyncAllCursorIDENullComposerKeepsArchivedTranscript(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "state.vscdb")
+	createCursorIDEStateDB(t, dbPath, []cursorIDESyncComposer{{
+		id: "goes-null-composer", name: "Goes null chat",
+		createdAt: 1782026756842, updatedAt: 1782026791522,
+		bubbles: []cursorIDESyncBubble{{
+			id: "b1", bubbleType: 1, text: "hello",
+			createdAt: "2026-06-21T07:27:29.606Z",
+		}},
+	}})
+	engine, database := newCursorIDESyncEngine(t, root)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	before, err := database.GetSessionFull(t.Context(), "cursor-ide:goes-null-composer")
+	require.NoError(t, err)
+	require.NotNil(t, before)
+
+	writer, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = writer.Exec(
+		`UPDATE cursorDiskKV SET value = NULL WHERE key = ?`,
+		"composerData:goes-null-composer",
+	)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.True(t, stats.ProcessingComplete(),
+		"a composer value going NULL must not fail the pass: %+v", stats)
+
+	archived, err := database.GetSessionFull(t.Context(), "cursor-ide:goes-null-composer")
+	require.NoError(t, err)
+	assertSourceMissingState(t, archived)
+	assert.Equal(t, before.MessageCount, archived.MessageCount,
+		"a NULL composer value must not truncate the archived transcript")
+	assert.False(t, database.IsSessionExcluded("cursor-ide:goes-null-composer"),
+		"the archived session must not be permanently deleted")
+}
