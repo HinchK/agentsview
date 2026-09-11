@@ -37,7 +37,12 @@ const (
 	// Version 10 rebuilds rollups with Bedrock pricing for namespaced Codex
 	// models, including historical AWS rates for timestamped usage.
 	// Version 11 rebuilds Copilot store usage with request-scoped pricing.
-	usageCacheFormatVersion             = 11
+	// Version 12 rebuilds version 11 rollups because models carrying an
+	// Ollama Cloud tag (kimi-k2.7-code:cloud, gpt-oss:120b-cloud) now price
+	// at the untagged model's catalog rate. EffectivePricingDigest hashes
+	// only catalog rows, so the same facts and catalog would otherwise keep
+	// the unpriced costs.
+	usageCacheFormatVersion             = 12
 	usageCacheApplicationID             = 0x41565543
 	usageCacheKind                      = "agentsview-usage-facts"
 	usageCacheRetirementProtocolVersion = 1

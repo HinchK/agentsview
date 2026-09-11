@@ -94,6 +94,13 @@ description: Release history for AgentsView
 
 **Bug fixes**
 
+- Show costs for OpenCode turns served through Ollama Cloud, such as
+  `kimi-k2.7-code:cloud` or `gpt-oss:120b-cloud`, which previously showed as
+  $0.00. Ollama bills these models per token at the upstream model's
+  published rate, so a tagged name now uses the untagged model's catalog
+  price when nothing matches the tagged name itself. Usage breakdowns keep
+  the tagged name, local Ollama tags such as `:27b-mlx` or `:latest` stay
+  unpriced, and cached usage totals recalculate on the next start.
 - Show Bedrock costs for Codex turns reported as `openai.gpt-5.4`,
   `openai.gpt-5.6-luna`, `openai.gpt-5.6-terra`, and `openai.gpt-6-astra`,
   while keeping those names in usage breakdowns. Dated usage uses AWS rates

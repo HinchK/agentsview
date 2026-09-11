@@ -1165,6 +1165,23 @@ preservation of archived messages for OpenCode, Kilo, MiMoCode, and Icodemate.
   `source_uuid`. Usage archive comparisons match those stored rows by ordinal
   and role until a complete source rewrite records the ID; rows that already
   have an ID require an exact identity match.
+- **Ollama Cloud model tags and cost (2026-09-10):** An assistant message's
+  `data.modelID` is the model key from the user's OpenCode provider config,
+  recorded verbatim. A custom `@ai-sdk/openai-compatible` provider that points
+  at a local Ollama server therefore yields Ollama tags such as
+  `kimi-k2.7-code:cloud`, and `data.providerID` is that config's own key
+  rather than a catalog provider, so the parser does not retain it. OpenCode
+  writes `cost: 0` for such models because it has no rate for them, and the
+  parser never imports OpenCode cost, so every such turn is priced by
+  agentsview. Ollama's [pricing page](https://ollama.com/pricing) bills cloud
+  models per million tokens; on the check date it listed `kimi-k2.7-code` at
+  $0.95 input, $0.19 cached input, and $4.00 output, equal to the `moonshotai`
+  row in the embedded GenAI Prices document. `PricingResolver.ResolveAt`
+  therefore retries the untagged name (`pricing.OllamaCloudBaseModel`) only
+  after every exact, custom, historical, and canonical attempt on the tagged
+  name fails. The pinned LiteLLM snapshot lists `ollama/*-cloud` rows at $0;
+  those exact rows still win, and local tags such as `:27b-mlx` or `:latest`
+  stay unpriced.
 - **Agentsview:** `internal/parser/opencode.go`,
   `internal/parser/opencode_provider.go`, and
   `internal/parser/opencode_storage_state.go`; legacy and database layouts are
