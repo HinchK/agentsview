@@ -104,7 +104,7 @@ func (s *Server) localMachineName() string {
 			return machine
 		}
 	}
-	return s.cfg.LocalMachineName
+	return s.cfg.InstallationID
 }
 
 func (s *Server) humaDataProjectRules(
@@ -114,6 +114,10 @@ func (s *Server) humaDataProjectRules(
 	machine := strings.TrimSpace(in.Machine)
 	if machine == "" {
 		machine = localMachine
+	}
+	machine, err := db.ResolveMachineFilter(ctx, s.db, machine)
+	if err != nil {
+		return nil, serverError(err)
 	}
 	rules, err := s.db.ListProjectRules(ctx, machine)
 	if err != nil {

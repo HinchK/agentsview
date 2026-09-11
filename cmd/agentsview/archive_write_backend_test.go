@@ -1427,9 +1427,9 @@ func TestLocalPGPushWatchGivesDeferredScopesAPollingOwner(t *testing.T) {
 
 	backend := &localArchiveWriteBackend{
 		appCfg: config.Config{
-			DataDir:          dataDir,
-			DBPath:           dbPath,
-			LocalMachineName: "local",
+			DataDir:        dataDir,
+			DBPath:         dbPath,
+			InstallationID: "local",
 			AgentDirs: map[parser.AgentType][]string{
 				parser.AgentCodex: {codexRoot},
 			},
@@ -1542,9 +1542,9 @@ func TestLocalDuckDBPushWatchGivesDeferredScopesAPollingOwner(t *testing.T) {
 
 	backend := &localArchiveWriteBackend{
 		appCfg: config.Config{
-			DataDir:          dataDir,
-			DBPath:           dbPath,
-			LocalMachineName: "local",
+			DataDir:        dataDir,
+			DBPath:         dbPath,
+			InstallationID: "local",
 			AgentDirs: map[parser.AgentType][]string{
 				parser.AgentCodex: {codexRoot},
 			},
