@@ -1612,8 +1612,16 @@ type syncJob struct {
 	processResult
 	agent          parser.AgentType
 	path           string
+	containerPath  string
 	machine        string
 	retentionLease *parseRetentionLease
+}
+
+func (j syncJob) containerResultPath() string {
+	if j.containerPath != "" {
+		return j.containerPath
+	}
+	return j.path
 }
 
 const (
@@ -6309,12 +6317,22 @@ func (e *Engine) rehydrateReconciliationPage(
 					provider, &source, candidate.SourceState,
 					candidate.Provider, candidate.Path,
 				) {
-					files = append(files, parser.DiscoveredFile{
+					file := parser.DiscoveredFile{
 						Path: candidate.Path, Project: source.ProjectHint,
 						Agent: candidate.Provider, ForceParse: forceCandidate,
 						Machine:        candidate.Machine,
 						ProviderSource: &source, ProviderProcess: true,
+					}
+					membershipFile := file
+					membershipFile.Path = providerDiscoveredPath(source)
+					if membershipFile.Path == "" {
+						membershipFile.Path = candidate.Path
+					}
+					e.unNoteSQLiteContainerDiscovery(parser.DiscoveredFile{
+						Agent: candidate.Provider, Path: candidate.Path,
 					})
+					e.noteSQLiteContainerDiscovery(membershipFile)
+					files = append(files, file)
 					continue
 				}
 			}
@@ -6341,7 +6359,7 @@ func (e *Engine) rehydrateReconciliationPage(
 			provider, &source, candidate.SourceState,
 			candidate.Provider, candidate.Path,
 		)
-		files = append(files, parser.DiscoveredFile{
+		file := parser.DiscoveredFile{
 			Path: candidate.Path, Project: source.ProjectHint,
 			Agent: candidate.Provider, ForceParse: forceCandidate,
 			// Carry the candidate's stored attribution: recomputing it from the
@@ -6349,7 +6367,17 @@ func (e *Engine) rehydrateReconciliationPage(
 			// the labeled root it was configured under.
 			Machine:        candidate.Machine,
 			ProviderSource: &source, ProviderProcess: true,
+		}
+		membershipFile := file
+		membershipFile.Path = providerDiscoveredPath(source)
+		if membershipFile.Path == "" {
+			membershipFile.Path = candidate.Path
+		}
+		e.unNoteSQLiteContainerDiscovery(parser.DiscoveredFile{
+			Agent: candidate.Provider, Path: candidate.Path,
 		})
+		e.noteSQLiteContainerDiscovery(membershipFile)
+		files = append(files, file)
 	}
 	return files, nil
 }
@@ -9552,6 +9580,7 @@ func (e *Engine) startWorkers(
 					processResult:  result,
 					agent:          file.Agent,
 					path:           file.Path,
+					containerPath:  result.sqliteContainerResultPath,
 					machine:        e.machineForFile(file),
 					retentionLease: result.retentionLease,
 				})
@@ -10059,7 +10088,7 @@ func (e *Engine) collectAndBatchWithOptions(
 			if r.sourceCwdChanged && e.deferredSourceCwd == nil {
 				stats.RecordCwdUpdated(1)
 			}
-			e.noteSQLiteContainerResult(r.path, false)
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
@@ -10087,7 +10116,7 @@ func (e *Engine) collectAndBatchWithOptions(
 			if err != nil {
 				log.Printf("reconcile skipped source cwd: %v", err)
 				stats.RecordFailed()
-				e.noteSQLiteContainerResult(r.path, false)
+				e.noteSQLiteContainerResult(r.containerResultPath(), false)
 				r.releaseRetention()
 				continue
 			}
@@ -10105,7 +10134,7 @@ func (e *Engine) collectAndBatchWithOptions(
 				e.cacheSkip(r.skipCacheKey(), r.mtime)
 			}
 			stats.RecordSkip()
-			e.noteSQLiteContainerResult(r.path, !proofWithheld)
+			e.noteSQLiteContainerResult(r.containerResultPath(), !proofWithheld)
 			if !proofWithheld && !r.suppressPresenceSweep {
 				admitted, exactOwnerships, err :=
 					e.skippedSourceAllowsCwdFilter(ctx, r)
@@ -10147,7 +10176,7 @@ func (e *Engine) collectAndBatchWithOptions(
 		if err != nil {
 			log.Printf("list pre-write subagent children: %v", err)
 			stats.RecordFailed()
-			e.noteSQLiteContainerResult(r.path, false)
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
 			r.releaseAll()
 			continue
 		}
@@ -10157,7 +10186,7 @@ func (e *Engine) collectAndBatchWithOptions(
 		if err := e.db.QueueSubagentParentCleanupRepairs(children); err != nil {
 			log.Printf("queue subagent parent repairs: %v", err)
 			stats.RecordFailed()
-			e.noteSQLiteContainerResult(r.path, false)
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
 			r.releaseAll()
 			continue
 		}
@@ -10176,7 +10205,7 @@ func (e *Engine) collectAndBatchWithOptions(
 				e.clearProviderSourceFreshness(ctx, r.providerStatHash)
 				log.Printf("stage DAG source data versions: %v", err)
 				stats.RecordFailed()
-				e.noteSQLiteContainerResult(r.path, false)
+				e.noteSQLiteContainerResult(r.containerResultPath(), false)
 				r.releaseAll()
 				continue
 			}
@@ -10187,7 +10216,7 @@ func (e *Engine) collectAndBatchWithOptions(
 		if err != nil {
 			log.Printf("delete parser-excluded sessions: %v", err)
 			stats.RecordFailed()
-			e.noteSQLiteContainerResult(r.path, false)
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
 			r.releaseAll()
 			continue
 		}
@@ -10215,7 +10244,7 @@ func (e *Engine) collectAndBatchWithOptions(
 					"tombstone source-missing members: %v", tombstoneErr,
 				)
 				stats.RecordFailed()
-				e.noteSQLiteContainerResult(r.path, false)
+				e.noteSQLiteContainerResult(r.containerResultPath(), false)
 				r.releaseAll()
 				continue
 			}
@@ -10228,7 +10257,7 @@ func (e *Engine) collectAndBatchWithOptions(
 			if err != nil {
 				log.Printf("reconcile rowless source cwd: %v", err)
 				stats.RecordFailed()
-				e.noteSQLiteContainerResult(r.path, false)
+				e.noteSQLiteContainerResult(r.containerResultPath(), false)
 				r.releaseRetention()
 				continue
 			}
@@ -10261,7 +10290,7 @@ func (e *Engine) collectAndBatchWithOptions(
 					)
 				}
 			}
-			e.noteSQLiteContainerResult(r.path, !proofWithheld)
+			e.noteSQLiteContainerResult(r.containerResultPath(), !proofWithheld)
 			if !proofWithheld &&
 				sourceAllowsParserExclusions {
 				baselineProcessedSource(r, true)
@@ -10295,7 +10324,7 @@ func (e *Engine) collectAndBatchWithOptions(
 		if err != nil {
 			log.Printf("reconcile filtered source cwd: %v", err)
 			stats.RecordFailed()
-			e.noteSQLiteContainerResult(r.path, false)
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
 			r.releaseRetention()
 			continue
 		}
@@ -10311,7 +10340,7 @@ func (e *Engine) collectAndBatchWithOptions(
 		// behavior.
 		presenceProofWithheld := r.sourceProofWithheld(vetoed > 0)
 		sourceProofWithheld := r.sourceProofWithheld(false)
-		e.noteSQLiteContainerResult(r.path, !presenceProofWithheld)
+		e.noteSQLiteContainerResult(r.containerResultPath(), !presenceProofWithheld)
 		if vetoed > 0 && len(allowed) == 0 {
 			e.clearProviderSourceFreshness(ctx, r.providerStatHash)
 			// Claude can emit a synthetic base result for a replay-only
@@ -10827,9 +10856,10 @@ type processResult struct {
 	// sourceBytes is the physical source size used to acquire the retention
 	// lease and to account this result against the pending write batch byte
 	// cap. Zero on lease-free skips.
-	sourceBytes        int64
-	results            []parser.ParseResult
-	excludedSessionIDs []string
+	sourceBytes               int64
+	sqliteContainerResultPath string
+	results                   []parser.ParseResult
+	excludedSessionIDs        []string
 	// preservedSessionIDs are higher-ranked members omitted by a shared source;
 	// they remain present while lower-ranked source ownership is reconciled.
 	preservedSessionIDs []string
@@ -11176,7 +11206,9 @@ func (e *Engine) processProviderFile(
 	var cwdDecision sourceCwdDecision
 	var cwdPath string
 	var cwdAgent parser.AgentType
+	var sqliteContainerResultPath string
 	defer func() {
+		result.sqliteContainerResultPath = sqliteContainerResultPath
 		if cwdDecision.resolution.State == parser.SourceCwdUnspecified {
 			return
 		}
@@ -11201,6 +11233,9 @@ func (e *Engine) processProviderFile(
 		return processResult{}, false
 	}
 	e.discardStaleSQLiteProviderSource(&file)
+	if file.ProviderSource != nil {
+		sqliteContainerResultPath = providerDiscoveredPath(*file.ProviderSource)
+	}
 
 	// OpenCode-family shared-SQLite gate: when the whole container
 	// provably has not changed since the last fully verified pass, none
@@ -11289,6 +11324,8 @@ func (e *Engine) processProviderFile(
 	if file.ProviderSource == nil && file.Project != "" {
 		source.ProjectHint = file.Project
 	}
+	file.ProviderSource = &source
+	sqliteContainerResultPath = providerDiscoveredPath(source)
 	cwdDecision = e.sourceCwdDecision(source)
 	cwdPath = e.sourceCwdLookupPath(source)
 	cwdAgent = source.Provider
@@ -11779,7 +11816,7 @@ func (e *Engine) processProviderFile(
 	// here the provider parses the source, so acquire the retention lease that
 	// bounds the parsed payload and attach it to every result carrying that
 	// data. A result still classified as a skip below releases it immediately.
-	sourceBytes := parseRetentionSourceBytes(file)
+	sourceBytes := e.parseRetentionSourceBytes(file)
 	lease, err := e.retentionBudget().acquire(
 		ctx, sourceBytes,
 	)
@@ -15050,7 +15087,7 @@ func (e *Engine) tryIncrementalJSONL(
 	// retention lease that bounds the parsed payload. It is attached to the
 	// incremental results below and released on every decline (fall-through to
 	// a full parse re-acquires at the provider parse seam) or skip return.
-	sourceBytes := parseRetentionSourceBytes(file)
+	sourceBytes := e.parseRetentionSourceBytes(file)
 	lease, leaseErr := e.retentionBudget().acquire(
 		ctx, sourceBytes,
 	)

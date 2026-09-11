@@ -1075,3 +1075,408 @@ func TestStartWorkersCancellationReleasesAdmissionWaiters(t *testing.T) {
 		next.Release()
 	})
 }
+
+// newSQLiteContainerMemberFixture builds a container-shaped fixture: one real
+// file named for an OpenCode-family container, truncated to containerBytes,
+// fanned into members virtual sources registered with a live container pass.
+func newSQLiteContainerMemberFixture(
+	t *testing.T, containerBytes int64, members int,
+) (*Engine, []parser.DiscoveredFile, string) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "mimocode.db")
+	handle, err := os.Create(dbPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(containerBytes))
+	require.NoError(t, handle.Close())
+
+	engine := NewEngine(openTestDB(t), EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+
+	files := make([]parser.DiscoveredFile, members)
+	engine.beginStreamingSQLiteContainerPass(nil)
+	for i := range files {
+		files[i] = parser.DiscoveredFile{
+			Path:  parser.VirtualSourcePath(dbPath, fmt.Sprintf("ses-%03d", i)),
+			Agent: parser.AgentMiMoCode,
+		}
+		engine.noteSQLiteContainerDiscovery(files[i])
+	}
+	engine.finishStreamingSQLiteContainerDiscovery()
+	return engine, files, dbPath
+}
+
+func TestBulkAdmissionAdmitsWorkerPoolForSQLiteContainerMembers(t *testing.T) {
+	engine, files, _ := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+	synctest.Test(t, func(t *testing.T) {
+		budget := newBulkParseRetentionBudget(defaultBulkParseRetentionBytes)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+
+		admitted := 0
+		for i := range maxWorkers {
+			lease, err := budget.acquire(
+				ctx, engine.parseRetentionSourceBytes(files[i]),
+			)
+			if err != nil {
+				break
+			}
+			admitted++
+			t.Cleanup(lease.Release)
+		}
+		assert.Equal(t, maxWorkers, admitted,
+			"members of one shared SQLite container must not serialize bulk admission")
+	})
+}
+
+func TestParseRetentionChargesContainerMemberItsShare(t *testing.T) {
+	engine, files, _ := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+
+	assert.Equal(t, int64(1048576), engine.parseRetentionSourceBytes(files[0]),
+		"a member must be charged its share of the container, not the whole file")
+
+	var total int64
+	for _, file := range files {
+		total += engine.parseRetentionSourceBytes(file)
+	}
+	assert.Equal(t, int64(67108864), total,
+		"member shares must sum back to the container they partition")
+}
+
+func TestParseRetentionFloorsContainerMemberShareAboveZero(t *testing.T) {
+	// A container smaller than its membership divides to zero, which
+	// retainedBytes reads as an unknown source and charges the whole budget:
+	// the exact fault per-member sizing removes. The floor is what prevents it,
+	// so pin it with a fixture the share test's 64 MiB container cannot reach.
+	engine, files, _ := newSQLiteContainerMemberFixture(t, 32, 64)
+
+	charged := engine.parseRetentionSourceBytes(files[0])
+	assert.Equal(t, int64(1), charged,
+		"a member share must floor at one byte, never divide to zero")
+
+	budget := newBulkParseRetentionBudget(defaultBulkParseRetentionBytes)
+	assert.Equal(t, parseRetentionFixedBytes+parseRetentionMultiplier, budget.weight(charged),
+		"the floored share must weigh as a known small source")
+	assert.Equal(t, defaultBulkParseRetentionBytes, budget.weight(0),
+		"a zero estimate would instead charge the whole admission capacity")
+
+	first, err := budget.acquire(t.Context(), charged)
+	require.NoError(t, err)
+	defer first.Release()
+	second, err := budget.acquire(t.Context(), charged)
+	require.NoError(t, err,
+		"a floored member share must not hold the budget exclusively")
+	second.Release()
+}
+
+func TestParseRetentionKeepsDaemonScavengeForLargeNonMembers(t *testing.T) {
+	// Preservation invariant: correcting the estimate narrows which sources
+	// clear the daemon scavenge threshold. A member's share may now fall below
+	// it, which is coherent with the smaller parse, but a genuinely large
+	// non-member source must still mark a scavenge.
+	engine, files, dbPath := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+
+	memberBytes := engine.parseRetentionSourceBytes(files[0])
+	assert.Less(t, memberBytes, parseRetentionScavengeThreshold,
+		"a member share below the threshold is what narrows daemon scavenging")
+
+	plainPath := filepath.Join(filepath.Dir(dbPath), "large.jsonl")
+	handle, err := os.Create(plainPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(64<<20))
+	require.NoError(t, handle.Close())
+	plain := parser.DiscoveredFile{Path: plainPath, Agent: parser.AgentClaude}
+
+	daemon := newParseRetentionBudget(defaultParseRetentionBytes)
+	daemon.scavenge = func() {}
+	lease, err := daemon.acquire(t.Context(), engine.parseRetentionSourceBytes(plain))
+	require.NoError(t, err)
+	defer lease.Release()
+	assert.True(t, daemon.scavengePending.Load(),
+		"a large non-member source must still mark a daemon scavenge")
+}
+
+func TestParseRetentionKeepsWholeFileSourceExclusive(t *testing.T) {
+	engine, _, dbPath := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+	plainPath := filepath.Join(filepath.Dir(dbPath), "whole.jsonl")
+	handle, err := os.Create(plainPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(67108864))
+	require.NoError(t, handle.Close())
+	plain := parser.DiscoveredFile{Path: plainPath, Agent: parser.AgentClaude}
+
+	sourceBytes := engine.parseRetentionSourceBytes(plain)
+	assert.Equal(t, int64(67108864), sourceBytes,
+		"a plain source must keep its whole-file size")
+
+	synctest.Test(t, func(t *testing.T) {
+		budget := newBulkParseRetentionBudget(defaultBulkParseRetentionBytes)
+		assert.Equal(t, defaultBulkParseRetentionBytes, budget.weight(sourceBytes))
+
+		first, acquireErr := budget.acquire(t.Context(), sourceBytes)
+		require.NoError(t, acquireErr)
+		t.Cleanup(first.Release)
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		_, acquireErr = budget.acquire(ctx, sourceBytes)
+		assert.ErrorIs(t, acquireErr, context.DeadlineExceeded,
+			"a second whole-file source must still block on the bulk budget")
+	})
+}
+
+func TestParseRetentionIgnoresNonFamilyVirtualPath(t *testing.T) {
+	engine, _, dbPath := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+	otherPath := filepath.Join(filepath.Dir(dbPath), "other.db")
+	handle, err := os.Create(otherPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(67108864))
+	require.NoError(t, handle.Close())
+
+	assert.Equal(t, int64(67108864), engine.parseRetentionSourceBytes(
+		parser.DiscoveredFile{
+			Path:  parser.VirtualSourcePath(otherPath, "ses-1"),
+			Agent: parser.AgentMiMoCode,
+		}),
+		"a virtual path over a non-family container base must keep the stat size")
+}
+
+func TestParseRetentionKeepsCodexSourceBytesForStagingThreshold(t *testing.T) {
+	engine, _, dbPath := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+	codexPath := filepath.Join(filepath.Dir(dbPath), "rollout.jsonl")
+	handle, err := os.Create(codexPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(67108864))
+	require.NoError(t, handle.Close())
+
+	assert.Equal(t, int64(67108864), engine.parseRetentionSourceBytes(
+		parser.DiscoveredFile{Path: codexPath, Agent: parser.AgentCodex}),
+		"the Codex staging threshold input must keep the whole-file size")
+}
+
+func TestParseRetentionChargesPromotedStorageShadowWholeSize(t *testing.T) {
+	engine, files, _ := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+	storagePath := filepath.Join(t.TempDir(), "ses-000.json")
+	require.NoError(t, os.WriteFile(storagePath, make([]byte, 4096), 0o644))
+
+	promoted := files[0]
+	promoted.ProviderSource = &parser.SourceRef{DisplayPath: storagePath}
+
+	assert.Equal(t, int64(4096), engine.parseRetentionSourceBytes(promoted),
+		"a member promoted to its storage shadow is charged the shadow, not a container share")
+}
+
+type retentionSourceTestProvider struct {
+	parser.ProviderBase
+	source parser.SourceRef
+}
+
+func (p *retentionSourceTestProvider) FindSource(
+	context.Context, parser.FindSourceRequest,
+) (parser.SourceRef, bool, error) {
+	return p.source, true, nil
+}
+
+func (p *retentionSourceTestProvider) Fingerprint(
+	context.Context, parser.SourceRef,
+) (parser.SourceFingerprint, error) {
+	return parser.SourceFingerprint{}, nil
+}
+
+func (p *retentionSourceTestProvider) Parse(
+	context.Context, parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	return parser.ParseOutcome{ResultSetComplete: true}, nil
+}
+
+type retentionSourceTestFactory struct {
+	provider *retentionSourceTestProvider
+}
+
+func (f retentionSourceTestFactory) Definition() parser.AgentDef {
+	return f.provider.Definition()
+}
+
+func (f retentionSourceTestFactory) Capabilities() parser.Capabilities {
+	return f.provider.Capabilities()
+}
+
+func (f retentionSourceTestFactory) NewProvider(parser.ProviderConfig) parser.Provider {
+	return f.provider
+}
+
+func TestProcessProviderFileUsesResolvedSourceAfterStaleMetadataDiscard(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mimocode.db")
+	handle, err := os.Create(dbPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(64<<20))
+	require.NoError(t, handle.Close())
+
+	shadowPath := filepath.Join(t.TempDir(), "session.json")
+	handle, err = os.Create(shadowPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(64<<20))
+	require.NoError(t, handle.Close())
+
+	virtualPath := parser.VirtualSourcePath(dbPath, "session")
+	virtual := parser.SourceRef{
+		Provider:       parser.AgentMiMoCode,
+		DisplayPath:    virtualPath,
+		FingerprintKey: virtualPath,
+		Key:            virtualPath,
+	}
+	provider := &retentionSourceTestProvider{
+		source: parser.SourceRef{
+			Provider:       parser.AgentMiMoCode,
+			DisplayPath:    shadowPath,
+			FingerprintKey: shadowPath,
+			Key:            shadowPath,
+		},
+	}
+	provider.ProviderBase = parser.ProviderBase{
+		Def: parser.AgentDef{Type: parser.AgentMiMoCode},
+		Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{
+				FindSource: parser.CapabilitySupported,
+			},
+		},
+	}
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentMiMoCode: {filepath.Dir(dbPath)},
+		},
+		Machine:           "local",
+		ProviderFactories: []parser.ProviderFactory{retentionSourceTestFactory{provider: provider}},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentMiMoCode: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	before := parser.SQLiteContainerState{
+		DBInode: 1, DBDevice: 2, DBChangeCounter: 3,
+	}
+	engine.beginStreamingSQLiteContainerPass(map[string]parser.SQLiteContainerState{
+		dbPath: before,
+	})
+	engine.noteSQLiteContainerDiscovery(parser.DiscoveredFile{
+		Agent: parser.AgentMiMoCode,
+		Path:  virtualPath,
+	})
+	for i := range 63 {
+		engine.noteSQLiteContainerDiscovery(parser.DiscoveredFile{
+			Agent: parser.AgentMiMoCode,
+			Path:  parser.VirtualSourcePath(dbPath, fmt.Sprintf("sibling-%02d", i)),
+		})
+	}
+
+	origStat := statSQLiteContainerState
+	t.Cleanup(func() { statSQLiteContainerState = origStat })
+	statSQLiteContainerState = func(path string) (parser.SQLiteContainerState, bool) {
+		if path == dbPath {
+			changed := before
+			changed.DBChangeCounter++
+			return changed, true
+		}
+		return origStat(path)
+	}
+
+	results := engine.startWorkers(t.Context(), []parser.DiscoveredFile{{
+		Agent:           parser.AgentMiMoCode,
+		Path:            virtualPath,
+		ProviderSource:  &virtual,
+		ProviderProcess: true,
+	}})
+	job, ok := <-results
+	require.True(t, ok)
+	require.NoError(t, job.err)
+	assert.Equal(t, int64(64<<20), job.sourceBytes,
+		"a source resolved after stale metadata discard must size from the resolved path")
+	assert.Equal(t, shadowPath, job.containerResultPath(),
+		"container completion must use the resolved source path")
+	engine.noteSQLiteContainerResult(job.containerResultPath(), true)
+	engine.containerMu.Lock()
+	completed := engine.containerPass.completed[dbPath]
+	engine.containerMu.Unlock()
+	assert.Zero(t, completed,
+		"a storage shadow must not count as a completed SQLite member")
+	job.releaseAll()
+}
+
+func TestRehydrateStorageShadowRemovesSQLiteMembership(t *testing.T) {
+	engine, files, dbPath := newSQLiteContainerMemberFixture(t, 64<<20, 64)
+	shadowPath := filepath.Join(filepath.Dir(dbPath), "storage", "session.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(shadowPath), 0o755))
+	handle, err := os.Create(shadowPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(64<<20))
+	require.NoError(t, handle.Close())
+
+	provider := &reconciliationSourceStateTestProvider{
+		source: parser.SourceRef{
+			Provider:    parser.AgentMiMoCode,
+			DisplayPath: shadowPath,
+		},
+	}
+	rehydrated, err := engine.rehydrateReconciliationPage(
+		t.Context(), []reconciliationCandidate{{
+			Provider: parser.AgentMiMoCode,
+			Identity: "session",
+			Path:     files[0].Path,
+		}},
+		map[parser.AgentType]parser.Provider{
+			parser.AgentMiMoCode: provider,
+		},
+		false,
+	)
+	require.NoError(t, err)
+	require.Len(t, rehydrated, 1)
+	assert.Equal(t, 63, engine.sqliteContainerDiscoveredMembers(files[0]),
+		"a storage-promoted candidate must leave the remaining SQLite member count")
+	assert.Equal(t, int64(64<<20), engine.parseRetentionSourceBytes(rehydrated[0]),
+		"a storage-promoted candidate must keep its resolved file size")
+}
+
+func TestParseRetentionFallsBackToContainerSizeWithoutPass(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mimocode.db")
+	handle, err := os.Create(dbPath)
+	require.NoError(t, err)
+	require.NoError(t, handle.Truncate(67108864))
+	require.NoError(t, handle.Close())
+
+	engine := NewEngine(openTestDB(t), EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+	require.Nil(t, engine.containerPass)
+
+	assert.Equal(t, int64(67108864), engine.parseRetentionSourceBytes(
+		parser.DiscoveredFile{
+			Path:  parser.VirtualSourcePath(dbPath, "ses-001"),
+			Agent: parser.AgentMiMoCode,
+		}),
+		"a pass tracking no membership must keep the whole-container size")
+}
+
+func TestParseRetentionBudgetAdmissionWeights(t *testing.T) {
+	bulk := newBulkParseRetentionBudget(defaultBulkParseRetentionBytes)
+	daemon := newParseRetentionBudget(defaultParseRetentionBytes)
+	for _, tc := range []struct {
+		name         string
+		budget       *parseRetentionBudget
+		sourceBytes  int64
+		wantWeight   int64
+		wantRetained int64
+	}{
+		{"bulk_one_byte", bulk, 1, 65540, 65540},
+		{"bulk_six_mib", bulk, 6291456, 25231360, 25231360},
+		{"bulk_below_clamp", bulk, 67092479, 268435452, 268435452},
+		{"bulk_at_clamp", bulk, 67092480, 268435456, 268435456},
+		{"bulk_saturated", bulk, 134217728, 268435456, 536870912},
+		{"bulk_unknown", bulk, 0, 268435456, 536870912},
+		{"bulk_negative", bulk, -1, 268435456, 536870912},
+		{"daemon_sixty_four_mib", daemon, 67108864, 67108864, 67108864},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.wantWeight, tc.budget.weight(tc.sourceBytes))
+			assert.Equal(t, tc.wantRetained, tc.budget.retainedBytes(tc.sourceBytes))
+		})
+	}
+}
