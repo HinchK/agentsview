@@ -721,8 +721,7 @@ var ErrDAGDetected = fmt.Errorf(
 
 // ErrClaudeIncrementalNeedsFullParse signals that appended Claude
 // lines contain content the incremental path cannot stitch into
-// already-stored rows (renames, late identity fields, and subagent-map
-// repairs for tool calls outside the append).
+// already-stored rows (renames and late identity fields).
 var ErrClaudeIncrementalNeedsFullParse = fmt.Errorf(
 	"incremental parse: appended Claude lines require full parse",
 )
@@ -899,17 +898,17 @@ func claudeParseSessionFrom(
 	}
 
 	// Queue/progress events can repair subagent linkage on an already-stored
-	// tool call. If the mapped tool_use_id is not introduced in this append,
-	// incremental parsing would advance file_size without updating that row.
-	if needsClaudeFullParseForSubagentMap(entries, subagentMap) {
-		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
-	}
+	// tool call. Carry those mappings through the existing atomic incremental
+	// link writer instead of re-parsing the whole transcript. Map-derived
+	// links come first so the database's first-non-empty-wins rule preserves
+	// the same precedence as the full parser.
+	links := claudeSubagentMapLinks(subagentMap)
 	if needsClaudeFullParseForWebSearchCounts(entries) {
 		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
 	}
 
 	if len(entries) == 0 && len(queuedCommands) == 0 {
-		return nil, nil, latestTS, consumed, nil
+		return nil, links, latestTS, consumed, nil
 	}
 
 	// Fork detection only matters when the full parser would actually
@@ -944,7 +943,7 @@ func claudeParseSessionFrom(
 		return nil, nil, time.Time{}, 0, ErrDAGDetected
 	}
 
-	links := collectClaudeSubagentLinks(entries)
+	links = append(links, collectClaudeSubagentLinks(entries)...)
 	links = append(
 		links, collectClaudeUnmatchedToolResults(entries, links)...,
 	)
@@ -1006,9 +1005,12 @@ func claudeSessionIdentityUpdate(line string, stored claudeStoredIdentity) bool 
 // collectClaudeUnmatchedToolResults returns result links for appended
 // tool_result blocks whose tool_use lives outside the appended window.
 // In-append results pair at write time and agentId-linked results are
-// already carried by collectClaudeSubagentLinks. isMeta carriers are
-// skipped: the full parser drops those lines entirely, so their result
-// content never reaches the stored tool call there either. Results
+// already carried by collectClaudeSubagentLinks. Only result-bearing
+// links suppress a late result: a queue/progress mapping for the same
+// tool_use carries no content, so its result still has to be copied
+// here. isMeta carriers are skipped: the full parser drops those lines
+// entirely, so their result content never reaches the stored tool call
+// there either. Results
 // whose tool_use id is unknown to the store no-op at apply time,
 // matching the full parser's unpaired-result behavior.
 func collectClaudeUnmatchedToolResults(
@@ -1016,7 +1018,9 @@ func collectClaudeUnmatchedToolResults(
 ) []ClaudeSubagentLink {
 	linked := make(map[string]struct{}, len(agentLinks))
 	for _, l := range agentLinks {
-		linked[l.ToolUseID] = struct{}{}
+		if l.HasResult {
+			linked[l.ToolUseID] = struct{}{}
+		}
 	}
 	appendedToolUse := make(map[string]struct{})
 	var out []ClaudeSubagentLink
@@ -1090,20 +1094,23 @@ func collectClaudeSubagentLinks(entries []dagEntry) []ClaudeSubagentLink {
 	return links
 }
 
-func needsClaudeFullParseForSubagentMap(
-	entries []dagEntry, subagentMap map[string]string,
-) bool {
-	if len(subagentMap) == 0 {
-		return false
-	}
-
-	appendedToolUseIDs := claudeAppendedToolUseIDs(entries)
+func claudeSubagentMapLinks(
+	subagentMap map[string]string,
+) []ClaudeSubagentLink {
+	toolUseIDs := make([]string, 0, len(subagentMap))
 	for toolUseID := range subagentMap {
-		if _, ok := appendedToolUseIDs[toolUseID]; !ok {
-			return true
-		}
+		toolUseIDs = append(toolUseIDs, toolUseID)
 	}
-	return false
+	slices.Sort(toolUseIDs)
+
+	links := make([]ClaudeSubagentLink, 0, len(toolUseIDs))
+	for _, toolUseID := range toolUseIDs {
+		links = append(links, ClaudeSubagentLink{
+			ToolUseID:         toolUseID,
+			SubagentSessionID: subagentMap[toolUseID],
+		})
+	}
+	return links
 }
 
 func claudeAppendedToolUseIDs(entries []dagEntry) map[string]struct{} {
