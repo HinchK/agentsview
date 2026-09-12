@@ -703,7 +703,7 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	type openAPISchema struct {
 		Ref        string                   `json:"$ref"`
-		Enum       []string                 `json:"enum"`
+		Enum       []any                    `json:"enum"`
 		Properties map[string]openAPISchema `json:"properties"`
 	}
 	type openAPIParameter struct {
@@ -745,49 +745,49 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 		path   string
 		method string
 		name   string
-		want   []string
+		want   []any
 	}{
 		{
 			path:   "/api/v1/sessions/{id}/messages",
 			method: "get",
 			name:   "direction",
-			want:   []string{"asc", "desc"},
+			want:   []any{"asc", "desc"},
 		},
 		{
 			path:   "/api/v1/search",
 			method: "get",
 			name:   "sort",
-			want:   []string{"relevance", "recency"},
+			want:   []any{"relevance", "recency"},
 		},
 		{
 			path:   "/api/v1/search/content",
 			method: "get",
 			name:   "mode",
-			want:   []string{"substring", "regex", "fts", "semantic", "hybrid"},
+			want:   []any{"substring", "regex", "fts", "semantic", "hybrid"},
 		},
 		{
 			path:   "/api/v1/search/content",
 			method: "get",
 			name:   "scope",
-			want:   []string{"top", "all", "subordinate"},
+			want:   []any{"top", "all", "subordinate"},
 		},
 		{
 			path:   "/api/v1/sessions/{id}/md",
 			method: "get",
 			name:   "depth",
-			want:   []string{"1", "all"},
+			want:   []any{"1", "all"},
 		},
 		{
 			path:   "/api/v1/analytics/activity",
 			method: "get",
 			name:   "granularity",
-			want:   []string{"day", "week", "month"},
+			want:   []any{"day", "week", "month"},
 		},
 		{
 			path:   "/api/v1/analytics/heatmap",
 			method: "get",
 			name:   "metric",
-			want:   []string{"messages", "sessions", "output_tokens"},
+			want:   []any{"messages", "sessions", "output_tokens"},
 		},
 	} {
 		pathItem, ok := spec.Paths[tt.path]
@@ -795,7 +795,7 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 		op, ok := pathItem[tt.method]
 		require.True(t, ok, "spec missing operation %s %s", tt.method, tt.path)
 
-		var got []string
+		var got []any
 		for _, param := range op.Parameters {
 			if param.Name == tt.name && param.In == "query" {
 				got = param.Schema.Enum
@@ -854,7 +854,7 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 	mode, ok := schema.Properties["mode"]
 	require.True(t, ok, "post /api/v1/config/terminal missing mode property")
 	mode = resolveSchema(mode)
-	assert.Equal(t, []string{"auto", "custom", "clipboard"}, mode.Enum)
+	assert.Equal(t, []any{"auto", "custom", "clipboard"}, mode.Enum)
 }
 
 func TestSearchContentSemanticGETRequiresIntentHeader(t *testing.T) {
@@ -3635,6 +3635,79 @@ func TestSettingsChartPaletteRoundTrip(t *testing.T) {
 	assert.Equal(t, config.ChartPaletteMatplotlib, persisted.ChartPalette)
 }
 
+func TestOpenAPISettingsZoomLevels(t *testing.T) {
+	te := setup(t)
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]jsontext.Value `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+	for _, name := range []string{"SettingsResponse", "SettingsUpdateRequest"} {
+		var zoom struct {
+			Type string `json:"type"`
+			Enum []int  `json:"enum"`
+		}
+		require.NoError(t, json.Unmarshal(spec.Components.Schemas[name].Properties["zoom_level"], &zoom), name)
+		assert.Equal(t, "integer", zoom.Type, name)
+		assert.Equal(t, []int{67, 75, 80, 90, 100, 110, 120, 125, 130, 150, 175, 200}, zoom.Enum, name)
+	}
+}
+
+func TestSettingsZoomLevelRoundTrip(t *testing.T) {
+	configured := config.ZoomLevel120
+	te := setup(t, func(cfg *config.Config) { cfg.ZoomLevel = &configured })
+	require.NoError(t, os.WriteFile(filepath.Join(te.dataDir, "config.toml"), []byte(
+		"github_token = \"keep\"\n[proxy]\nmode = \"caddy\"\n"), 0o600))
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	assert.Contains(t, w.Body.String(), `"zoom_level":120`)
+
+	w = putSettings(`{"zoom_level":120}`)
+	assertStatus(t, w, http.StatusOK)
+	var updated struct {
+		ZoomLevel *config.ZoomLevel `json:"zoom_level"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &updated))
+	require.NotNil(t, updated.ZoomLevel)
+	assert.Equal(t, config.ZoomLevel120, *updated.ZoomLevel)
+
+	var persisted struct {
+		ZoomLevel   *config.ZoomLevel  `toml:"zoom_level"`
+		GithubToken string             `toml:"github_token"`
+		Proxy       config.ProxyConfig `toml:"proxy"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	require.NotNil(t, persisted.ZoomLevel)
+	assert.Equal(t, config.ZoomLevel120, *persisted.ZoomLevel)
+	assert.Equal(t, "keep", persisted.GithubToken)
+	assert.Equal(t, "caddy", persisted.Proxy.Mode)
+
+	before, err := os.ReadFile(filepath.Join(te.dataDir, "config.toml"))
+	require.NoError(t, err)
+	w = putSettings(`{"zoom_level":101}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "zoom_level")
+	after, err := os.ReadFile(filepath.Join(te.dataDir, "config.toml"))
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
 func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T) {
 	te := setup(t)
 	putSettings := func(body string) *httptest.ResponseRecorder {
@@ -3794,6 +3867,20 @@ func TestSettingsToolResultImagesReadOnlyBackend(t *testing.T) {
 	te := setupPGMode(t)
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
 		strings.NewReader(`{"tool_result_images":"drop"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusNotImplemented)
+
+	_, err := os.Stat(filepath.Join(te.dataDir, "config.toml"))
+	assert.True(t, os.IsNotExist(err), "config.toml must not be written by a read-only backend")
+}
+
+func TestSettingsZoomLevelReadOnlyBackend(t *testing.T) {
+	te := setupPGMode(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"zoom_level":120}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://127.0.0.1:0")
 	w := httptest.NewRecorder()

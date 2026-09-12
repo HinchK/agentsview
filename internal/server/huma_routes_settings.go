@@ -108,6 +108,7 @@ func (s *Server) humaGetSettings(
 		Host:             s.cfg.Host,
 		Port:             s.cfg.Port,
 		ChartPalette:     s.cfg.ResolvedChartPalette(),
+		ZoomLevel:        s.cfg.ZoomLevel,
 		ToolResultImages: toolResultImagesValue(s.cfg.ToolResultImages),
 		RequireAuth:      s.cfg.RequireAuth,
 		ReadOnly:         s.db.ReadOnly(),
@@ -139,6 +140,9 @@ func (s *Server) humaUpdateSettings(
 			return nil, apiError(http.StatusBadRequest, err.Error())
 		}
 		patch["chart_palette"] = palette
+	}
+	if in.Body.ZoomLevel != nil {
+		patch["zoom_level"] = *in.Body.ZoomLevel
 	}
 	if in.Body.ToolResultImages != nil {
 		// The enum tag already constrained this to "keep" or "drop" before

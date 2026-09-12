@@ -11,6 +11,7 @@ import {
   isRemoteConnection,
 } from "../api/runtime.js";
 import { DEFAULT_CHART_PALETTE, isChartPalette, type ChartPalette } from "../utils/chartPalette.js";
+import { ui } from "./ui.svelte.js";
 
 export type ToolResultImagesPolicy = "keep" | "drop";
 
@@ -53,6 +54,7 @@ function forbiddenMessage(serverMessage: string): string {
 
 class SettingsStore {
   private mutationQueue: Promise<void> | null = null;
+  private loadVersion = 0;
   agentDirs: Record<string, string[]> = $state({});
   sessionProviders: SessionProvider[] = $state([]);
   disabledAgents: string[] = $state([]);
@@ -76,7 +78,13 @@ class SettingsStore {
    *  to provide an auth token before the app can load. */
   needsAuth: boolean = $state(false);
 
-  async load() {
+  async load(): Promise<void> {
+    if (this.saving && this.mutationQueue) {
+      await this.mutationQueue;
+      return this.load();
+    }
+    const loadVersion = ++this.loadVersion;
+    const isCurrentLoad = () => loadVersion === this.loadVersion;
     this.loading = true;
     this.loaded = false;
     this.error = null;
@@ -84,6 +92,7 @@ class SettingsStore {
     this.needsAuth = false;
     try {
       const data = await SettingsService.getApiV1Settings();
+      if (!isCurrentLoad()) return;
       if (!isChartPalette(data.chart_palette)) {
         throw new Error(
           `Invalid chart_palette in settings response: ${String(data.chart_palette)}`,
@@ -100,6 +109,7 @@ class SettingsStore {
       this.requireAuth = data.require_auth ?? false;
       this.readOnly = data.read_only === true;
       this.chartPalette = data.chart_palette;
+      ui.applyZoomDefault(data.zoom_level);
       // A response without the field, including every fixture that predates
       // it, reads as the default keep policy instead of failing the load.
       this.toolResultImages = data.tool_result_images === "drop" ? "drop" : "keep";
@@ -110,6 +120,7 @@ class SettingsStore {
         setAuthToken(data.auth_token);
       }
     } catch (e) {
+      if (!isCurrentLoad()) return;
       if (e instanceof ApiError && e.status === 401) {
         this.needsAuth = true;
       } else if (e instanceof ApiError && e.status === 403) {
@@ -118,8 +129,10 @@ class SettingsStore {
         this.error = e instanceof Error ? e.message : "Failed to load settings";
       }
     } finally {
-      this.loading = false;
-      this.loaded = true;
+      if (isCurrentLoad()) {
+        this.loading = false;
+        this.loaded = true;
+      }
     }
   }
 

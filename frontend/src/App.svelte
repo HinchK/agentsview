@@ -38,6 +38,7 @@
 </script>
 
 <script lang="ts">
+  import { FlashBanner, showFlash } from "@kenn-io/kit-ui";
   import { onMount, untrack } from "svelte";
   import AppHeader from "./lib/components/layout/AppHeader.svelte";
   import ThreeColumnLayout from "./lib/components/layout/ThreeColumnLayout.svelte";
@@ -728,6 +729,13 @@
     ui.activeModal = "about";
   }
 
+  $effect(() => {
+    const saveError = settings.saveError;
+    if (saveError) {
+      untrack(() => showFlash(saveError, { tone: "danger" }));
+    }
+  });
+
   onMount(() => {
     globalAuthToken = getAuthToken();
     settings.load();
@@ -797,6 +805,8 @@
 {:else}
 
 <AppHeader />
+
+<FlashBanner toneLabels={{ danger: m.settings_save_error_label() }} />
 
 {#if router.route === "usage" || router.route === "token-usage"}
   <div class="page-scroll">
