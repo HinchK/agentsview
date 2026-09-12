@@ -61,11 +61,11 @@ func configureArchiveSQLiteConnection(conn *sqlite3.SQLiteConn) error {
 		return err
 	}
 	if err := conn.RegisterFunc(
-		"agentsview_chinese_fts_fingerprint",
+		"agentsview_cjk_fts_fingerprint",
 		func() string { return simpleFTSRuntimeConfig.fingerprint },
 		true,
 	); err != nil {
-		return fmt.Errorf("registering Chinese FTS fingerprint: %w", err)
+		return fmt.Errorf("registering CJK FTS fingerprint: %w", err)
 	}
 	if !simpleFTSRuntimeConfig.available() {
 		return nil

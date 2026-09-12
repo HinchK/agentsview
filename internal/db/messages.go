@@ -2111,24 +2111,24 @@ func sessionHasFTSTableTx(tx transactionQueries, table string) (bool, error) {
 	return ftsCount > 0, nil
 }
 
-func sessionHasCurrentChineseFTSTx(
+func sessionHasCurrentCJKFTSTx(
 	tx transactionQueries,
 ) (bool, error) {
-	exists, err := sessionHasFTSTableTx(tx, "messages_chinese_fts")
+	exists, err := sessionHasFTSTableTx(tx, "messages_cjk_fts")
 	if err != nil || !exists || !simpleFTSRuntimeConfig.available() {
 		return false, err
 	}
 	var storedFingerprint string
 	err = tx.QueryRow(
 		"SELECT CAST(value AS TEXT) FROM stats WHERE key = ?",
-		chineseFTSFingerprintStatsKey,
+		cjkFTSFingerprintStatsKey,
 	).Scan(&storedFingerprint)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf(
-			"reading Chinese fts fingerprint: %w", err,
+			"reading CJK fts fingerprint: %w", err,
 		)
 	}
 	return storedFingerprint == simpleFTSRuntimeConfig.fingerprint, nil
@@ -2143,14 +2143,14 @@ func deleteSessionMessageRowsTx(
 		deleteDDL  string
 	}{
 		{"messages_fts", "messages_ad", messagesADTriggerDDL},
-		{"messages_chinese_fts", "messages_chinese_ad", messagesChineseADTriggerDDL},
+		{"messages_cjk_fts", "messages_cjk_ad", messagesCJKADTriggerDDL},
 	}
 	active := tables[:0]
 	for _, table := range tables {
 		var exists bool
 		var err error
-		if table.name == "messages_chinese_fts" {
-			exists, err = sessionHasCurrentChineseFTSTx(tx)
+		if table.name == "messages_cjk_fts" {
+			exists, err = sessionHasCurrentCJKFTSTx(tx)
 		} else {
 			exists, err = sessionHasFTSTableTx(tx, table.name)
 		}
